@@ -20,17 +20,11 @@ return {
     },
     opts = {
       sources = {
-        --{ name = "copilot" },
-        { name = "nvim_lsp" },
-        --{ name = "luasnip" },
-        { name = "buffer" },
-        --{ name = "nvim_lua" },
-        { name = "async_path" },
       }
     },
-    --config = function()
-    --  require "configs.nvim-cmp"
-    --end
+    config = function()
+      require "configs.nvim-cmp"
+    end
   },
   {
     "williamboman/mason-lspconfig.nvim",

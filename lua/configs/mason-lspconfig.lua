@@ -1,7 +1,7 @@
 -- require("lspconfig").setup({})
 require("mason-lspconfig").setup({
     automatic_installation = true,
-    ensure_installed = { "lua_ls" }
+    ensure_installed = { "lua_ls", "pyright", "clangd" }
 })
 
 local map = vim.keymap.set
@@ -83,7 +83,6 @@ require("mason-lspconfig").setup_handlers {
     -- and will be called for each installed server that doesn't have
     -- a dedicated handler.
     function (server_name) -- default handler (optional)
-        vim.notify("mason lsp handler called for server ", server_name)
         require("lspconfig")[server_name].setup {
           on_attach = default_M.on_attach,
           capabilities = default_M.capabilities,
