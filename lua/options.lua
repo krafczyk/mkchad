@@ -17,3 +17,6 @@ vim.api.nvim_set_keymap('n', ',', '@@', { noremap = false, silent = false })
 -- How I like searching to be done
 o.incsearch = true
 o.hlsearch = true
+
+-- Set keybind for getting lsp diagnostics
+-- vim.api.nvim_buf_set_option('n', '<space>e', '<cmd>lua vim.lsp.diagnostic.show_line_diagnostics()<CR>', { noremap=true, silent=true })
