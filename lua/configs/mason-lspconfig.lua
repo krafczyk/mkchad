@@ -84,7 +84,11 @@ require("mason-lspconfig").setup_handlers {
     -- a dedicated handler.
     function (server_name) -- default handler (optional)
         vim.notify("mason lsp handler called for server ", server_name)
-        require("lspconfig")[server_name].setup {}
+        require("lspconfig")[server_name].setup {
+          on_attach = default_M.on_attach,
+          capabilities = default_M.capabilities,
+          on_init = default_M.on_init,
+        }
     end,
     -- Next, you can provide a dedicated handler for specific servers.
     -- For example, a handler override for the `rust_analyzer`:
