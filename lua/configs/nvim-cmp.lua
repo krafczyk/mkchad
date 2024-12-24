@@ -1,6 +1,18 @@
 local cmp = require('cmp')
 local lspkind = require('lspkind')
 
+local cmp_enabled = true
+
+-- Function to toggle nvim-cmp
+function ToggleCmp()
+    cmp_enabled = not cmp_enabled
+    if cmp_enabled then
+        print("nvim-cmp enabled")
+    else
+        print("nvim-cmp disabled")
+    end
+end
+
 -- Copilot enabled state
 local copilot_enabled = false
 
@@ -15,6 +27,9 @@ local function toggle_copilot_buffer(enable)
 end
 
 cmp.setup {
+  enabled = function()
+    return cmp_enabled
+  end,
   snippet = {
     expand = function(args)
       -- vim.snippet.expand(args.body) -- For native neovim snippets
@@ -61,15 +76,10 @@ cmp.setup {
   },
 }
 
+-- Keymap to toggle cmp
+vim.api.nvim_set_keymap('n', '<leader>ct', ':lua ToggleCmp()<CR>', { noremap = true, silent = true })
+
 -- Command to manually request Copilot completion
--- vim.api.nvim_set_keymap(
---   'i', -- Insert mode
---   '<C-c>', -- Replace <C-c> with your preferred key combination
---   [[<Cmd>lua require('cmp').complete({ config = { sources = vim.deepcopy(require('cmp').get_config().sources, { { name = "copilot" } }) } })<CR>]],
---   { noremap = true, silent = true })
-
-
-
 function _G.trigger_copilot_complete()
   -- Check if Copilot is enabled (globally or for the buffer)
   if not copilot_enabled and not vim.b.copilot_enabled then
