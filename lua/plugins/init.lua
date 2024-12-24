@@ -11,16 +11,27 @@ return {
   },
   -- These are some examples, uncomment them if you want to see them work!
   {
+    "zbirenbaum/copilot.lua",
+    config = function()
+      require "configs.copilot"
+    end,
+  },
+  {
+    "zbirenbaum/copilot-cmp",
+    dependencies = {
+      "zbirenbaum/copilot.lua",
+    },
+    config = function()
+      require "configs.copilot-cmp"
+    end,
+  },
+  {
     "hrsh7th/nvim-cmp",
     dependencies = {
-      --"zbirenbaum/copilot.lua",
+      "zbirenbaum/copilot-cmp",
       "hrsh7th/cmp-nvim-lsp",
       "onsails/lspkind.nvim",
       "https://codeberg.org/FelipeLema/cmp-async-path.git"
-    },
-    opts = {
-      sources = {
-      }
     },
     config = function()
       require "configs.nvim-cmp"
