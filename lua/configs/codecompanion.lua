@@ -25,6 +25,11 @@ require('codecompanion').setup({
       })
     end
   },
+  display = {
+    diff = {
+      provider = "mini_pick",
+    },
+  },
   opts = {
     language = "English"
   },
