@@ -124,7 +124,23 @@ require("mason-lspconfig").setup_handlers {
                 },
             },
         }
-    end
+    end,
+    ["java_language_server"] = function()
+        require("lspconfig").java_language_server.setup {
+            on_attach = default_M.on_attach,
+            capabilities = default_M.capabilities,
+            on_init = default_M.on_init,
+            handlers = {
+                -- Fixes https://github.com/georgewfraser/java-language-server/issues/267
+                ['client/registerCapability'] = function(err, result, ctx, config)
+                    local registration = {
+                        registrations = { result },
+                    }
+                    return vim.lsp.handlers['client/registerCapability'](err, registration, ctx, config)
+                end
+            },
+        }
+    end,
     --     local lspconfig = require("lspconfig")
     --     local lua_ls_config = lspconfig.lua_ls
 
