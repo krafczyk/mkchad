@@ -125,6 +125,46 @@ require("mason-lspconfig").setup_handlers {
             },
         }
     end,
+    ["basedpyright"] = function()
+        local root_files = {
+            'pyrightconfig.json',
+            'pyproject.toml'
+        }
+        require("lspconfig").basedpyright.setup {
+            on_attach = default_M.on_attach,
+            capabilities = default_M.capabilities,
+            on_init = default_M.on_init,
+            root_dir = function(fname)
+                -- Search root_files for a match using vim.fs.root(fname, root_file) using the files in root_files
+                for _, file in ipairs(root_files) do
+                    local result = vim.fs.root(fname, file)
+                    if result then
+                        return result
+                    end
+                end
+            end
+        }
+    end,
+    ["pyright"] = function()
+        local root_files = {
+            'pyrightconfig.json',
+            'pyproject.toml'
+        }
+        require("lspconfig").pyright.setup {
+            on_attach = default_M.on_attach,
+            capabilities = default_M.capabilities,
+            on_init = default_M.on_init,
+            root_dir = function(fname)
+                -- Search root_files for a match using vim.fs.root(fname, root_file) using the files in root_files
+                for _, file in ipairs(root_files) do
+                    local result = vim.fs.root(fname, file)
+                    if result then
+                        return result
+                    end
+                end
+            end
+        }
+    end,
     ["java_language_server"] = function()
         require("lspconfig").java_language_server.setup {
             on_attach = default_M.on_attach,
@@ -141,27 +181,6 @@ require("mason-lspconfig").setup_handlers {
             },
         }
     end,
-    --     local lspconfig = require("lspconfig")
-    --     local lua_ls_config = lspconfig.lua_ls
-
-    --     if lua_ls_config then
-    --         -- Check that the existing cmd property is correct
-    --         local correct_cmd = {
-    --             "lua-language-server",
-    --             "--logpath=~/.cache/lua-language-server/log",
-    --             "--metapath=~/.cache/lua-language-server/meta"}
-    --         -- Modify the `cmd property of the existing configuration
-    --         if lua_ls_config.cmd ~= correct_cmd then
-    --             lua_ls_config.cmd = correct_cmd
-
-    --             -- Restart the language server to apply changes
-    --             vim.lsp.stop_client(vim.lsp.get_active_clients({ name = "lua_ls"}))
-    --             lua_ls_config.manager.try_add_wrapper()
-    --         end
-    --     else
-    --         vim.notify("lua_ls configuration not found!", vim.log.levels.ERROR)
-    --     end
-
     -- ["rust_analyzer"] = function ()
     --     require("rust-tools").setup {}
     -- end
