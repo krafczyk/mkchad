@@ -1,7 +1,7 @@
 -- require("lspconfig").setup({})
 require("mason-lspconfig").setup({
     automatic_installation = true,
-    ensure_installed = { "lua_ls", "basedpyright", "clangd", "jdtls", "ts_ls" }
+    ensure_installed = { "lua_ls", "basedpyright", "clangd", "jdtls", "ts_ls", "bashls" }
 })
 
 local map = vim.keymap.set
