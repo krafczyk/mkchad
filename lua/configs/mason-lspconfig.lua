@@ -1,12 +1,7 @@
--- require("lspconfig").setup({})
-require("mason-lspconfig").setup({
-    automatic_installation = true,
-    ensure_installed = { "lua_ls", "basedpyright", "clangd", "jdtls", "ts_ls", "bashls" }
-})
-
 local map = vim.keymap.set
 local default_M = {}
 
+-- Define attach methods
 -- export on_attach & capabilities
 default_M.on_attach = function(_, bufnr)
     local function opts(desc)
@@ -78,6 +73,46 @@ default_M.capabilities.textDocument.completion.completionItem = {
     },
 }
 
+dofile(vim.g.base46_cache .. "lsp")
+require("nvchad.lsp").diagnostic_config()
+
+-- Define configs for pre-installed LSPs
+require('lspconfig').lua_ls.setup({
+    cmd = {
+        "lua-language-server",
+        "--logpath=~/.cache/lua-language-server/log",
+        "--metapath=~/.cache/lua-language-server/meta"},
+    filetypes = { "lua" },
+    on_attach = default_M.on_attach,
+    capabilities = default_M.capabilities,
+    on_init = default_M.on_init,
+
+    settings = {
+        Lua = {
+            diagnostics = {
+                globals = { "vim" },
+            },
+            workspace = {
+                library = {
+                    vim.fn.expand "$VIMRUNTIME/lua",
+                    vim.fn.expand "$VIMRUNTIME/lua/vim/lsp",
+                    vim.fn.stdpath "data" .. "/lazy/ui/nvchad_types",
+                    vim.fn.stdpath "data" .. "/lazy/lazy.nvim/lua/lazy",
+                    "${3rd}/luv/library",
+                },
+                maxPreload = 100000,
+                preloadFileSize = 10000,
+            },
+        },
+    },
+})
+
+require("mason-lspconfig").setup({
+    automatic_installation = true,
+    ensure_installed = { "basedpyright", "clangd", "jdtls", "ts_ls", "bashls" }
+})
+
+-- Define attach methods
 require("mason-lspconfig").setup_handlers {
     -- The first entry (without a key) will be the default handler
     -- and will be called for each installed server that doesn't have
@@ -91,40 +126,6 @@ require("mason-lspconfig").setup_handlers {
     end,
     -- Next, you can provide a dedicated handler for specific servers.
     -- For example, a handler override for the `rust_analyzer`:
-    [ "lua_ls" ] = function ()
-        dofile(vim.g.base46_cache .. "lsp")
-        require("nvchad.lsp").diagnostic_config()
-
-        require("lspconfig").lua_ls.setup {
-            cmd = {
-                "lua-language-server",
-                "--logpath=~/.cache/lua-language-server/log",
-                "--metapath=~/.cache/lua-language-server/meta"},
-            filetypes = { "lua" },
-            on_attach = default_M.on_attach,
-            capabilities = default_M.capabilities,
-            on_init = default_M.on_init,
-
-            settings = {
-                Lua = {
-                    diagnostics = {
-                        globals = { "vim" },
-                    },
-                    workspace = {
-                        library = {
-                            vim.fn.expand "$VIMRUNTIME/lua",
-                            vim.fn.expand "$VIMRUNTIME/lua/vim/lsp",
-                            vim.fn.stdpath "data" .. "/lazy/ui/nvchad_types",
-                            vim.fn.stdpath "data" .. "/lazy/lazy.nvim/lua/lazy",
-                            "${3rd}/luv/library",
-                        },
-                        maxPreload = 100000,
-                        preloadFileSize = 10000,
-                    },
-                },
-            },
-        }
-    end,
     ["basedpyright"] = function()
         local root_files = {
             'pyrightconfig.json',
