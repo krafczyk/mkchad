@@ -107,9 +107,34 @@ require('lspconfig').lua_ls.setup({
     },
 })
 
+local pyright_root_files = {
+    'pyrightconfig.json',
+    'pyproject.toml'
+}
+require("lspconfig").basedpyright.setup({
+    on_attach = default_M.on_attach,
+    capabilities = default_M.capabilities,
+    on_init = default_M.on_init,
+    root_dir = function(fname)
+        -- Search root_files for a match using vim.fs.root(fname, root_file) using the files in root_files
+        for _, file in ipairs(pyright_root_files) do
+            local result = vim.fs.root(fname, file)
+            if result then
+                return result
+            end
+        end
+    end
+})
+
+require("lspconfig").clangd.setup({
+  on_attach = default_M.on_attach,
+  capabilities = default_M.capabilities,
+  on_init = default_M.on_init,
+})
+
 require("mason-lspconfig").setup({
     automatic_installation = true,
-    ensure_installed = { "basedpyright", "clangd", "jdtls", "ts_ls", "bashls" }
+    ensure_installed = { "jdtls", "ts_ls", "bashls" }
 })
 
 -- Define attach methods
@@ -125,39 +150,14 @@ require("mason-lspconfig").setup_handlers {
         }
     end,
     -- Next, you can provide a dedicated handler for specific servers.
-    -- For example, a handler override for the `rust_analyzer`:
-    ["basedpyright"] = function()
-        local root_files = {
-            'pyrightconfig.json',
-            'pyproject.toml'
-        }
-        require("lspconfig").basedpyright.setup {
-            on_attach = default_M.on_attach,
-            capabilities = default_M.capabilities,
-            on_init = default_M.on_init,
-            root_dir = function(fname)
-                -- Search root_files for a match using vim.fs.root(fname, root_file) using the files in root_files
-                for _, file in ipairs(root_files) do
-                    local result = vim.fs.root(fname, file)
-                    if result then
-                        return result
-                    end
-                end
-            end
-        }
-    end,
     ["pyright"] = function()
-        local root_files = {
-            'pyrightconfig.json',
-            'pyproject.toml'
-        }
         require("lspconfig").pyright.setup {
             on_attach = default_M.on_attach,
             capabilities = default_M.capabilities,
             on_init = default_M.on_init,
             root_dir = function(fname)
                 -- Search root_files for a match using vim.fs.root(fname, root_file) using the files in root_files
-                for _, file in ipairs(root_files) do
+                for _, file in ipairs(pyright_root_files) do
                     local result = vim.fs.root(fname, file)
                     if result then
                         return result
@@ -182,6 +182,7 @@ require("mason-lspconfig").setup_handlers {
             },
         }
     end,
+    -- For example, a handler override for the `rust_analyzer`:
     -- ["rust_analyzer"] = function ()
     --     require("rust-tools").setup {}
     -- end
