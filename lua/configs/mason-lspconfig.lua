@@ -73,67 +73,8 @@ default_M.capabilities.textDocument.completion.completionItem = {
     },
 }
 
-dofile(vim.g.base46_cache .. "lsp")
-require("nvchad.lsp").diagnostic_config()
-
--- Define configs for pre-installed LSPs
-require('lspconfig').lua_ls.setup({
-    cmd = {
-        "lua-language-server",
-        "--logpath=~/.cache/lua-language-server/log",
-        "--metapath=~/.cache/lua-language-server/meta"},
-    filetypes = { "lua" },
-    on_attach = default_M.on_attach,
-    capabilities = default_M.capabilities,
-    on_init = default_M.on_init,
-
-    settings = {
-        Lua = {
-            diagnostics = {
-                globals = { "vim" },
-            },
-            workspace = {
-                library = {
-                    vim.fn.expand "$VIMRUNTIME/lua",
-                    vim.fn.expand "$VIMRUNTIME/lua/vim/lsp",
-                    vim.fn.stdpath "data" .. "/lazy/ui/nvchad_types",
-                    vim.fn.stdpath "data" .. "/lazy/lazy.nvim/lua/lazy",
-                    "${3rd}/luv/library",
-                },
-                maxPreload = 100000,
-                preloadFileSize = 10000,
-            },
-        },
-    },
-})
-
-local pyright_root_files = {
-    'pyrightconfig.json',
-    'pyproject.toml'
-}
-require("lspconfig").basedpyright.setup({
-    on_attach = default_M.on_attach,
-    capabilities = default_M.capabilities,
-    on_init = default_M.on_init,
-    root_dir = function(fname)
-        -- Search root_files for a match using vim.fs.root(fname, root_file) using the files in root_files
-        for _, file in ipairs(pyright_root_files) do
-            local result = vim.fs.root(fname, file)
-            if result then
-                return result
-            end
-        end
-    end
-})
-
-require("lspconfig").clangd.setup({
-  on_attach = default_M.on_attach,
-  capabilities = default_M.capabilities,
-  on_init = default_M.on_init,
-})
-
 require("mason-lspconfig").setup({
-    automatic_installation = true,
+    automatic_installation = false,
     ensure_installed = { "jdtls", "ts_ls", "bashls" }
 })
 
@@ -187,3 +128,65 @@ require("mason-lspconfig").setup_handlers {
     --     require("rust-tools").setup {}
     -- end
 }
+
+dofile(vim.g.base46_cache .. "lsp")
+require("nvchad.lsp").diagnostic_config()
+
+-- Define configs for pre-installed LSPs
+require('lspconfig').lua_ls.setup({
+    cmd = {
+        "lua-language-server",
+        "--logpath=~/.cache/lua-language-server/log",
+        "--metapath=~/.cache/lua-language-server/meta"},
+    on_attach = default_M.on_attach,
+    capabilities = default_M.capabilities,
+    on_init = default_M.on_init,
+
+    settings = {
+        Lua = {
+            runtime = {
+                version = "LuaJIT"
+            },
+            diagnostics = {
+                globals = { "vim" },
+            },
+            workspace = {
+                checkThirdParty = false,
+                library = {
+                    vim.fn.expand "$VIMRUNTIME/lua",
+                    vim.fn.expand "$VIMRUNTIME/lua/vim/lsp",
+                    vim.fn.stdpath "data" .. "/lazy/ui/nvchad_types",
+                    vim.fn.stdpath "data" .. "/lazy/lazy.nvim/lua/lazy",
+                    "${3rd}/luv/library",
+                },
+                maxPreload = 100000,
+                preloadFileSize = 10000,
+            },
+        },
+    },
+})
+
+local pyright_root_files = {
+    'pyrightconfig.json',
+    'pyproject.toml'
+}
+require("lspconfig").basedpyright.setup({
+    on_attach = default_M.on_attach,
+    capabilities = default_M.capabilities,
+    on_init = default_M.on_init,
+    root_dir = function(fname)
+        -- Search root_files for a match using vim.fs.root(fname, root_file) using the files in root_files
+        for _, file in ipairs(pyright_root_files) do
+            local result = vim.fs.root(fname, file)
+            if result then
+                return result
+            end
+        end
+    end
+})
+
+require("lspconfig").clangd.setup({
+  on_attach = default_M.on_attach,
+  capabilities = default_M.capabilities,
+  on_init = default_M.on_init,
+})
