@@ -17,6 +17,25 @@ map("n", "<leader>dp", vim.diagnostic.goto_prev, { desc = "Go to prev diagnostic
 map("n", "<leader>ln", ":lnext<CR>", { silent = true, desc = "Go to next location in location list" })
 map("n", "<leader>lp", ":lprev<CR>", { silent = true, desc = "Go to next location in location list" })
 
+-- Clipboard reloader
+local function reload_clipboard_provider()
+  -- Unset the loaded clipboard provider
+  vim.g.loaded_clipboard_provider = nil
+
+  -- Reload the clipboard provider
+  vim.cmd("runtime autoload/provider/clipboard.vim")
+
+  -- Check if the clipboard provider was reloaded successfully
+  local health_check = vim.fn["provider#clipboard#Executable"]()
+  if health_check then
+    vim.notify("Clipboard provider successfully reloaded.", vim.log.levels.INFO)
+  else
+    vim.notify("Failed to reload clipboard provider. Check your environment.", vim.log.levels.ERROR)
+  end
+end
+
+vim.api.nvim_create_user_command("ReloadClipboard", reload_clipboard_provider, {})
+
 -- Clear location list
 map("n", "<leader>cl", function()
   vim.fn.setloclist(0, {})
