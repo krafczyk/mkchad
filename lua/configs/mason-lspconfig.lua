@@ -179,9 +179,11 @@ require("lspconfig").basedpyright.setup({
         for _, file in ipairs(pyright_root_files) do
             local result = vim.fs.root(fname, file)
             if result then
+                vim.notify("basedpyright found a root dir: " .. result, vim.log.levels.INFO)
                 return result
             end
         end
+        vim.notify("basedpyright failed to find a root dir with any of the following config files: " .. vim.inspect(pyright_root_files), vim.log.levels.ERROR)
     end
 })
 
