@@ -308,3 +308,13 @@ local function trigger_copilot_complete()
 end
 
 vim.keymap.set('i', '<C-c>', trigger_copilot_complete, { noremap = true, silent = true, desc = "Trigger a completion with copilot"})
+
+-- Update cmp sources when entering a new buffer
+vim.api.nvim_create_augroup('UpdateCmpSources', { clear = true})
+vim.api.nvim_create_autocmd('BufEnter', {
+  group = "UpdateCmpSources",
+  pattern = "*",
+  callback = function()
+    update_cmp_sources()
+  end
+})
