@@ -21,6 +21,12 @@ require('codecompanion').setup({
       return require("codecompanion.adapters").extend("openai", {
         env = {
           api_key = "cmd:tr -d '\n' < ~/.config/openai.token",
+        },
+        schema = {
+          model = {
+            completion = "o3-mini-high",
+            chat = "o3-mini-high",
+          },
         }
       })
     end
