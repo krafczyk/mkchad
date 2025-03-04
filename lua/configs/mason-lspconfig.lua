@@ -1,6 +1,11 @@
 local map = vim.keymap.set
 local default_M = {}
 
+local pyright_root_files = {
+    'pyrightconfig.json',
+    'pyproject.toml'
+}
+
 -- Define attach methods
 -- export on_attach & capabilities
 default_M.on_attach = function(_, bufnr)
@@ -166,10 +171,6 @@ require('lspconfig').lua_ls.setup({
     },
 })
 
-local pyright_root_files = {
-    'pyrightconfig.json',
-    'pyproject.toml'
-}
 require("lspconfig").basedpyright.setup({
     on_attach = default_M.on_attach,
     capabilities = default_M.capabilities,
