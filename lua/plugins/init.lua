@@ -4,16 +4,16 @@ return {
     -- event = 'BufWritePre', -- uncomment for format on save
     opts = require "configs.conform",
   },
-  {
-    "jedrzejboczar/possession.nvim",
-    lazy=false,
-    dependencies = {
-      "nvim-telescope/telescope.nvim"
-    },
-    config = function()
-      require "configs.possession"
-    end
-  },
+  -- {
+  --   "jedrzejboczar/possession.nvim",
+  --   lazy=false,
+  --   dependencies = {
+  --     "nvim-telescope/telescope.nvim"
+  --   },
+  --   config = function()
+  --     require "configs.possession"
+  --   end
+  -- },
   {
     "folke/noice.nvim",
     event = "VeryLazy",
