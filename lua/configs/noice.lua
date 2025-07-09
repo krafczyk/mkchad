@@ -12,6 +12,7 @@ require('noice').setup({
     bottom_search = true, -- use a classic bottom cmdline for search
     command_palette = true, -- position the cmdline and popupmenu together
     long_message_to_split = true, -- long messages will be sent to a split
+    cmdline_output_to_split = true, -- cmdline output gets it's own split
     inc_rename = false, -- enables an input dialog for inc-rename.nvim
     lsp_doc_border = false, -- add a border to hover docs and signature help
   },
@@ -26,5 +27,36 @@ require('noice').setup({
         height = "auto",
       }
     },
+  },
+  routes = {
+    -- 1.  Catch :write confirmations *before* they reach the split route
+    {
+      filter = {
+        event = "msg_show",
+        -- catch EVERYTHING *except* the shell-output that goes to the split
+	["not"] = { kind = "cmdline_output" },
+        max_height = 3, -- multi-line logs still go to the split
+      },
+      view   = "notify",
+      opts   = { replace = true, timeout = 2000 },
+    },
+    --{
+    --  filter = {
+    --    event = "msg_show",
+    --    kind  = "bufwrite",  -- ← "w {file} written" lines
+    --  },
+    --  view = "notify", -- or "mini", "popup", …
+    --  opts = { replace = true, timeout = 1500 }, -- fade after 1.5 s
+    --},
+    -- 2.  (other custom routes …)
+    --{
+    --  filter = {
+    --  event = "msg_show",
+    --  kind = "emsg"
+    --},
+    --view = "notify",
+    --opts   = { level = vim.log.levels.ERROR, title = "Error" },
+    --}, --
+    -- 3.  Finally the preset’s own route handles "cmdline_output"
   }
 })

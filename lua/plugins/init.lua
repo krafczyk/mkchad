@@ -64,28 +64,30 @@ return {
     end
   },
   {
-    "williamboman/mason-lspconfig.nvim",
-    lazy=false,
-    dependencies={
+    "mason-org/mason-lspconfig.nvim",
+    event = {"BufReadPre", "BufNewFile"},
+    opts = {},
+    dependencies = {
+      { "mason-org/mason.nvim", opts = {} },
       "neovim/nvim-lspconfig",
-      "williamboman/mason.nvim"
     },
     config = function()
-      require "configs.mason-lspconfig"
+      require("mason").setup()
+      require "configs.lsp"
     end
   },
   {
-  	"nvim-treesitter/nvim-treesitter",
+    "nvim-treesitter/nvim-treesitter",
     config = function()
       require "configs.nvim-treesitter"
     end,
-  	opts = {
-  		ensure_installed = {
-  			"vim", "lua", "vimdoc",
+    opts = {
+      ensure_installed = {
+        "vim", "lua", "vimdoc",
         "html", "css", "c", "python",
         "bash", "markdown"
-  		},
-  	},
+      },
+    },
   },
   {
     "olimorris/codecompanion.nvim",
