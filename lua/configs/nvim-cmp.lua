@@ -133,17 +133,8 @@ vim.api.nvim_set_keymap('n', '<leader>ct', ':lua ToggleCmp()<CR>', { noremap = t
 
 -- Method to update cmp sources given the current Copilot state
 local function set_cmp_sources(copilot)
-  local cur_cmp = require('cmp')
-  cur_cmp.abort() -- Aborting completion session
-  if copilot then
-    cur_cmp.setup({
-      sources = cmp_sources_w_copilot
-    })
-  else
-    cur_cmp.setup({
-      sources = cmp_sources_wo_copilot
-    })
-  end
+  local sources = copilot and cmp_sources_w_copilot or cmp_sources_wo_copilot
+  require('cmp').setup.buffer({ sources = sources })
 end
 
 local function update_cmp_sources()
