@@ -70,11 +70,21 @@ return {
     dependencies = {
       { "mason-org/mason.nvim", opts = {} },
       "neovim/nvim-lspconfig",
+      "ray-x/lsp_signature.nvim"
     },
     config = function()
       require("mason").setup()
       require "configs.lsp"
     end
+  },
+  {
+    "ray-x/lsp_signature.nvim",
+    opts = {
+      bind = true,
+      handler_opts = {
+        border = "rounded"
+      }
+    },
   },
   {
     "nvim-treesitter/nvim-treesitter",
