@@ -1,5 +1,6 @@
 require('noice').setup({
   lsp = {
+    signature = { enabled = false, },
     -- override markdown rendering so that **cmp** and other plugins use **Treesitter**
     override = {
       ["vim.lsp.util.convert_input_to_markdown_lines"] = true,
@@ -40,23 +41,5 @@ require('noice').setup({
       view   = "notify",
       opts   = { replace = true, timeout = 2000 },
     },
-    --{
-    --  filter = {
-    --    event = "msg_show",
-    --    kind  = "bufwrite",  -- ← "w {file} written" lines
-    --  },
-    --  view = "notify", -- or "mini", "popup", …
-    --  opts = { replace = true, timeout = 1500 }, -- fade after 1.5 s
-    --},
-    -- 2.  (other custom routes …)
-    --{
-    --  filter = {
-    --  event = "msg_show",
-    --  kind = "emsg"
-    --},
-    --view = "notify",
-    --opts   = { level = vim.log.levels.ERROR, title = "Error" },
-    --}, --
-    -- 3.  Finally the preset’s own route handles "cmdline_output"
   }
 })
