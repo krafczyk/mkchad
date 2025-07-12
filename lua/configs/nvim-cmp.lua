@@ -1,4 +1,4 @@
-local luasnip = require('luasnip')
+-- local luasnip = require('luasnip')
 local cmp = require('cmp')
 local lspkind = require('lspkind')
 
@@ -28,7 +28,7 @@ end, { desc = "Print the current state of the Copilot manager." })
 
 local cmp_sources_wo_copilot = {
   { name = "nvim_lsp" },
-  { name = "luasnip" },
+  -- { name = "luasnip" },
   { name = "buffer" },
   { name = "nvim_lua" },
   { name = "async_path" },
@@ -37,7 +37,7 @@ local cmp_sources_wo_copilot = {
 local cmp_sources_w_copilot = {
   { name = "copilot" , priority = 100 }, -- Unsure if this is the right priority level
   { name = "nvim_lsp" },
-  { name = "luasnip" },
+  -- { name = "luasnip" },
   { name = "buffer" },
   { name = "nvim_lua" },
   { name = "async_path" },
@@ -48,12 +48,12 @@ cmp.setup {
   enabled = function()
     return cmp_enabled
   end,
-  snippet = {
-    expand = function(args)
-      -- vim.snippet.expand(args.body) -- For native neovim snippets
-      luasnip.lsp_expand(args.body) -- For LuaSnip users
-    end,
-  },
+  -- snippet = {
+  --   expand = function(args)
+  --     -- vim.snippet.expand(args.body) -- For native neovim snippets
+  --     luasnip.lsp_expand(args.body) -- For LuaSnip users
+  --   end,
+  -- },
   window = {
     completion = cmp.config.window.bordered(),
     documentation = cmp.config.window.bordered(),
@@ -67,13 +67,13 @@ cmp.setup {
     ['<C-space>'] = cmp.mapping.complete(),
     ['<CR>'] = cmp.mapping(function(fallback)
       if cmp.visible() then
-        if luasnip.expandable() then
-          luasnip.expand()
-        else
+        -- if luasnip.expandable() then
+        --   luasnip.expand()
+        -- else
           cmp.confirm({
             select = true,
           })
-        end
+        -- end
       else
         fallback()
       end
@@ -81,8 +81,8 @@ cmp.setup {
     ['<Tab>'] = cmp.mapping(function(fallback)
       if cmp.visible() then
         cmp.select_next_item()
-      elseif luasnip.locally_jumpable(1) then
-        luasnip.jump(1)
+      -- elseif luasnip.locally_jumpable(1) then
+      --   luasnip.jump(1)
       else
         fallback()
       end
@@ -90,8 +90,8 @@ cmp.setup {
     ["<S-Tab>"] = cmp.mapping(function(fallback)
       if cmp.visible() then
         cmp.select_prev_item()
-      elseif luasnip.locally_jumpable(-1) then
-        luasnip.jump(-1)
+      -- elseif luasnip.locally_jumpable(-1) then
+      --   luasnip.jump(-1)
       else
         fallback()
       end
@@ -109,7 +109,7 @@ cmp.setup {
         copilot = "[Copilot]",
         buffer = "[Buffer]",
         nvim_lsp = "[LSP]",
-        luasnip = "[LuaSnip]",
+        -- luasnip = "[LuaSnip]",
         nvim_lua = "[Lua]",
         async_path = "[Path]",
         --latex_symbols = "[Latex]",
