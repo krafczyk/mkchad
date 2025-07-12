@@ -4,6 +4,11 @@ return {
     -- event = 'BufWritePre', -- uncomment for format on save
     opts = require "configs.conform",
   },
+  -- Basic plugins which don't need anything special
+  {
+    "tpope/vim-commentary",
+    lazy=false,
+  },
   -- {
   --   "jedrzejboczar/possession.nvim",
   --   lazy=false,
@@ -29,11 +34,6 @@ return {
     config = function()
       require "configs.noice"
     end
-  },
-  -- Basic plugins which don't need anything special
-  {
-    "tpope/vim-commentary",
-    lazy=false,
   },
   -- These are some examples, uncomment them if you want to see them work!
   {
