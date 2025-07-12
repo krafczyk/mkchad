@@ -7,6 +7,8 @@ local map = vim.keymap.set
 map("n", ";", ":", { desc = "CMD enter command mode" })
 map("i", "jk", "<ESC>")
 
+-- Stop terminal opening when pressing 'esc'+'h' in quick succession
+map('n', '<M-h>', '<Nop>', { noremap = true, silent = true })
 
 -- Hover Diagnostic Command
 map("n", "<leader>d", vim.diagnostic.open_float)
