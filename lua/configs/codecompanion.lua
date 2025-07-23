@@ -24,8 +24,8 @@ require('codecompanion').setup({
         },
         schema = {
           model = {
-            completion = "o3-mini-high",
-            chat = "o3-mini-high",
+            completion = "o4-mini",
+            chat = "o4-mini",
           },
         }
       })
