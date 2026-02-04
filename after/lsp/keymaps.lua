@@ -16,3 +16,13 @@ end
 vim.api.nvim_create_autocmd("LspAttach", {
   callback = function(ev) bufmap(ev.buf) end,
 })
+
+vim.api.nvim_create_autocmd('LspAttach', {
+  callback = function(args)
+    if vim.bo[args.buf].buftype == 'prompt' then
+      local client = vim.lsp.get_client_by_id(args.data.client_id)
+      if client then vim.lsp.buf_detach_client(args.buf, client.id) end
+    end
+  end,
+})
+
