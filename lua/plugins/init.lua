@@ -35,6 +35,30 @@ return {
       require "configs.noice"
     end
   },
+  {
+    "folke/snacks.nvim",
+    priority = 1000,
+    lazy = false,
+    opts = {
+      input = { enabled = true },
+      terminal = { enabled = true },
+      picker = {
+        enabled = true,
+        actions = {
+          opencode_send = function(...)
+            return require("opencode").snacks_picker_send(...)
+          end,
+        },
+        win = {
+          input = {
+            keys = {
+              ["<a-a>"] = { "opencode_send", mode = { "n", "i" } },
+            },
+          },
+        },
+      },
+    },
+  },
   -- These are some examples, uncomment them if you want to see them work!
   {
     "zbirenbaum/copilot.lua",
@@ -88,26 +112,105 @@ return {
   },
   {
     "nvim-treesitter/nvim-treesitter",
-    config = function()
-      require "configs.nvim-treesitter"
-    end,
+    branch = "main",
+    build = ":TSUpdate",
+    lazy = false,
+
     opts = {
-      ensure_installed = {
-        "vim", "lua", "vimdoc",
-        "html", "css", "c", "python",
-        "bash", "markdown"
+      install_dir = vim.fn.stdpath("data") .. "/site",
+      ensure_install = {
+        "vim",
+        "lua",
+        "vimdoc",
+        "html",
+        "css",
+        "c",
+        "python",
+        "bash",
+        "markdown",
       },
     },
+
+    config = require("configs.nvim-treesitter"),
   },
+  -- {
+  --   "olimorris/codecompanion.nvim",
+  --   dependencies = {
+  --     "nvim-lua/plenary.nvim",
+  --     "nvim-treesitter/nvim-treesitter",
+  --     "echasnovski/mini.nvim",
+  --   },
+  --   config = function()
+  --     require "configs.codecompanion"
+  --   end,
+  -- },
+
   {
-    "olimorris/codecompanion.nvim",
+    "nickjvandyke/opencode.nvim",
+    version = "*",
+    cmd = "Opencode",
+    keys = {
+      {
+        "<leader>oa",
+        function()
+          require("opencode").ask("@this: ", { submit = true })
+        end,
+        mode = { "n", "x" },
+        desc = "Ask opencode",
+      },
+      {
+        "<leader>os",
+        function()
+          require("opencode").select()
+        end,
+        mode = { "n", "x" },
+        desc = "Select opencode",
+      },
+      {
+        "<leader>ot",
+        function()
+          require("opencode").toggle()
+        end,
+        mode = { "n", "t" },
+        desc = "Toggle opencode",
+      },
+      {
+        "<leader>oo",
+        function()
+          return require("opencode").operator("@this ")
+        end,
+        mode = { "n", "x" },
+        desc = "Add range to opencode",
+        expr = true,
+      },
+      {
+        "<leader>ol",
+        function()
+          return require("opencode").operator("@this ") .. "_"
+        end,
+        desc = "Add line to opencode",
+        expr = true,
+      },
+      {
+        "<leader>ou",
+        function()
+          require("opencode").command("session.half.page.up")
+        end,
+        desc = "Scroll opencode up",
+      },
+      {
+        "<leader>od",
+        function()
+          require("opencode").command("session.half.page.down")
+        end,
+        desc = "Scroll opencode down",
+      },
+    },
     dependencies = {
-      "nvim-lua/plenary.nvim",
-      "nvim-treesitter/nvim-treesitter",
-      "echasnovski/mini.nvim",
+      "folke/snacks.nvim",
     },
     config = function()
-      require "configs.codecompanion"
+      require "configs.opencode"
     end,
   },
 }

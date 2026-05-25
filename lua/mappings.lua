@@ -12,8 +12,14 @@ map('n', '<M-h>', '<Nop>', { noremap = true, silent = true })
 
 -- Hover Diagnostic Command
 map("n", "<leader>d", vim.diagnostic.open_float)
-map("n", "<leader>dn", vim.diagnostic.goto_next, { desc = "Go to next diagnostic"})
-map("n", "<leader>dp", vim.diagnostic.goto_prev, { desc = "Go to prev diagnostic"})
+
+map("n", "<leader>dn", function()
+  vim.diagnostic.jump({ count = 1, float = true })
+end, { desc = "Go to next diagnostic" })
+
+map("n", "<leader>dp", function()
+  vim.diagnostic.jump({ count = -1, float = true })
+end, { desc = "Go to prev diagnostic" })
 
 -- Navigate location list
 map("n", "<leader>ln", ":lnext<CR>", { silent = true, desc = "Go to next location in location list" })

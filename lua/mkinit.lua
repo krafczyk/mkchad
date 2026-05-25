@@ -9,13 +9,41 @@ end
 
 -- Define numbertoggle method
 -- (Changes line numbers to relative when in normal mode.)
-vim.api.nvim_exec([[
-augroup numbertoggle
-  autocmd!
-  autocmd BufEnter,FocusGained,InsertLeave,WinEnter * if &nu && mode() != "i" | set rnu   | endif
-  autocmd BufLeave,FocusLost,InsertEnter,WinLeave   * if &nu                  | set nornu | endif
-augroup END
-]], false)
+local numbertoggle = vim.api.nvim_create_augroup("numbertoggle", {
+  clear = true,
+})
+
+local function set_relativenumber(enabled)
+  if vim.wo.number then
+    vim.wo.relativenumber = enabled
+  end
+end
+
+vim.api.nvim_create_autocmd({
+  "BufEnter",
+  "FocusGained",
+  "InsertLeave",
+  "WinEnter",
+}, {
+  group = numbertoggle,
+  callback = function()
+    if vim.fn.mode() ~= "i" then
+      set_relativenumber(true)
+    end
+  end,
+})
+
+vim.api.nvim_create_autocmd({
+  "BufLeave",
+  "FocusLost",
+  "InsertEnter",
+  "WinLeave",
+}, {
+  group = numbertoggle,
+  callback = function()
+    set_relativenumber(false)
+  end,
+})
 
 -- Define swap/backup/undo file behavior
 local state = vim.fn.stdpath("state")
