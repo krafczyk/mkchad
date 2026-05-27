@@ -81,7 +81,7 @@ return {
       "zbirenbaum/copilot-cmp",
       "hrsh7th/cmp-nvim-lsp",
       "onsails/lspkind.nvim",
-      "https://codeberg.org/FelipeLema/cmp-async-path.git"
+      "FelipeLema/cmp-async-path"
     },
     config = function()
       require "configs.nvim-cmp"
