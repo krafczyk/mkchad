@@ -92,12 +92,12 @@ return {
     event = {"BufReadPre", "BufNewFile"},
     opts = {},
     dependencies = {
-      { "mason-org/mason.nvim", opts = {} },
+      { "mason-org/mason.nvim", opts = { PATH = "skip" } },
       "neovim/nvim-lspconfig",
       "ray-x/lsp_signature.nvim"
     },
     config = function()
-      require("mason").setup()
+      require("mason").setup({ PATH = "skip" })
       require "configs.lsp"
     end
   },
