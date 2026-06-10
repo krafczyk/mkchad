@@ -168,9 +168,7 @@ return {
       },
       {
         "<leader>ot",
-        function()
-          require("opencode").toggle()
-        end,
+        "<cmd>Opencode toggle<cr>",
         mode = { "n", "t" },
         desc = "Toggle opencode",
       },

@@ -167,13 +167,13 @@ local function run_opencode_command(opts)
   local action = opts.fargs[1] or ""
 
   if action == "" or action == "toggle" then
-    opencode.toggle()
+    toggle_opencode_terminal()
   elseif action == "select" then
     opencode.select()
   elseif action == "start" then
-    opencode.start()
+    start_opencode_terminal()
   elseif action == "stop" then
-    opencode.stop()
+    stop_opencode_terminal()
   elseif action == "ask" then
     opencode.ask()
   elseif action == "move" then
