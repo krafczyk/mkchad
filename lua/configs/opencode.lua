@@ -83,15 +83,12 @@ local function snacks_terminal_opts(position)
     win = vim.tbl_deep_extend("force", {
       position = position,
       enter = false,
-      on_win = function(win)
-        require("opencode.terminal").setup(win.win)
-      end,
     }, opencode_terminal_sizes[position] or {}),
   }
 end
 
 local function get_opencode_terminal(create)
-  return require("snacks").terminal.get(
+  return require("snacks.terminal").get(
     opencode_cmd,
     vim.tbl_deep_extend("force", snacks_terminal_opts(), {
       create = create,
@@ -159,7 +156,7 @@ local function stop_opencode_terminal()
 end
 
 local function toggle_opencode_terminal()
-  require("snacks").terminal.toggle(opencode_cmd, snacks_terminal_opts())
+  require("snacks.terminal").toggle(opencode_cmd, snacks_terminal_opts())
 end
 
 local function run_opencode_command(opts)
