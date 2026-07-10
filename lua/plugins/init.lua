@@ -148,7 +148,7 @@ return {
   {
     "nickjvandyke/opencode.nvim",
     version = "*",
-    cmd = "Opencode",
+    cmd = { "Opencode", "OpenCodeStart", "OpenCodeStop", "OpenCodeInfo" },
     keys = {
       {
         "<leader>oa",
