@@ -35,6 +35,14 @@ executable. Detached-child persistence depends on the SingularityCE/Apptainer
 runtime; a killed server is recovered on the next OpenCode operation. Multiple
 attached TUIs using the same directory remain an OpenCode limitation.
 
+`:OpenCodeReload` (or `:Opencode reload`) refreshes only the current absolute
+directory instance. It refuses while that directory has active work, a pending
+permission, or a pending question; it does not start an inactive server or
+restart the shared server. It recreates this Neovim's attached TUI after the
+instance refresh. Project-scoped OpenCode configuration can therefore refresh,
+but process-cached global configuration still requires `:OpenCodeStop` followed
+by the next OpenCode operation.
+
 # Credits
 
 1) Lazyvim starter https://github.com/LazyVim/starter as nvchad's starter was inspired by Lazyvim's . It made a lot of things easier!

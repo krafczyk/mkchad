@@ -123,7 +123,7 @@ local function remove_matching_state(generation)
 end
 
 local function curl_quote(value)
-  return value:gsub("\\", "\\\\"):gsub('"', '\\"')
+  return value:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", "\\n"):gsub("\r", "\\r")
 end
 
 local function probe_health(url, callback)
@@ -195,6 +195,71 @@ local function probe_health(url, callback)
       .. '"\n'
   end
   vim.fn.chansend(job, config)
+  vim.fn.chanclose(job, "stdin")
+end
+
+-- Keep reload credentials and payloads on curl's stdin, as with health probes.
+-- The directory header deliberately matches the attached TUI's current cwd.
+local function request_json(url, path, method, body, directory, callback)
+  local stdout = {}
+  local command = {
+    "curl",
+    "--silent",
+    "--show-error",
+    "--connect-timeout",
+    "1",
+    "--max-time",
+    "4",
+    "--config",
+    "-",
+    "--write-out",
+    "\n%{http_code}",
+    "-X",
+    method,
+    url .. path,
+  }
+  local job = vim.fn.jobstart(command, {
+    on_stdout = function(_, data)
+      if data then
+        vim.list_extend(stdout, data)
+      end
+    end,
+    on_exit = function(_, code)
+      vim.schedule(function()
+        local response = table.concat(stdout, "\n")
+        local status = tonumber(response:match("\n(%d%d%d)%s*$"))
+        local response_body = response:gsub("\n%d%d%d%s*$", "")
+        if status == 401 then
+          callback(nil, { kind = "unauthorized", status = status })
+        elseif code ~= 0 or not status or status < 200 or status >= 300 then
+          callback(nil, { kind = "HTTP " .. (status or "request failure"), status = status })
+        elseif response_body == "" then
+          callback({}, { kind = "ok", status = status })
+        else
+          local ok, decoded = pcall(vim.json.decode, response_body)
+          callback(ok and decoded or nil, { kind = ok and "ok" or "invalid JSON", status = status })
+        end
+      end)
+    end,
+  })
+  if job <= 0 then
+    callback(nil, { kind = "unable to launch curl" })
+    return
+  end
+  local config = {
+    'header = "Accept: application/json"',
+    'header = "Content-Type: application/json"',
+  }
+  if directory and directory ~= "" then
+    table.insert(config, 'header = "x-opencode-directory: ' .. curl_quote(directory) .. '"')
+  end
+  if vim.env.OPENCODE_SERVER_PASSWORD and vim.env.OPENCODE_SERVER_PASSWORD ~= "" then
+    table.insert(config, 'user = "' .. curl_quote((vim.env.OPENCODE_SERVER_USERNAME or "opencode") .. ":" .. vim.env.OPENCODE_SERVER_PASSWORD) .. '"')
+  end
+  if body then
+    table.insert(config, 'data-binary = "' .. curl_quote(vim.json.encode(body)) .. '"')
+  end
+  vim.fn.chansend(job, table.concat(config, "\n") .. "\n")
   vim.fn.chanclose(job, "stdin")
 end
 
@@ -1008,6 +1073,190 @@ local function stop_shared_server()
   end)
 end
 
+local reload_waiters = {}
+local reload_active = false
+
+local function absolute_cwd()
+  local cwd = vim.fn.getcwd()
+  if cwd == "" then
+    return nil
+  end
+  local absolute = vim.fn.fnamemodify(cwd, ":p")
+  return absolute == "/" and absolute or absolute:gsub("/$", "")
+end
+
+local function contains_busy_status(value)
+  if type(value) == "string" then
+    return value == "busy"
+  elseif type(value) == "table" then
+    for _, child in pairs(value) do
+      if contains_busy_status(child) then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+local function contains_pending_item(value)
+  if type(value) ~= "table" then
+    return value ~= nil and value ~= false
+  end
+  if #value > 0 then
+    return true
+  end
+  for _, child in pairs(value) do
+    if contains_pending_item(child) then
+      return true
+    end
+  end
+  return false
+end
+
+local function finish_reload(ok, message)
+  local callbacks = reload_waiters
+  reload_waiters = {}
+  reload_active = false
+  for _, callback in ipairs(callbacks) do
+    callback(ok, message)
+  end
+end
+
+local function reload_current_directory(callback)
+  table.insert(reload_waiters, callback or function() end)
+  if reload_active then
+    return
+  end
+  reload_active = true
+
+  local directory = absolute_cwd()
+  if not directory then
+    finish_reload(false, "Unable to determine the current Neovim directory for OpenCode reload")
+    return
+  end
+  local initial_state = read_state()
+  managed_state_if_healthy(initial_state, nil, function(healthy_state, detail)
+    if not healthy_state then
+      finish_reload(
+        false,
+        "OpenCode reload is inactive for " .. directory .. " (" .. (detail and detail.kind or "inactive") .. "); it did not start a server"
+      )
+      return
+    end
+    acquire_lock(function(locked, lock_err)
+      if not locked then
+        finish_reload(false, "OpenCode reload could not acquire the lifecycle lock: " .. (lock_err or "unknown error"))
+        return
+      end
+      local function fail(phase, err)
+        release_lock()
+        finish_reload(
+          false,
+          "OpenCode reload failed during " .. phase .. " for " .. directory .. ": " .. (err or "unknown error")
+        )
+      end
+      local function request(path, method, body, done)
+        request_json(healthy_state.url, path, method, body, directory, function(result, request_detail)
+          if result then
+            done(result)
+          else
+            done(nil, request_detail.kind)
+          end
+        end)
+      end
+      local locked_state = read_state()
+      managed_state_if_healthy(locked_state, nil, function(rechecked, recheck_detail)
+        if not rechecked then
+          fail("managed-state validation", recheck_detail and recheck_detail.kind)
+          return
+        end
+        if rechecked.pid ~= healthy_state.pid or rechecked.generation ~= healthy_state.generation or rechecked.url ~= healthy_state.url then
+          fail("managed-state validation", "the shared server changed while reload was waiting")
+          return
+        end
+        request("/session/status", "GET", nil, function(status, status_err)
+          if not status then
+            fail("session-status preflight", status_err)
+          elseif contains_busy_status(status) then
+            fail("session-status preflight", "current-directory work is active; reload was not attempted")
+          else
+            request("/permission", "GET", nil, function(permissions, permission_err)
+              if not permissions then
+                fail("permission preflight", permission_err)
+              elseif contains_pending_item(permissions) then
+                fail("permission preflight", "a current-directory permission is pending; reload was not attempted")
+              else
+                request("/question", "GET", nil, function(questions, question_err)
+                  if not questions then
+                    fail("question preflight", question_err)
+                  elseif contains_pending_item(questions) then
+                    fail("question preflight", "a current-directory question is pending; reload was not attempted")
+                  else
+                    request("/instance/dispose", "POST", nil, function(_, dispose_err)
+                      if dispose_err then
+                        fail("instance disposal", dispose_err)
+                        return
+                      end
+                      local connected = require("opencode.server").connected
+                      if connected then
+                        connected:disconnect()
+                      end
+                      close_local_tui()
+                      request("/path", "GET", nil, function(path, path_err)
+                        if not path then
+                          fail("instance recreation", path_err)
+                        elseif path.directory ~= directory then
+                          fail(
+                            "routed-path validation",
+                            "server returned " .. vim.inspect(path.directory) .. " instead of " .. directory
+                          )
+                        else
+                          ensure_local_tui(rechecked, function(tui_ok, tui_err)
+                            if not tui_ok then
+                              fail("local TUI recreation", tui_err)
+                              return
+                            end
+                            local loaded, discovery = pcall(require, "opencode.server.discovery")
+                            if not loaded then
+                              fail("plugin reconnection", discovery)
+                              return
+                            end
+                            discovery.get():next(function()
+                              local final_state = read_state()
+                              if not final_state
+                                or final_state.pid ~= rechecked.pid
+                                or final_state.generation ~= rechecked.generation
+                                or final_state.url ~= rechecked.url
+                                or final_state.port ~= rechecked.port
+                              then
+                                fail("shared-server validation", "shared server state changed during reload")
+                                return
+                              end
+                              release_lock()
+                              finish_reload(
+                                true,
+                                "Reloaded OpenCode instance for "
+                                  .. directory
+                                  .. "; global process-cached configuration may still require shared stop/start"
+                              )
+                            end):catch(function(err)
+                              fail("plugin reconnection", tostring(err))
+                            end)
+                          end)
+                        end
+                      end)
+                    end)
+                  end
+                end)
+              end
+            end)
+          end
+        end)
+      end)
+    end)
+  end)
+end
+
 local function show_info()
   local state, state_status = read_state()
   local configured, configured_err = explicit_port()
@@ -1083,7 +1332,7 @@ local function complete_opencode(arg_lead, cmdline)
   end
   return vim.tbl_filter(function(action)
     return vim.startswith(action, arg_lead)
-  end, { "ask", "info", "move", "select", "start", "stop", "toggle" })
+  end, { "ask", "info", "move", "reload", "select", "start", "stop", "toggle" })
 end
 
 local function run_opencode_command(opts)
@@ -1096,6 +1345,10 @@ local function run_opencode_command(opts)
     stop_shared_server()
   elseif action == "info" then
     show_info()
+  elseif action == "reload" then
+    reload_current_directory(function(ok, message)
+      notify(message, ok and vim.log.levels.INFO or vim.log.levels.WARN)
+    end)
   elseif action == "move" then
     move_terminal(opts.fargs[2] or "default")
   elseif action == "ask" then
@@ -1139,6 +1392,14 @@ vim.api.nvim_create_user_command("OpenCodeInfo", show_info, {
   desc = "Show live OpenCode server information without starting it",
   force = true,
 })
+vim.api.nvim_create_user_command("OpenCodeReload", function()
+  reload_current_directory(function(ok, message)
+    notify(message, ok and vim.log.levels.INFO or vim.log.levels.WARN)
+  end)
+end, {
+  desc = "Reload the current OpenCode directory instance without restarting the shared server",
+  force = true,
+})
 
 -- Narrow test seam for the headless lifecycle regression script. It is only
 -- installed when explicitly requested before this configuration is sourced.
@@ -1155,6 +1416,7 @@ if vim.g.mkchad_opencode_test_api then
     read_state = read_state,
     write_state = write_state,
     ensure_local_tui = ensure_local_tui,
+    reload_current_directory = reload_current_directory,
     tui_valid = tui_valid,
   }
 end
