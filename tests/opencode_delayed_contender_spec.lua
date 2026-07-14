@@ -47,6 +47,9 @@ if mode == "worker" then
   end, 10), "contender timed out")
   assert(ok, err)
   local state = lifecycle.read_state()
+  if vim.env.MKCHAD_OPENCODE_EXPECT_FALLBACK == "1" then
+    assert(state.port ~= 4096 and state.port_source == "fallback", "contenders must converge on a persisted high fallback")
+  end
   vim.fn.writefile({ state.generation, tostring(state.pid) }, vim.env.MKCHAD_OPENCODE_RESULT .. "." .. vim.fn.getpid())
   vim.cmd("qa!")
 end

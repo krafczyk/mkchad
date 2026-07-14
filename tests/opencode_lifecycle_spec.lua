@@ -27,6 +27,22 @@ local function wait_for(callback)
   return unpack(result)
 end
 
+local function health_listener(port)
+  local server = assert(vim.uv.new_tcp())
+  assert(server:bind("127.0.0.1", port) == 0, "could not bind health fixture")
+  assert(server:listen(8, function(err)
+    assert(not err, err)
+    local client = assert(vim.uv.new_tcp())
+    server:accept(client)
+    client:read_start(function()
+      client:write("HTTP/1.1 200 OK\r\nContent-Length: 16\r\n\r\n{\"healthy\":true}")
+      client:read_stop()
+      client:close()
+    end)
+  end) == 0)
+  return server
+end
+
 if vim.env.MKCHAD_OPENCODE_LOCK_WORKER == "1" then
   local acquired = wait_for(lifecycle.acquire_lock)
   if acquired then
@@ -222,6 +238,92 @@ assert_equal(persisted.generation, "401-test", "401 must leave managed state unc
 assert(vim.fn.jobwait({ auth_job }, 0)[1] == -1, "401 must not replace the existing backend")
 vim.fn.jobstop(auth_job)
 auth_server:close()
+
+-- A matching argv alone is insufficient: a separate healthy responder must
+-- not turn a non-listening managed PID into an adopted backend.
+local ownership_port = 49889
+local ownership_responder = health_listener(ownership_port)
+local ownership_job = vim.fn.jobstart({
+  "python3",
+  "-c",
+  "import time; time.sleep(30)",
+  "serve",
+  "--hostname",
+  "127.0.0.1",
+  "--port",
+  tostring(ownership_port),
+})
+local ownership_pid = vim.fn.jobpid(ownership_job)
+assert(vim.wait(1000, function()
+  return vim.uv.fs_readlink("/proc/" .. ownership_pid .. "/exe") ~= nil
+end, 10), "non-listener fixture did not exec")
+local ownership_state = {
+  schema = 1,
+  hostname = vim.uv.os_gethostname():gsub("[^%w_.-]", "_"),
+  pid = ownership_pid,
+  generation = "non-listening-owned-pid",
+  host = "127.0.0.1",
+  port = ownership_port,
+  url = "http://127.0.0.1:" .. ownership_port,
+  process_executable = vim.uv.fs_readlink("/proc/" .. ownership_pid .. "/exe"),
+  argv = proc_argv(ownership_pid),
+}
+assert(lifecycle.process_is_owned(ownership_state))
+assert(not lifecycle.process_listens_on_port(ownership_pid, ownership_port), "fixture unexpectedly owns responder socket")
+assert(lifecycle.write_state(ownership_state))
+local ownership_done, ownership_ok, ownership_err = false, nil, nil
+vim.g.opencode_opts.server.ensure(function(ok, err)
+  ownership_done, ownership_ok, ownership_err = true, ok, err
+end)
+assert(vim.wait(3000, function()
+  return ownership_done
+end, 10), "non-listener ownership ensure did not finish")
+assert_equal(ownership_ok, false, "non-listening PID must not be treated as a healthy managed server")
+assert(ownership_err:find("Refusing to adopt a healthy unmanaged OpenCode endpoint", 1, true), ownership_err)
+assert(ownership_err:find("does not own the listening socket", 1, true), ownership_err)
+assert_equal(lifecycle.read_state().generation, ownership_state.generation, "unmanaged endpoint state must be preserved")
+assert(vim.fn.jobwait({ ownership_job }, 0)[1] == -1, "non-listening process must not be signaled")
+vim.fn.jobstop(ownership_job)
+ownership_responder:close()
+vim.uv.fs_unlink(lifecycle.paths().state)
+
+-- Availability must include listen(), not merely bind(). When 4096 is free,
+-- controlled HTTP and non-HTTP listeners exercise both kinds there. When a
+-- host service already owns 4096, do not inspect it; it still must trigger the
+-- same automatic fallback.
+local preferred_port = 4096
+local fallback, fallback_source
+if lifecycle.port_is_available(preferred_port) then
+  local unknown_healthy = health_listener(preferred_port)
+  assert(not lifecycle.port_is_available(preferred_port), "unknown healthy listener must occupy 4096")
+  fallback, fallback_source = lifecycle.select_port(nil)
+  assert(fallback ~= preferred_port and fallback_source == "fallback", "healthy unknown 4096 must select a high fallback")
+  unknown_healthy:close()
+  local non_http = assert(vim.uv.new_tcp())
+  assert(non_http:bind("127.0.0.1", preferred_port) == 0, "could not bind non-HTTP fixture")
+  assert(non_http:listen(1, function() end) == 0)
+  assert(not lifecycle.port_is_available(preferred_port), "non-HTTP listener must occupy 4096")
+  fallback, fallback_source = lifecycle.select_port(nil)
+  assert(fallback ~= preferred_port and fallback_source == "fallback", "non-HTTP 4096 must select a high fallback")
+  non_http:close()
+else
+  fallback, fallback_source = lifecycle.select_port(nil)
+  assert(fallback ~= preferred_port and fallback_source == "fallback", "occupied 4096 must select a high fallback")
+end
+local fixture_port = 49890
+local unknown_healthy = health_listener(fixture_port)
+assert(not lifecycle.port_is_available(fixture_port), "unknown healthy listener must occupy its port")
+unknown_healthy:close()
+local non_http = assert(vim.uv.new_tcp())
+assert(non_http:bind("127.0.0.1", fixture_port) == 0, "could not bind non-HTTP fixture")
+assert(non_http:listen(1, function() end) == 0)
+assert(not lifecycle.port_is_available(fixture_port), "non-HTTP listener must occupy its port")
+non_http:close()
+
+-- A failed automatic candidate is explicitly excluded before retry selection,
+-- so the bounded retry cannot select 4096 again even if its bind race clears.
+local retry_port, retry_source = lifecycle.select_port(nil, { [preferred_port] = true })
+assert(retry_port ~= preferred_port and retry_source == "fallback", "automatic retry must exclude its failed candidate")
 
 -- A simultaneous pair can create only one atomic lock directory. The second
 -- worker is started by the shell harness below so this single process test

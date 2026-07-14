@@ -269,6 +269,12 @@ local function port_is_available(port)
     return false
   end
   local ok = tcp:bind(host, port)
+  if ok == 0 then
+    -- libuv can bind an already-listened-to port on some platforms until a
+    -- listener is actually created. Probe the complete operation so automatic
+    -- selection never mistakes an occupied endpoint for an available one.
+    ok = tcp:listen(1, function() end)
+  end
   tcp:close()
   return ok == 0
 end
@@ -573,7 +579,10 @@ local function resolve_executable()
   return executable, version
 end
 
-local function select_port(state)
+local function select_port(state, excluded_ports)
+  local function available(port)
+    return not (excluded_ports and excluded_ports[port]) and port_is_available(port)
+  end
   local requested, request_err = explicit_port()
   if request_err then
     return nil, nil, request_err
@@ -584,22 +593,22 @@ local function select_port(state)
     end
     return requested, "explicit"
   end
-  if state and port_is_available(state.port) then
+  if state and available(state.port) then
     return state.port, "persisted"
   end
-  if port_is_available(preferred_port) then
+  if available(preferred_port) then
     return preferred_port, "preferred 4096"
   end
   for _ = 1, 20 do
     local candidate = math.random(49152, 65535)
-    if port_is_available(candidate) then
+    if available(candidate) then
       return candidate, "fallback"
     end
   end
   return nil, nil, "Unable to find an available OpenCode port"
 end
 
-local function spawn_server(state, deadline_ns, callback)
+local function spawn_server(state, deadline_ns, callback, excluded_ports)
   local state_paths = paths()
   local executable, version, executable_err = resolve_executable()
   if not executable then
@@ -619,7 +628,7 @@ local function spawn_server(state, deadline_ns, callback)
     return
   end
   uv.fs_chmod(state_paths.log, 384)
-  local port, source, port_err = select_port(state)
+  local port, source, port_err = select_port(state, excluded_ports)
   if not port then
     uv.fs_close(stdin_fd)
     uv.fs_close(log_fd)
@@ -664,14 +673,14 @@ local function spawn_server(state, deadline_ns, callback)
     }
     local owned, ownership = process_is_owned(managed)
     if not owned then
-      callback(nil, "OpenCode child exited or did not exec the expected command (" .. ownership .. "); see " .. state_paths.log)
+      callback(nil, "OpenCode child exited or did not exec the expected command (" .. ownership .. "); see " .. state_paths.log, port)
       return
     end
     local wrote, write_err = write_state(managed)
     if not wrote then
       terminate_generation(managed, deadline_ns, function(cleaned, cleanup_err)
         local suffix = cleaned and "" or "; cleanup failed: " .. (cleanup_err or "unknown error")
-        callback(nil, write_err .. suffix)
+        callback(nil, write_err .. suffix, port)
       end)
       return
     end
@@ -703,7 +712,8 @@ local function spawn_server(state, deadline_ns, callback)
             .. ownership_suffix
             .. cleanup_suffix
             .. "; see "
-            .. state_paths.log
+            .. state_paths.log,
+          port
         )
       end)
     end)
@@ -840,6 +850,11 @@ local function managed_state_if_healthy(state, requested, callback)
         })
       elseif not owned then
         callback(nil, { kind = "unmanaged-endpoint", message = ownership })
+      elseif not process_listens_on_port(state.pid, state.port) then
+        callback(nil, {
+          kind = "unmanaged-endpoint",
+          message = "managed PID does not own the listening socket for " .. state.url,
+        })
       else
         callback(state, detail)
       end
@@ -902,13 +917,14 @@ local function ensure_backend(callback)
           finish_ensure(false, "OpenCode startup lock ownership was lost before launch")
           return
         end
-        spawn_server(locked_state, deadline_ns, function(started, start_err)
+        spawn_server(locked_state, deadline_ns, function(started, start_err, failed_port)
           if not started and not requested and attempt < 2 and uv.hrtime() < deadline_ns then
             -- A bind race may only retry through automatic port selection.
             if not lock_is_owned() then
               finish_ensure(false, "OpenCode startup lock ownership was lost before automatic retry")
               return
             end
+            local excluded_ports = failed_port and { [failed_port] = true } or nil
             spawn_server(nil, deadline_ns, function(retried, retry_err)
               release_lock()
               if not retried then
@@ -918,7 +934,7 @@ local function ensure_backend(callback)
               ensure_local_tui(retried, function(ok, err)
                 finish_ensure(ok, err, retried)
               end)
-            end)
+            end, excluded_ports)
             return
           end
           release_lock()
@@ -1409,9 +1425,11 @@ if vim.g.mkchad_opencode_test_api then
     lock_is_owned = lock_is_owned,
     paths = paths,
     process_listens_on_port = process_listens_on_port,
+    port_is_available = port_is_available,
     process_is_owned = process_is_owned,
     release_lock = release_lock,
     spawn_server = spawn_server,
+    select_port = select_port,
     terminate_generation = terminate_generation,
     read_state = read_state,
     write_state = write_state,
