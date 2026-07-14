@@ -7,6 +7,14 @@ local function assert_equal(actual, expected, message)
   assert(actual == expected, (message or "values differ") .. ": " .. vim.inspect(actual) .. " ~= " .. vim.inspect(expected))
 end
 
+local function proc_argv(pid)
+  local fd = assert(vim.uv.fs_open("/proc/" .. pid .. "/cmdline", "r", 0))
+  local size = vim.uv.fs_fstat(fd).size
+  local content = assert(vim.uv.fs_read(fd, size == 0 and 8192 or size, 0))
+  vim.uv.fs_close(fd)
+  return vim.split(content, "\0", { plain = true, trimempty = true })
+end
+
 local function wait_for(callback)
   local done, result = false
   callback(function(...)
@@ -59,10 +67,7 @@ local near_pid = vim.fn.jobpid(near_job)
 assert(vim.wait(1000, function()
   return vim.uv.fs_readlink("/proc/" .. near_pid .. "/exe") ~= nil
 end, 10), "near-match fixture did not exec")
-local near_argv = vim.split(vim.fn.readfile("/proc/" .. near_pid .. "/cmdline", "b")[1], "\0", {
-  plain = true,
-  trimempty = true,
-})
+local near_argv = proc_argv(near_pid)
 local near_state = {
   hostname = vim.uv.os_gethostname():gsub("[^%w_.-]", "_"),
   pid = near_pid,
@@ -117,6 +122,53 @@ end, 10), "dead local TUI was not recreated")
 assert_equal(tui_creations, 2, "SIGKILL must recreate the local TUI")
 vim.fn.jobstop(latest_tui_job)
 
+local conflict_port = 49887
+local responder = vim.fs.joinpath(lifecycle.paths().root, "healthy.py")
+assert(vim.fn.mkdir(lifecycle.paths().root, "p", 448) ~= 0 or vim.uv.fs_stat(lifecycle.paths().root))
+vim.fn.writefile({
+  "import socket, sys",
+  "sock = socket.socket(); sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)",
+  "sock.bind(('127.0.0.1', int(sys.argv[-1]))); sock.listen()",
+  "while True:",
+  "  client, _ = sock.accept(); client.recv(4096); client.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Length: 16\\r\\n\\r\\n{\\\"healthy\\\":true}'); client.close()",
+}, responder)
+local conflict_job = vim.fn.jobstart({ "python3", responder, "serve", "--hostname", "127.0.0.1", "--port", tostring(conflict_port) })
+local conflict_pid = vim.fn.jobpid(conflict_job)
+assert(vim.wait(1000, function()
+  return vim.uv.fs_readlink("/proc/" .. conflict_pid .. "/exe") ~= nil
+end, 10), "explicit-conflict fixture did not exec")
+assert(vim.wait(1000, function()
+  return lifecycle.process_listens_on_port(conflict_pid, conflict_port)
+end, 10), "explicit-conflict fixture did not listen")
+local conflict_state = {
+  schema = 1,
+  hostname = vim.uv.os_gethostname():gsub("[^%w_.-]", "_"),
+  pid = conflict_pid,
+  generation = "explicit-conflict-test",
+  host = "127.0.0.1",
+  port = conflict_port,
+  url = "http://127.0.0.1:" .. conflict_port,
+  process_executable = vim.uv.fs_readlink("/proc/" .. conflict_pid .. "/exe"),
+  argv = proc_argv(conflict_pid),
+}
+local conflict_owned, conflict_reason = lifecycle.process_is_owned(conflict_state)
+assert(conflict_owned, conflict_reason .. ": " .. vim.inspect(conflict_state.argv))
+assert(lifecycle.write_state(conflict_state))
+vim.env.OPENCODE_PORT = "49886"
+local conflict_done, conflict_ok, conflict_err = false, nil, nil
+vim.g.opencode_opts.server.ensure(function(ok, err)
+  conflict_ok, conflict_err, conflict_done = ok, err, true
+end)
+assert(vim.wait(3000, function()
+  return conflict_done
+end, 10), "explicit conflict ensure did not finish")
+assert_equal(conflict_ok, false, "different explicit port must not attach")
+assert(conflict_err:find("stop the shared server", 1, true), conflict_err)
+assert_equal(lifecycle.read_state().generation, "explicit-conflict-test", "explicit conflict must not change state")
+assert(vim.fn.jobwait({ conflict_job }, 0)[1] == -1, "explicit conflict must not replace the backend")
+vim.fn.jobstop(conflict_job)
+vim.env.OPENCODE_PORT = nil
+
 local auth_port = 49888
 local auth_server = vim.uv.new_tcp()
 assert(auth_server:bind("127.0.0.1", auth_port) == 0, "could not bind 401 fixture")
@@ -153,7 +205,7 @@ local auth_state = {
   port = auth_port,
   url = "http://127.0.0.1:" .. auth_port,
   process_executable = vim.uv.fs_readlink("/proc/" .. auth_pid .. "/exe"),
-  argv = vim.split(vim.fn.readfile("/proc/" .. auth_pid .. "/cmdline", "b")[1], "\0", { plain = true, trimempty = true }),
+  argv = proc_argv(auth_pid),
 }
 assert(lifecycle.write_state(auth_state))
 local auth_done, auth_ok, auth_err = false, nil, nil
