@@ -166,6 +166,8 @@ assert(not future_ok and future_err:find("unsupported future", 1, true), future_
 assert(table.concat(vim.fn.readfile(paths.state), ""):find("preserve", 1, true))
 
 vim.uv.fs_unlink(paths.state)
+local pending_lock_ok, pending_lock_err = await(lifecycle.acquire_lock)
+assert(pending_lock_ok, pending_lock_err)
 local pending_cases = {
   { "empty backend", function(p) p.backend = {} end },
   { "empty proxy", function(p) p.proxy = {} end },
@@ -196,5 +198,6 @@ for _, test in ipairs(pending_cases) do
   assert(vim.uv.fs_stat("/proc/" .. vim.fn.getpid()), "pending " .. test[1] .. " signaled the test process")
   vim.uv.fs_unlink(paths.pending)
 end
+lifecycle.release_lock()
 
 vim.cmd("qa!")

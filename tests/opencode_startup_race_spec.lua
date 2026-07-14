@@ -25,14 +25,14 @@ local pid_record = vim.fs.joinpath(lifecycle.paths().root, "spawned.pid")
 local responder_pid_record = vim.fs.joinpath(lifecycle.paths().root, "responder.pid")
 local request_record = vim.fs.joinpath(lifecycle.paths().root, "health-requested")
 vim.fn.writefile({
-  "#!/bin/sh",
-  'if [ "$1" = "--version" ]; then echo fake; exit 0; fi',
-  "echo $$ > \"" .. pid_record .. "\"",
-  "python3 -c 'import pathlib,socket,sys; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind((\"127.0.0.1\",int(sys.argv[1]))); s.listen(); c,a=s.accept(); pathlib.Path(sys.argv[2]).write_bytes(c.recv(4096)); c.sendall(b\"HTTP/1.1 200 OK\\r\\nContent-Length: 16\\r\\n\\r\\n{\\\"healthy\\\":true}\"); c.close()' \"$5\" \""
-    .. request_record
-    .. "\" &",
-  "echo $! > \"" .. responder_pid_record .. "\"",
-  "exec python3 -c 'import time; time.sleep(30)' \"$@\"",
+  "#!/usr/bin/env python3",
+  "import os, pathlib, subprocess, sys, time",
+  "if len(sys.argv) > 1 and sys.argv[1] == '--version': print('fake'); raise SystemExit(0)",
+  "pathlib.Path('" .. pid_record .. "').write_text(str(os.getpid()))",
+  "source = 'import pathlib,socket,sys; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind((\"127.0.0.1\",int(sys.argv[1]))); s.listen(); c,a=s.accept(); pathlib.Path(sys.argv[2]).write_bytes(c.recv(4096)); c.sendall(b\"HTTP/1.1 200 OK\\r\\nContent-Length: 16\\r\\n\\r\\n{\\\"healthy\\\":true}\"); c.close()'",
+  "responder = subprocess.Popen([sys.executable, '-c', source, sys.argv[-1], '" .. request_record .. "'])",
+  "pathlib.Path('" .. responder_pid_record .. "').write_text(str(responder.pid))",
+  "time.sleep(30)",
 }, fake)
 assert(vim.uv.fs_chmod(fake, 493))
 vim.env.PATH = lifecycle.paths().root .. ":" .. vim.env.PATH

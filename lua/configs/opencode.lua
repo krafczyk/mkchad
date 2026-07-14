@@ -1,4 +1,6 @@
 local uv = vim.uv
+local config_source = debug.getinfo(1, "S").source:gsub("^@", "")
+local config_root = vim.fs.dirname(vim.fs.dirname(vim.fs.dirname(config_source)))
 local host = "127.0.0.1"
 local preferred_port = 4096
 local startup_timeout_ms = 30000
@@ -7,6 +9,20 @@ local local_tui_bootstrap_ms = 200
 local lock_renew_interval_ms = 3000
 local proxy_max_connections = 128
 local password_warning_shown = false
+local fence_poll_interval_ms = 20
+local fence_acquire_timeout_ms = 1000
+local pidfd_helper_timeout_ms = 3000
+local subprocess_timeout_ms = 5000
+local subprocess_term_grace_ms = 250
+local subprocess_output_limit = 64 * 1024
+
+local ffi_ok, ffi = pcall(require, "ffi")
+if ffi_ok then
+  pcall(ffi.cdef, "int flock(int fd, int operation);")
+end
+local flock_exclusive = 2
+local flock_nonblocking = 4
+local flock_unlock = 8
 
 local no_password_warning = "WARNING: OPENCODE_SERVER_PASSWORD is not set. TLS authenticates the OpenCode server, not clients; both the public proxy and discoverable internal loopback backend are accessible to other local users. Set a strong existing environment password, then stop and restart the shared server."
 
@@ -33,6 +49,7 @@ local function paths()
     pending = vim.fs.joinpath(root, "pending.json"),
     log = vim.fs.joinpath(root, "server.log"),
     proxy_log = vim.fs.joinpath(root, "proxy.log"),
+    fence = vim.fs.joinpath(root, "lifecycle.fence"),
     lock = vim.fs.joinpath(root, "startup.lock"),
     lock_owner = vim.fs.joinpath(root, "startup.lock", "owner.json"),
     tls = vim.fs.joinpath(root, "tls"),
@@ -42,6 +59,7 @@ local function paths()
     server_cert = vim.fs.joinpath(root, "tls", "server.pem"),
     password = vim.fs.joinpath(root, "tls", "store.password"),
     proxy_source = vim.fs.joinpath(vim.fn.stdpath("config"), "java", "MkChadTlsProxy.java"),
+    pidfd_helper = vim.fs.joinpath(config_root, "scripts", "opencode_pidfd_signal.py"),
   }
 end
 
@@ -65,6 +83,421 @@ local function ensure_state_dir()
   end
   uv.fs_chmod(state_paths.root, 448)
   return state_paths
+end
+
+local fence_fd
+local test_hooks = {}
+local write_private
+local release_lock
+local valid_argv
+local active_subprocesses = {}
+
+local function fence_is_held()
+  return fence_fd ~= nil
+end
+
+local function release_fence()
+  local fd = fence_fd
+  fence_fd = nil
+  if not fd then
+    return
+  end
+  if ffi_ok then
+    pcall(function()
+      ffi.C.flock(fd, flock_unlock)
+    end)
+  end
+  uv.fs_close(fd)
+end
+
+local function safe_subprocess_callback(callback, ...)
+  local arguments = { n = select("#", ...), ... }
+  local ok, err = xpcall(function()
+    callback(unpack(arguments, 1, arguments.n))
+  end, debug.traceback)
+  if ok then
+    return
+  end
+  if fence_is_held() then
+    if release_lock then
+      release_lock()
+    else
+      release_fence()
+    end
+  end
+  if vim.v.exiting == vim.NIL or vim.v.exiting == 0 then
+    vim.schedule(function()
+      notify("OpenCode subprocess callback failed: " .. tostring(err), vim.log.levels.ERROR)
+    end)
+  end
+end
+
+local function subprocess_environment(overrides)
+  if not overrides then
+    return nil
+  end
+  local environment = uv.os_environ()
+  for name, value in pairs(overrides) do
+    environment[name] = value
+  end
+  local encoded = {}
+  for name, value in pairs(environment) do
+    table.insert(encoded, name .. "=" .. value)
+  end
+  return encoded
+end
+
+local function valid_subprocess_argv(argv)
+  if type(argv) ~= "table" or #argv < 1 or #argv > 128 then
+    return false
+  end
+  for key, value in pairs(argv) do
+    if type(key) ~= "number" or key % 1 ~= 0 or key < 1 or key > #argv or type(value) ~= "string" or value == "" or #value > 4096 or value:find("\0", 1, true) then
+      return false
+    end
+  end
+  return true
+end
+
+local function run_subprocess(argv, options, callback)
+  options = options or {}
+  local completed = false
+  local process
+  local pid
+  local exit_code
+  local exit_signal
+  local exited = false
+  local stdout_done = false
+  local stderr_done = false
+  local failure
+  local timed_out = false
+  local killed = false
+  local stdout = {}
+  local stderr = {}
+  local stdout_size = 0
+  local stderr_size = 0
+  local stdin_pipe = uv.new_pipe(false)
+  local stdout_pipe = uv.new_pipe(false)
+  local stderr_pipe = uv.new_pipe(false)
+  local deadline_timer = uv.new_timer()
+  local kill_timer = uv.new_timer()
+  local drain_timer = uv.new_timer()
+
+  local function close_handle(handle)
+    if handle and not handle:is_closing() then
+      handle:close()
+    end
+  end
+
+  local function close_timer(timer)
+    if timer and not timer:is_closing() then
+      timer:stop()
+      timer:close()
+    end
+  end
+
+  local function dispatch(result, err)
+    if vim.v.exiting ~= vim.NIL and vim.v.exiting ~= 0 then
+      if fence_is_held() then
+        if release_lock then
+          release_lock()
+        else
+          release_fence()
+        end
+      end
+      return
+    end
+    vim.schedule(function()
+      safe_subprocess_callback(callback, result, err)
+    end)
+  end
+
+  local function finish()
+    if completed or not exited or not stdout_done or not stderr_done then
+      return
+    end
+    completed = true
+    if pid then
+      active_subprocesses[pid] = nil
+    end
+    close_timer(deadline_timer)
+    close_timer(kill_timer)
+    close_timer(drain_timer)
+    close_handle(stdin_pipe)
+    close_handle(stdout_pipe)
+    close_handle(stderr_pipe)
+    close_handle(process)
+    local result = {
+      code = exit_code,
+      signal = exit_signal,
+      stdout = table.concat(stdout),
+      stderr = table.concat(stderr),
+      timed_out = timed_out,
+      killed = killed,
+      pid = pid,
+    }
+    local err = failure
+    if not err and exit_code ~= 0 then
+      err = ("%s exited with code %d"):format(vim.fs.basename(argv[1]), exit_code or -1)
+    end
+    dispatch(result, err)
+  end
+
+  local function terminate(reason, timeout)
+    if failure or exited then
+      return
+    end
+    failure = reason
+    timed_out = timeout or false
+    if process and not process:is_closing() then
+      pcall(process.kill, process, "sigterm")
+      kill_timer:start(subprocess_term_grace_ms, 0, function()
+        if not exited and process and not process:is_closing() then
+          killed = true
+          pcall(process.kill, process, "sigkill")
+        end
+      end)
+    end
+  end
+
+  local function consume(target, size_name, chunk)
+    if not chunk then
+      return
+    end
+    local current = size_name == "stdout" and stdout_size or stderr_size
+    local remaining = subprocess_output_limit - current
+    if remaining > 0 then
+      table.insert(target, chunk:sub(1, remaining))
+    end
+    current = current + #chunk
+    if size_name == "stdout" then
+      stdout_size = current
+    else
+      stderr_size = current
+    end
+    if current > subprocess_output_limit then
+      terminate(size_name .. " exceeded the bounded subprocess output limit", false)
+    end
+  end
+
+  if not valid_subprocess_argv(argv) or type(callback) ~= "function" or not stdin_pipe or not stdout_pipe or not stderr_pipe or not deadline_timer or not kill_timer or not drain_timer then
+    close_timer(deadline_timer)
+    close_timer(kill_timer)
+    close_timer(drain_timer)
+    close_handle(stdin_pipe)
+    close_handle(stdout_pipe)
+    close_handle(stderr_pipe)
+    dispatch(nil, "invalid bounded subprocess request or unavailable libuv handle")
+    return
+  end
+
+  local now = uv.hrtime()
+  local local_deadline_ns = now + (options.timeout_ms or subprocess_timeout_ms) * 1000000
+  local deadline_ns = options.deadline_ns and math.min(options.deadline_ns, local_deadline_ns) or local_deadline_ns
+  local remaining_ms = math.floor((deadline_ns - now) / 1000000)
+  if remaining_ms <= 0 then
+    close_timer(deadline_timer)
+    close_timer(kill_timer)
+    close_timer(drain_timer)
+    close_handle(stdin_pipe)
+    close_handle(stdout_pipe)
+    close_handle(stderr_pipe)
+    dispatch(nil, "bounded subprocess deadline expired before launch")
+    return
+  end
+
+  local arguments = {}
+  for index = 2, #argv do
+    table.insert(arguments, argv[index])
+  end
+  process, pid = uv.spawn(argv[1], {
+    args = arguments,
+    cwd = options.cwd,
+    env = subprocess_environment(options.env),
+    stdio = { stdin_pipe, stdout_pipe, stderr_pipe },
+  }, function(code, signal)
+    exited = true
+    exit_code = code
+    exit_signal = signal
+    close_timer(deadline_timer)
+    close_timer(kill_timer)
+    drain_timer:start(subprocess_term_grace_ms, 0, function()
+      if not stdout_done or not stderr_done then
+        failure = failure or "bounded subprocess pipes did not close after child exit"
+        stdout_done = true
+        stderr_done = true
+        pcall(stdout_pipe.read_stop, stdout_pipe)
+        pcall(stderr_pipe.read_stop, stderr_pipe)
+        close_handle(stdout_pipe)
+        close_handle(stderr_pipe)
+        finish()
+      end
+    end)
+    close_handle(process)
+    finish()
+  end)
+  if not process or not pid then
+    exited = true
+    stdout_done = true
+    stderr_done = true
+    failure = "unable to start " .. vim.fs.basename(argv[1])
+    finish()
+    return
+  end
+  active_subprocesses[pid] = function(shutdown)
+    if not exited and process and not process:is_closing() then
+      failure = failure or (shutdown and "Neovim exited while subprocess was active" or "bounded subprocess was cancelled")
+      killed = shutdown or killed
+      pcall(process.kill, process, shutdown and "sigkill" or "sigterm")
+    end
+  end
+  stdout_pipe:read_start(function(err, chunk)
+    if err then
+      terminate("unable to read bounded subprocess stdout", false)
+    end
+    if chunk then
+      consume(stdout, "stdout", chunk)
+    else
+      stdout_done = true
+      close_handle(stdout_pipe)
+      finish()
+    end
+  end)
+  stderr_pipe:read_start(function(err, chunk)
+    if err then
+      terminate("unable to read bounded subprocess stderr", false)
+    end
+    if chunk then
+      consume(stderr, "stderr", chunk)
+    else
+      stderr_done = true
+      close_handle(stderr_pipe)
+      finish()
+    end
+  end)
+  local stdin = options.stdin or ""
+  stdin_pipe:write(stdin, function(write_err)
+    if write_err then
+      terminate("unable to write protected bounded subprocess stdin", false)
+    end
+    if not stdin_pipe:is_closing() then
+      stdin_pipe:shutdown(function()
+        close_handle(stdin_pipe)
+      end)
+    end
+  end)
+  deadline_timer:start(remaining_ms, 0, function()
+    terminate("bounded subprocess timed out", true)
+  end)
+end
+
+vim.api.nvim_create_autocmd("VimLeavePre", {
+  callback = function()
+    for _, cancel in pairs(active_subprocesses) do
+      cancel(true)
+    end
+    if fence_is_held() then
+      if release_lock then
+        release_lock()
+      else
+        release_fence()
+      end
+    end
+  end,
+})
+
+local function acquire_fence(callback, deadline_ns)
+  if fence_fd then
+    callback(false, "nested OpenCode lifecycle fence acquisition was refused")
+    return
+  end
+  if not ffi_ok then
+    callback(false, "Linux flock support is unavailable in this Neovim")
+    return
+  end
+  local state_paths, state_err = ensure_state_dir()
+  if not state_paths then
+    callback(false, state_err)
+    return
+  end
+  local fd, open_err = uv.fs_open(state_paths.fence, "a", 384)
+  if not fd then
+    callback(false, "Unable to open OpenCode lifecycle fence: " .. (open_err or "unknown error"))
+    return
+  end
+  local closed = false
+  local function close_fd()
+    if not closed then
+      closed = true
+      uv.fs_close(fd)
+    end
+  end
+  local fd_stat = uv.fs_fstat(fd)
+  local path_stat = uv.fs_stat(state_paths.fence)
+  local chmod_ok, chmod_err = uv.fs_chmod(state_paths.fence, 384)
+  path_stat = uv.fs_stat(state_paths.fence)
+  if not fd_stat
+    or fd_stat.type ~= "file"
+    or not path_stat
+    or path_stat.type ~= "file"
+    or fd_stat.dev ~= path_stat.dev
+    or fd_stat.ino ~= path_stat.ino
+    or not chmod_ok
+    or path_stat.mode % 512 ~= 384
+  then
+    close_fd()
+    callback(false, "OpenCode lifecycle fence path or permissions are unsafe: " .. (chmod_err or state_paths.fence))
+    return
+  end
+  local function attempt()
+    local ok, result = pcall(function()
+      return ffi.C.flock(fd, flock_exclusive + flock_nonblocking)
+    end)
+    if ok and result == 0 then
+      closed = true
+      fence_fd = fd
+      callback(true)
+      return
+    end
+    local errno = ok and ffi.errno() or 0
+    if ok and (errno == 4 or errno == 11) and uv.hrtime() < deadline_ns then
+      vim.defer_fn(attempt, fence_poll_interval_ms)
+      return
+    end
+    close_fd()
+    if ok and errno == 11 then
+      callback(false, "Timed out waiting for the OpenCode lifecycle fence")
+    else
+      callback(false, "Unable to acquire the Linux OpenCode lifecycle fence")
+    end
+  end
+  attempt()
+end
+
+local function require_fence(action)
+  if not fence_is_held() then
+    return nil, "OpenCode lifecycle fence is not held for " .. action
+  end
+  return true
+end
+
+local function run_test_hook(action)
+  if not vim.g.mkchad_opencode_test_api then
+    return
+  end
+  local hook = test_hooks[action]
+  if not hook then
+    return
+  end
+  test_hooks[action] = nil
+  write_private(hook.marker, action, true)
+  local deadline = uv.hrtime() + 60 * 1000000000
+  while not uv.fs_stat(hook.resume) and uv.hrtime() < deadline do
+    uv.sleep(10)
+  end
+  if not uv.fs_stat(hook.resume) then
+    error("OpenCode lifecycle test hook timed out: " .. action)
+  end
 end
 
 local function read_file(path)
@@ -120,7 +553,7 @@ local function decimal_identity(value, allow_zero)
   return #value < 20 or (#value == 20 and value <= "18446744073709551615")
 end
 
-local function valid_argv(argv)
+valid_argv = function(argv)
   if type(argv) ~= "table" or #argv < 1 or #argv > 128 then
     return false
   end
@@ -318,7 +751,7 @@ local function read_state()
   return state, "valid"
 end
 
-local function write_private(path, content, exclusive)
+write_private = function(path, content, exclusive)
   local fd, err = uv.fs_open(path, exclusive and "wx" or "w", 384)
   if not fd then
     return nil, err
@@ -336,7 +769,11 @@ local function write_private(path, content, exclusive)
   return true
 end
 
-local function write_state(state)
+local function write_state_under_fence(state)
+  local fenced, fence_err = require_fence("lifecycle state publication")
+  if not fenced then
+    return nil, fence_err
+  end
   local state_paths, err = ensure_state_dir()
   if not state_paths then
     return nil, err
@@ -355,11 +792,20 @@ local function write_state(state)
   return true
 end
 
-local function remove_matching_state(generation)
+local function remove_matching_state_under_fence(generation)
+  local fenced, fence_err = require_fence("lifecycle state removal")
+  if not fenced then
+    return nil, fence_err
+  end
   local state = read_state()
   if state and state.generation == generation then
-    uv.fs_unlink(paths().state)
+    run_test_hook("state_remove")
+    local removed, remove_err = uv.fs_unlink(paths().state)
+    if not removed then
+      return nil, remove_err or "unable to remove matching lifecycle state"
+    end
   end
+  return true
 end
 
 local function curl_quote(value)
@@ -380,7 +826,6 @@ local function probe_health(state, callback, authenticated)
     return
   end
   local started_at = uv.hrtime()
-  local stdout, stderr = {}, {}
   local command = {
     "curl",
     "--silent",
@@ -396,20 +841,15 @@ local function probe_health(state, callback, authenticated)
     "\n%{http_code}",
     state.url .. "/global/health",
   }
-  local job = vim.fn.jobstart(command, {
-    on_stdout = function(_, data)
-      if data then
-        vim.list_extend(stdout, data)
-      end
-    end,
-    on_stderr = function(_, data)
-      if data then
-        vim.list_extend(stderr, data)
-      end
-    end,
-    on_exit = function(_, code)
-      vim.schedule(function()
-        local response = table.concat(stdout, "\n")
+  local config = ca_config .. 'header = "Accept: application/json"\n'
+  if authenticated and vim.env.OPENCODE_SERVER_PASSWORD and vim.env.OPENCODE_SERVER_PASSWORD ~= "" then
+    config = config
+      .. 'user = "'
+      .. curl_quote((vim.env.OPENCODE_SERVER_USERNAME or "opencode") .. ":" .. vim.env.OPENCODE_SERVER_PASSWORD)
+      .. '"\n'
+  end
+  run_subprocess(command, { stdin = config, timeout_ms = 3000 }, function(result, subprocess_err)
+        local response = result and result.stdout or ""
         local status = tonumber(response:match("\n(%d%d%d)%s*$"))
         local body = response:gsub("\n%d%d%d%s*$", "")
         local latency_ms = math.floor((uv.hrtime() - started_at) / 1000000)
@@ -417,10 +857,18 @@ local function probe_health(state, callback, authenticated)
           callback(nil, { kind = "unauthorized", latency_ms = latency_ms })
           return
         end
-        if code ~= 0 or not status or status < 200 or status >= 300 then
-          local message = table.concat(stderr, " ")
+        if subprocess_err or not status or status < 200 or status >= 300 then
+          local message = result and result.stderr or ""
           local kind = message:find("timed out", 1, true) and "timeout" or "unavailable"
-          callback(nil, { kind = kind, latency_ms = latency_ms, status = status })
+          if result and result.timed_out then
+            kind = "timeout"
+          end
+          callback(nil, {
+            kind = kind,
+            latency_ms = latency_ms,
+            status = status,
+            message = subprocess_err or vim.trim(message),
+          })
           return
         end
         local ok, health = pcall(vim.json.decode, body)
@@ -433,22 +881,7 @@ local function probe_health(state, callback, authenticated)
           return
         end
         callback(health, { kind = "healthy", latency_ms = latency_ms, status = status })
-      end)
-    end,
-  })
-  if job <= 0 then
-    callback(nil, { kind = "unable to launch curl", latency_ms = 0 })
-    return
-  end
-  local config = ca_config .. 'header = "Accept: application/json"\n'
-  if authenticated and vim.env.OPENCODE_SERVER_PASSWORD and vim.env.OPENCODE_SERVER_PASSWORD ~= "" then
-    config = config
-      .. 'user = "'
-      .. curl_quote((vim.env.OPENCODE_SERVER_USERNAME or "opencode") .. ":" .. vim.env.OPENCODE_SERVER_PASSWORD)
-      .. '"\n'
-  end
-  vim.fn.chansend(job, config)
-  vim.fn.chanclose(job, "stdin")
+  end)
 end
 
 -- Keep reload credentials and payloads on curl's stdin, as with health probes.
@@ -459,7 +892,6 @@ local function request_json(state, path, method, body, directory, callback)
     callback(nil, { kind = "untrusted state" })
     return
   end
-  local stdout = {}
   local command = {
     "curl",
     "--silent",
@@ -477,34 +909,6 @@ local function request_json(state, path, method, body, directory, callback)
     method,
     state.url .. path,
   }
-  local job = vim.fn.jobstart(command, {
-    on_stdout = function(_, data)
-      if data then
-        vim.list_extend(stdout, data)
-      end
-    end,
-    on_exit = function(_, code)
-      vim.schedule(function()
-        local response = table.concat(stdout, "\n")
-        local status = tonumber(response:match("\n(%d%d%d)%s*$"))
-        local response_body = response:gsub("\n%d%d%d%s*$", "")
-        if status == 401 then
-          callback(nil, { kind = "unauthorized", status = status })
-        elseif code ~= 0 or not status or status < 200 or status >= 300 then
-          callback(nil, { kind = "HTTP " .. (status or "request failure"), status = status })
-        elseif response_body == "" then
-          callback({}, { kind = "ok", status = status })
-        else
-          local ok, decoded = pcall(vim.json.decode, response_body)
-          callback(ok and decoded or nil, { kind = ok and "ok" or "invalid JSON", status = status })
-        end
-      end)
-    end,
-  })
-  if job <= 0 then
-    callback(nil, { kind = "unable to launch curl" })
-    return
-  end
   local config = {
     'header = "Accept: application/json"',
     'header = "Content-Type: application/json"',
@@ -518,8 +922,21 @@ local function request_json(state, path, method, body, directory, callback)
   if body then
     table.insert(config, 'data-binary = "' .. curl_quote(vim.json.encode(body)) .. '"')
   end
-  vim.fn.chansend(job, ca_config .. table.concat(config, "\n") .. "\n")
-  vim.fn.chanclose(job, "stdin")
+  run_subprocess(command, { stdin = ca_config .. table.concat(config, "\n") .. "\n", timeout_ms = 5000 }, function(result, subprocess_err)
+        local response = result and result.stdout or ""
+        local status = tonumber(response:match("\n(%d%d%d)%s*$"))
+        local response_body = response:gsub("\n%d%d%d%s*$", "")
+        if status == 401 then
+          callback(nil, { kind = "unauthorized", status = status })
+        elseif subprocess_err or not status or status < 200 or status >= 300 then
+          callback(nil, { kind = "HTTP " .. (status or "request failure"), status = status })
+        elseif response_body == "" then
+          callback({}, { kind = "ok", status = status })
+        else
+          local ok, decoded = pcall(vim.json.decode, response_body)
+          callback(ok and decoded or nil, { kind = ok and "ok" or "invalid JSON", status = status })
+        end
+  end)
 end
 
 local function port_is_available(port)
@@ -576,16 +993,22 @@ local function proc_executable(pid)
 end
 
 local function file_identity(path)
-  local stat = vim.fn.exepath("stat")
-  if stat == "" then
+  local fd = uv.fs_open(path, "r", 0)
+  if not fd then
     return nil
   end
-  local result = vim.system({ stat, "-Lc", "%d:%i", "--", path }, { text = true }):wait(1000)
-  if not result or result.code ~= 0 then
+  local stat = uv.fs_fstat(fd)
+  local fdinfo = read_file("/proc/self/fdinfo/" .. fd)
+  uv.fs_close(fd)
+  local inode = fdinfo and fdinfo:match("\nino:%s*(%d+)%s*\n")
+  if not inode then
+    inode = fdinfo and fdinfo:match("^ino:%s*(%d+)%s*\n")
+  end
+  local device = stat and tostring(stat.dev)
+  if not device or not decimal_identity(device, true) or not decimal_identity(inode, false) then
     return nil
   end
-  local dev, ino = result.stdout:match("^(%d+):(%d+)%s*$")
-  return dev and decimal_identity(dev, true) and decimal_identity(ino, false) and { dev = dev, ino = ino } or nil
+  return { dev = device, ino = inode }
 end
 
 local function proc_executable_identity(pid)
@@ -874,22 +1297,10 @@ local function legacy_process_is_owned(state)
   if not pid_is_live(state.pid) then
     return false, "PID is not live"
   end
-  if type(state.process_executable) ~= "string" or type(state.argv) ~= "table" then
-    return false, "legacy process identity is unavailable"
-  end
-  if proc_executable(state.pid) ~= state.process_executable or not argv_equal(proc_cmdline(state.pid), state.argv) then
-    return false, "legacy PID executable or argv does not match"
-  end
-  if #state.argv < 6
-    or state.argv[#state.argv - 4] ~= "serve"
-    or state.argv[#state.argv - 3] ~= "--hostname"
-    or state.argv[#state.argv - 2] ~= host
-    or state.argv[#state.argv - 1] ~= "--port"
-    or state.argv[#state.argv] ~= tostring(state.port)
-  then
-    return false, "legacy process argv is not an exact opencode serve command"
-  end
-  return true, "verified"
+  return false,
+    "schema 1 lacks boot ID, PID start time, and immutable executable identity; preserve state and use trusted OS process accounting to verify and terminate PID "
+      .. state.pid
+      .. " manually, then retry after it is dead"
 end
 
 local function process_is_owned(state)
@@ -934,20 +1345,56 @@ end
 
 local renew_lock
 
-local function signal_process(process, boot_id, signal)
+local function signal_process(process, boot_id, requested_signal, callback)
+  local fenced, fence_err = require_fence("managed process signal")
+  if not fenced then
+    callback(false, fence_err)
+    return
+  end
   local renewed, lease_err = renew_lock()
   if not renewed then
-    return nil, "lifecycle lock ownership was lost before " .. signal .. ": " .. (lease_err or "lease renewal failed")
+    callback(false, "lifecycle lock ownership was lost before " .. requested_signal .. ": " .. (lease_err or "lease renewal failed"))
+    return
   end
   local owned, reason = process_identity_is_owned(process, boot_id)
   if not owned then
-    return nil, reason
+    callback(false, reason)
+    return
   end
-  local ok, err = uv.kill(process.pid, signal)
-  if not ok then
-    return nil, err or "unable to signal managed process"
+  local signal_name = ({ sigterm = "SIGTERM", sigkill = "SIGKILL" })[requested_signal]
+  local python = vim.fn.exepath("python3")
+  local helper = paths().pidfd_helper
+  if not signal_name or python == "" or not uv.fs_stat(helper) then
+    callback(false, "Linux pidfd signal helper is unavailable")
+    return
   end
-  return true
+  local request = {
+    schema = 1,
+    boot_id = boot_id,
+    signal = signal_name,
+    process = process,
+  }
+  local hook = vim.g.mkchad_opencode_test_api and test_hooks.signal or nil
+  if hook then
+    test_hooks.signal = nil
+    request.test_pause = { marker = hook.marker, resume = hook.resume }
+  end
+  run_subprocess({ python, helper }, {
+    stdin = vim.json.encode(request),
+    timeout_ms = hook and 60000 or pidfd_helper_timeout_ms,
+    env = hook and { MKCHAD_OPENCODE_PIDFD_TEST = "1" } or nil,
+  }, function(result, subprocess_err)
+    if not subprocess_err then
+      callback(true)
+      return
+    end
+    if result and result.timed_out then
+      callback(false, "pidfd signal helper timed out")
+      return
+    end
+    local detail = result and vim.trim(result.stderr) or ""
+    callback(false, detail ~= "" and detail or subprocess_err or "pidfd signal helper refused the managed process")
+  end)
 end
 
 local function terminate_process(process, boot_id, deadline_ns, callback)
@@ -956,35 +1403,40 @@ local function terminate_process(process, boot_id, deadline_ns, callback)
     callback(not process or not pid_is_live(process.pid), reason)
     return
   end
-  local sent, signal_err = signal_process(process, boot_id, "sigterm")
-  if not sent then
-    callback(false, signal_err)
-    return
-  end
-  local escalated = false
-  local function wait_for_exit()
-    if not pid_is_live(process.pid) then
-      callback(true)
+  signal_process(process, boot_id, "sigterm", function(sent, signal_err)
+    if not sent then
+      callback(false, signal_err)
       return
     end
-    if uv.hrtime() >= deadline_ns then
-      if not escalated then
-        local killed, kill_err = signal_process(process, boot_id, "sigkill")
-        if not killed then
-          callback(not pid_is_live(process.pid), kill_err)
-          return
-        end
-        escalated = true
-        vim.defer_fn(wait_for_exit, health_interval_ms)
-        return
-      else
-        callback(false, "managed process did not exit after SIGKILL")
+    local escalated = false
+    local escalating = false
+    local function wait_for_exit()
+      if not pid_is_live(process.pid) then
+        callback(true)
         return
       end
+      if uv.hrtime() >= deadline_ns then
+        if not escalated and not escalating then
+          escalating = true
+          signal_process(process, boot_id, "sigkill", function(killed, kill_err)
+            escalating = false
+            if not killed then
+              callback(not pid_is_live(process.pid), kill_err)
+              return
+            end
+            escalated = true
+            vim.defer_fn(wait_for_exit, health_interval_ms)
+          end)
+          return
+        elseif escalated then
+          callback(false, "managed process did not exit after SIGKILL")
+          return
+        end
+      end
+      vim.defer_fn(wait_for_exit, health_interval_ms)
     end
-    vim.defer_fn(wait_for_exit, health_interval_ms)
-  end
-  wait_for_exit()
+    wait_for_exit()
+  end)
 end
 
 local lock_claim
@@ -1063,7 +1515,7 @@ local function lock_is_owned()
   local now_ms = monotonic_ms()
   return owner_matches_claim(owner, lock_stat, lock_claim)
     and valid_lock_lease(lock_stat, owner, lease, now_ms)
-    and lease.deadline_monotonic_ms > now_ms
+    and (fence_is_held() or lease.deadline_monotonic_ms > now_ms)
 end
 
 local function same_lock(stat, claim)
@@ -1071,6 +1523,9 @@ local function same_lock(stat, claim)
 end
 
 local function cleanup_created_lock(claim)
+  if not fence_is_held() then
+    return false
+  end
   if not same_lock(uv.fs_stat(paths().lock), claim) then
     return false
   end
@@ -1103,6 +1558,10 @@ local function stop_lock_renewal()
 end
 
 renew_lock = function()
+  local fenced, fence_err = require_fence("logical lock lease renewal")
+  if not fenced then
+    return nil, fence_err
+  end
   local claim = lock_claim
   if not claim or not lock_is_owned() then
     return nil, "the current lease is absent, expired, or no longer owned"
@@ -1168,6 +1627,10 @@ local function start_lock_renewal()
 end
 
 local function require_lock_ownership(action)
+  local fenced, fence_err = require_fence(action)
+  if not fenced then
+    return nil, fence_err
+  end
   local renewed, err = renew_lock()
   if not renewed then
     return nil, "OpenCode lifecycle lock ownership was lost before " .. action .. ": " .. (err or "lease renewal failed")
@@ -1180,7 +1643,8 @@ local function write_state_while_locked(state, action)
   if not owned then
     return nil, ownership_err
   end
-  return write_state(state)
+  run_test_hook("state_publish")
+  return write_state_under_fence(state)
 end
 
 local function remove_matching_state_while_locked(generation, action)
@@ -1188,11 +1652,27 @@ local function remove_matching_state_while_locked(generation, action)
   if not owned then
     return nil, ownership_err
   end
-  remove_matching_state(generation)
+  return remove_matching_state_under_fence(generation)
+end
+
+local function remove_malformed_state_while_locked(action)
+  local owned, ownership_err = require_lock_ownership(action or "malformed lifecycle state removal")
+  if not owned then
+    return nil, ownership_err
+  end
+  local state, status = read_state()
+  if state or status ~= "malformed" then
+    return nil, "lifecycle state changed before malformed-state removal"
+  end
+  run_test_hook("state_remove")
+  local removed, remove_err = uv.fs_unlink(paths().state)
+  if not removed then
+    return nil, remove_err or "unable to remove malformed lifecycle state"
+  end
   return true
 end
 
-local function release_lock()
+release_lock = function()
   stop_lock_renewal()
   local claim = lock_claim
   if claim and lock_is_owned() then
@@ -1226,6 +1706,7 @@ local function release_lock()
     end
   end
   lock_claim = nil
+  release_fence()
 end
 
 local function lock_is_stale(lock_stat, owner)
@@ -1269,6 +1750,9 @@ local function lock_is_stale(lock_stat, owner)
 end
 
 local function reclaim_stale_lock()
+  if not fence_is_held() then
+    return false
+  end
   local lock_stat = uv.fs_stat(paths().lock)
   if not lock_stat then
     return false
@@ -1280,6 +1764,7 @@ local function reclaim_stale_lock()
   if not lock_is_stale(lock_stat, owner) then
     return false
   end
+  run_test_hook("logical_reclaim")
   -- Rename isolates exactly the directory that was checked. A new acquirer can
   -- create startup.lock after this rename without being removed by this cleanup.
   local tombstone = paths().lock .. ".stale-" .. random_token()
@@ -1308,6 +1793,10 @@ local function reclaim_stale_lock()
 end
 
 local function publish_lock_owner(claim)
+  local fenced, fence_err = require_fence("logical lock owner publication")
+  if not fenced then
+    return nil, fence_err
+  end
   if not same_lock(uv.fs_stat(paths().lock), claim) then
     return nil, "startup lock directory changed before owner publication"
   end
@@ -1351,9 +1840,10 @@ local function publish_lock_owner(claim)
   return true
 end
 
-local function acquire_lock(callback, retried, deadline_ns)
+local function acquire_logical_lock_under_fence(callback, retried)
   local state_paths, err = ensure_state_dir()
   if not state_paths then
+    release_fence()
     callback(false, err)
     return
   end
@@ -1371,6 +1861,7 @@ local function acquire_lock(callback, retried, deadline_ns)
     if not wrote then
       cleanup_created_lock(claim)
       lock_claim = nil
+      release_fence()
       callback(false, "Unable to write OpenCode startup lock: " .. (write_err or "unknown error"))
       return
     end
@@ -1389,20 +1880,49 @@ local function acquire_lock(callback, retried, deadline_ns)
     return
   end
   if not retried and reclaim_stale_lock() then
-    acquire_lock(callback, true, deadline_ns)
+    acquire_logical_lock_under_fence(callback, true)
     return
   end
+  release_fence()
   callback(false, "OpenCode startup is already in progress")
 end
 
-local function resolve_executable()
+local function acquire_lock(callback, retried, deadline_ns)
+  local operation_deadline = deadline_ns or (uv.hrtime() + startup_timeout_ms * 1000000)
+  local fence_deadline = math.min(operation_deadline, uv.hrtime() + fence_acquire_timeout_ms * 1000000)
+  acquire_fence(function(acquired, fence_err)
+    if not acquired then
+      callback(false, fence_err)
+      return
+    end
+    local ok, acquire_err = xpcall(function()
+      acquire_logical_lock_under_fence(callback, retried)
+    end, debug.traceback)
+    if not ok then
+      release_lock()
+      error(acquire_err, 0)
+    end
+  end, fence_deadline)
+end
+
+local function resolve_executable(deadline_ns, callback)
   local executable = vim.fn.exepath("opencode")
   if executable == "" then
-    return nil, nil, "Unable to find opencode on PATH"
+    callback(nil, nil, "Unable to find opencode on PATH")
+    return
   end
-  local output = vim.fn.systemlist({ executable, "--version" })
-  local version = vim.v.shell_error == 0 and output[1] or "unknown"
-  return executable, version
+  run_subprocess({ executable, "--version" }, { deadline_ns = deadline_ns }, function(result, subprocess_err)
+    if subprocess_err then
+      callback(nil, nil, "Unable to query the bounded OpenCode version: " .. subprocess_err)
+      return
+    end
+    local version = result.stdout:match("^([^\r\n]+)")
+    if not safe_string(version, 128) then
+      callback(nil, nil, "OpenCode version output was malformed")
+      return
+    end
+    callback(executable, version)
+  end)
 end
 
 local function select_port(state, excluded_ports)
@@ -1441,11 +1961,17 @@ local function remove_known_directory(directory, names)
   uv.fs_rmdir(directory)
 end
 
-local function run_keytool(arguments)
-  local command = { "keytool" }
+local function run_keytool(arguments, deadline_ns, callback)
+  local keytool = vim.fn.exepath("keytool")
+  if keytool == "" then
+    callback(nil, "keytool is unavailable")
+    return
+  end
+  local command = { keytool }
   vim.list_extend(command, arguments)
-  local output = vim.fn.system(command)
-  return vim.v.shell_error == 0, output:gsub("%s+$", "")
+  run_subprocess(command, { deadline_ns = deadline_ns }, function(result, subprocess_err)
+    callback(not subprocess_err and result or nil, subprocess_err)
+  end)
 end
 
 local function certificate_identity(state_paths)
@@ -1454,16 +1980,17 @@ local function certificate_identity(state_paths)
   return ca and store and vim.fn.sha256(ca .. store) or nil
 end
 
-local function validate_certificate_material(state_paths)
+local function validate_certificate_material(state_paths, deadline_ns, callback)
   for _, path in ipairs({ state_paths.password, state_paths.ca, state_paths.ca_store, state_paths.server_store, state_paths.server_cert }) do
     local stat = uv.fs_stat(path)
     if not stat or stat.type ~= "file" then
-      return nil, "certificate material is incomplete"
+      callback(nil, "certificate material is incomplete")
+      return
     end
     uv.fs_chmod(path, 384)
   end
   uv.fs_chmod(state_paths.tls, 448)
-  local ca_ok = run_keytool({
+  run_keytool({
     "-list",
     "-alias",
     "mkchad-ca",
@@ -1473,49 +2000,61 @@ local function validate_certificate_material(state_paths)
     "PKCS12",
     "-storepass:file",
     state_paths.password,
-  })
-  local server_ok = run_keytool({
-    "-list",
-    "-alias",
-    "server",
-    "-keystore",
-    state_paths.server_store,
-    "-storetype",
-    "PKCS12",
-    "-storepass:file",
-    state_paths.password,
-  })
-  local java = vim.fn.exepath("java")
-  local proxy_source = uv.fs_stat(state_paths.proxy_source)
-  local certificate_ok = false
-  if java ~= "" and proxy_source then
-    vim.fn.system({
-      java,
-      "--source",
-      "21",
-      state_paths.proxy_source,
-      "--validate-keystore",
+  }, deadline_ns, function(ca_result, ca_err)
+    if not ca_result then
+      callback(nil, "CA keystore validation failed: " .. (ca_err or "unknown error"))
+      return
+    end
+    run_keytool({
+      "-list",
+      "-alias",
+      "server",
+      "-keystore",
       state_paths.server_store,
-      "--password-file",
+      "-storetype",
+      "PKCS12",
+      "-storepass:file",
       state_paths.password,
-      "--ca-file",
-      state_paths.ca,
-      "--ca-keystore",
-      state_paths.ca_store,
-    })
-    certificate_ok = vim.v.shell_error == 0
-  end
-  local identity = certificate_identity(state_paths)
-  if not ca_ok or not server_ok or not certificate_ok or not identity then
-    return nil, "certificate keystore validation failed"
-  end
-  return identity
+    }, deadline_ns, function(server_result, server_err)
+      if not server_result then
+        callback(nil, "server keystore validation failed: " .. (server_err or "unknown error"))
+        return
+      end
+      local java = vim.fn.exepath("java")
+      if java == "" or not uv.fs_stat(state_paths.proxy_source) then
+        callback(nil, "Java keystore validator is unavailable")
+        return
+      end
+      run_subprocess({
+        java,
+        "--source",
+        "21",
+        state_paths.proxy_source,
+        "--validate-keystore",
+        state_paths.server_store,
+        "--password-file",
+        state_paths.password,
+        "--ca-file",
+        state_paths.ca,
+        "--ca-keystore",
+        state_paths.ca_store,
+      }, { deadline_ns = deadline_ns }, function(_, java_err)
+        local identity = not java_err and certificate_identity(state_paths) or nil
+        if not identity then
+          callback(nil, "certificate keystore validation failed: " .. (java_err or "identity unavailable"))
+          return
+        end
+        callback(identity)
+      end)
+    end)
+  end)
 end
 
-local function generate_certificate_material(state_paths)
+local function generate_certificate_material(state_paths, deadline_ns, callback)
   local staging = state_paths.tls .. ".new-" .. random_token()
   if not uv.fs_mkdir(staging, 448) then
-    return nil, "unable to create certificate staging directory"
+    callback(nil, "unable to create certificate staging directory")
+    return
   end
   local files = {
     password = vim.fs.joinpath(staging, "store.password"),
@@ -1529,7 +2068,8 @@ local function generate_certificate_material(state_paths)
   local wrote, write_err = write_private(files.password, vim.fn.sha256(random .. random_token()), true)
   if not wrote then
     remove_known_directory(staging, { "store.password" })
-    return nil, "unable to create certificate password file: " .. (write_err or "unknown error")
+    callback(nil, "unable to create certificate password file: " .. (write_err or "unknown error"))
+    return
   end
   local commands = {
     {
@@ -1648,54 +2188,97 @@ local function generate_certificate_material(state_paths)
       "-noprompt",
     },
   }
-  for _, command in ipairs(commands) do
-    local ok, output = run_keytool(command)
-    if not ok then
+  local function fail(message)
+    remove_known_directory(staging, { "store.password", "ca.pem", "ca.p12", "server.p12", "server.pem", "server.csr" })
+    callback(nil, message)
+  end
+  local function publish(identity)
+    local previous
+    if uv.fs_stat(state_paths.tls) then
+      previous = state_paths.tls .. ".invalid-" .. random_token()
+      if not uv.fs_rename(state_paths.tls, previous) then
+        fail("unable to isolate invalid certificate material")
+        return
+      end
+    end
+    if not uv.fs_rename(staging, state_paths.tls) then
+      if previous then
+        uv.fs_rename(previous, state_paths.tls)
+      end
       remove_known_directory(staging, { "store.password", "ca.pem", "ca.p12", "server.p12", "server.pem", "server.csr" })
-      return nil, "keytool certificate generation failed: " .. (output ~= "" and output or "unknown error")
+      callback(nil, "unable to publish generated certificate material")
+      return
     end
-  end
-  uv.fs_unlink(files.request)
-  for _, path in pairs(files) do
-    if path ~= files.request then
-      uv.fs_chmod(path, 384)
-    end
-  end
-  local previous
-  if uv.fs_stat(state_paths.tls) then
-    previous = state_paths.tls .. ".invalid-" .. random_token()
-    if not uv.fs_rename(state_paths.tls, previous) then
-      remove_known_directory(staging, { "store.password", "ca.pem", "ca.p12", "server.p12", "server.pem" })
-      return nil, "unable to isolate invalid certificate material"
-    end
-  end
-  if not uv.fs_rename(staging, state_paths.tls) then
     if previous then
-      uv.fs_rename(previous, state_paths.tls)
+      remove_known_directory(previous, { "store.password", "ca.pem", "ca.p12", "server.p12", "server.pem", "server.csr" })
     end
-    remove_known_directory(staging, { "store.password", "ca.pem", "ca.p12", "server.p12", "server.pem" })
-    return nil, "unable to publish generated certificate material"
+    callback(identity)
   end
-  if previous then
-    remove_known_directory(previous, { "store.password", "ca.pem", "ca.p12", "server.p12", "server.pem", "server.csr" })
+  local function run_command(index)
+    if index > #commands then
+      uv.fs_unlink(files.request)
+      for _, path in pairs(files) do
+        if path ~= files.request then
+          uv.fs_chmod(path, 384)
+        end
+      end
+      local staged_paths = vim.tbl_extend("force", state_paths, {
+        tls = staging,
+        password = files.password,
+        ca = files.ca,
+        ca_store = files.ca_store,
+        server_store = files.server_store,
+        server_cert = files.server_cert,
+      })
+      validate_certificate_material(staged_paths, deadline_ns, function(identity, validation_err)
+        if not identity then
+          fail("generated certificate validation failed: " .. (validation_err or "unknown error"))
+          return
+        end
+        publish(identity)
+      end)
+      return
+    end
+    run_keytool(commands[index], deadline_ns, function(result, command_err)
+      if not result then
+        fail("keytool certificate generation failed: " .. (command_err or "unknown error"))
+        return
+      end
+      run_command(index + 1)
+    end)
   end
-  return validate_certificate_material(state_paths)
+  run_command(1)
 end
 
-local function ensure_certificate_material()
+local function ensure_certificate_material(deadline_ns, callback)
+  if type(deadline_ns) == "function" then
+    callback = deadline_ns
+    deadline_ns = nil
+  end
+  deadline_ns = deadline_ns or (uv.hrtime() + startup_timeout_ms * 1000000)
+  local fenced, fence_err = require_fence("certificate material validation or publication")
+  if not fenced then
+    callback(nil, fence_err)
+    return
+  end
   local state_paths, state_err = ensure_state_dir()
   if not state_paths then
-    return nil, state_err
+    callback(nil, state_err)
+    return
   end
-  local identity, validation_err = validate_certificate_material(state_paths)
-  if identity then
-    return identity
-  end
-  local generated, generation_err = generate_certificate_material(state_paths)
-  if not generated then
-    return nil, generation_err .. " (existing material: " .. validation_err .. ")"
-  end
-  return generated
+  validate_certificate_material(state_paths, deadline_ns, function(identity, validation_err)
+    if identity then
+      callback(identity)
+      return
+    end
+    generate_certificate_material(state_paths, deadline_ns, function(generated, generation_err)
+      if not generated then
+        callback(nil, generation_err .. " (existing material: " .. validation_err .. ")")
+        return
+      end
+      callback(generated)
+    end)
+  end)
 end
 
 local function select_internal_port(public_port, excluded)
@@ -1762,11 +2345,24 @@ local function capture_process(pid, extra)
 end
 
 local function write_pending(pending)
+  if not valid_pending(pending) then
+    return nil, "refusing to write malformed pending startup metadata"
+  end
+  local owned, ownership_err = require_lock_ownership("pending generation " .. pending.generation .. " write")
+  if not owned then
+    return nil, ownership_err
+  end
   local temporary = paths().pending .. "." .. random_token() .. ".tmp"
   local wrote, write_err = write_private(temporary, vim.json.encode(pending), true)
   if not wrote then
     return nil, write_err
   end
+  owned, ownership_err = require_lock_ownership("pending generation " .. pending.generation .. " publication")
+  if not owned then
+    uv.fs_unlink(temporary)
+    return nil, ownership_err
+  end
+  run_test_hook("pending_write")
   local renamed, rename_err = uv.fs_rename(temporary, paths().pending)
   if not renamed then
     uv.fs_unlink(temporary)
@@ -1987,20 +2583,7 @@ local function stop_legacy(state, deadline_ns, callback)
     callback(not pid_is_live(state.pid), reason)
     return
   end
-  local identity = proc_executable_identity(state.pid)
-  local process = identity and capture_process(state.pid, {
-    port = state.port,
-    executable = state.process_executable,
-    executable_dev = identity.dev,
-    executable_ino = identity.ino,
-    local_version = "legacy",
-    log = paths().log,
-  }) or nil
-  if not process then
-    callback(false, "legacy process identity changed before stop")
-    return
-  end
-  terminate_process(process, current_boot_id(), deadline_ns, callback)
+  callback(false, reason)
 end
 
 local function read_pending()
@@ -2015,10 +2598,47 @@ local function read_pending()
   return pending, "valid"
 end
 
-local function cleanup_pending(deadline_ns, callback)
-  local pending = read_pending()
+local function matching_pending_while_locked(generation, action)
+  local owned, ownership_err = require_lock_ownership(action)
+  if not owned then
+    return nil, ownership_err
+  end
+  local pending, status = read_pending()
   if not pending then
-    if uv.fs_stat(paths().pending) then
+    if status == "malformed" or uv.fs_stat(paths().pending) then
+      return nil, "malformed pending startup metadata requires manual inspection: " .. paths().pending
+    end
+    return nil, "pending startup metadata is missing for generation " .. generation
+  end
+  if pending.generation ~= generation then
+    return nil,
+      "pending startup generation changed from " .. generation .. " to " .. pending.generation .. "; refusing stale cleanup"
+  end
+  return pending
+end
+
+local function remove_matching_pending_while_locked(generation, action)
+  local pending, pending_err = matching_pending_while_locked(generation, action or "pending generation removal")
+  if not pending then
+    return nil, pending_err
+  end
+  run_test_hook("pending_remove")
+  local removed, remove_err = uv.fs_unlink(paths().pending)
+  if not removed then
+    return nil, remove_err or "unable to remove matching pending startup metadata"
+  end
+  return true
+end
+
+local function cleanup_pending(deadline_ns, callback)
+  local owned, ownership_err = require_lock_ownership("interrupted pending startup inspection")
+  if not owned then
+    callback(false, ownership_err)
+    return
+  end
+  local pending, status = read_pending()
+  if not pending then
+    if status == "malformed" or uv.fs_stat(paths().pending) then
       callback(false, "malformed pending startup metadata requires manual inspection: " .. paths().pending)
     else
       callback(true)
@@ -2027,45 +2647,69 @@ local function cleanup_pending(deadline_ns, callback)
   end
   stop_pair(pending, deadline_ns, function(stopped, err)
     if stopped then
-      uv.fs_unlink(paths().pending)
+      local removed, remove_err = remove_matching_pending_while_locked(
+        pending.generation,
+        "interrupted pending generation removal"
+      )
+      if not removed then
+        callback(false, remove_err)
+        return
+      end
     end
     callback(stopped, err)
   end)
 end
 
 local function cleanup_failed_pair(state, deadline_ns, callback)
-  stop_pair(state, deadline_ns, function(stopped, err)
+  local pending, pending_err = matching_pending_while_locked(state.generation, "failed pending generation cleanup")
+  if not pending then
+    callback(false, pending_err)
+    return
+  end
+  stop_pair(pending, deadline_ns, function(stopped, err)
     if stopped then
-      uv.fs_unlink(paths().pending)
+      local removed, remove_err = remove_matching_pending_while_locked(
+        state.generation,
+        "failed pending generation removal"
+      )
+      if not removed then
+        callback(false, remove_err)
+        return
+      end
     end
     callback(stopped, err)
   end)
 end
 
 local function spawn_pair(previous, deadline_ns, callback, excluded_public, excluded_internal)
-  local state_paths = paths()
-  local certificate, certificate_err = ensure_certificate_material()
-  if not certificate then
-    callback(nil, "Unable to prepare host TLS certificate material: " .. certificate_err)
+  local fenced, fence_err = require_fence("managed pair launch")
+  if not fenced then
+    callback(nil, fence_err)
     return
   end
-  if lock_claim then
-    local still_locked, lock_err = require_lock_ownership("post-certificate server launch")
-    if not still_locked then
-      callback(nil, lock_err)
+  local state_paths = paths()
+  ensure_certificate_material(deadline_ns, function(certificate, certificate_err)
+    if not certificate then
+      callback(nil, "Unable to prepare host TLS certificate material: " .. certificate_err)
       return
     end
-  end
-  if not uv.fs_stat(state_paths.proxy_source) then
-    callback(nil, "TLS proxy source is unavailable: " .. state_paths.proxy_source)
-    return
-  end
-  local executable, version, executable_err = resolve_executable()
-  local java = vim.fn.exepath("java")
-  if not executable or java == "" then
-    callback(nil, executable_err or "Unable to find Java 21 on PATH")
-    return
-  end
+    if lock_claim then
+      local still_locked, lock_err = require_lock_ownership("post-certificate server launch")
+      if not still_locked then
+        callback(nil, lock_err)
+        return
+      end
+    end
+    if not uv.fs_stat(state_paths.proxy_source) then
+      callback(nil, "TLS proxy source is unavailable: " .. state_paths.proxy_source)
+      return
+    end
+    resolve_executable(deadline_ns, function(executable, version, executable_err)
+      local java = vim.fn.exepath("java")
+      if not executable or java == "" then
+        callback(nil, executable_err or "Unable to find Java 21 on PATH")
+        return
+      end
   local backend_executable = file_identity(executable)
   local proxy_executable = file_identity(java)
   local proxy_source = file_identity(state_paths.proxy_source)
@@ -2120,8 +2764,13 @@ local function spawn_pair(previous, deadline_ns, callback, excluded_public, excl
     }
     local pending_ok, pending_err = write_pending(pending)
     if not pending_ok then
-      terminate_process(backend, boot_id, deadline_ns, function()
-        callback(nil, "Unable to record pending backend identity: " .. (pending_err or "unknown error"))
+      terminate_process(backend, boot_id, deadline_ns, function(_, cleanup_err)
+        callback(
+          nil,
+          "Unable to record pending backend identity: "
+            .. (pending_err or "unknown error")
+            .. (cleanup_err and "; backend cleanup refused: " .. cleanup_err or "")
+        )
       end)
       return
     end
@@ -2250,13 +2899,26 @@ local function spawn_pair(previous, deadline_ns, callback, excluded_public, excl
                   end)
                   return
                 end
-                uv.fs_unlink(state_paths.pending)
+                local removed, remove_err = remove_matching_pending_while_locked(
+                  generation,
+                  "successful pending generation removal"
+                )
+                if not removed then
+                  callback(nil, "Complete state was published but pending metadata could not be removed: " .. remove_err)
+                  return
+                end
                 callback(state)
               elseif uv.hrtime() >= deadline_ns or detail.kind == "unauthorized" then
                 cleanup_failed_pair(state, deadline_ns, function(_, cleanup_err)
                   callback(
                     nil,
-                    "Pinned HTTPS health failed (" .. detail.kind .. ")" .. (cleanup_err and "; " .. cleanup_err or "") .. "; see " .. state_paths.proxy_log,
+                    "Pinned HTTPS health failed ("
+                      .. detail.kind
+                      .. (detail.message and ": " .. detail.message or "")
+                      .. ")"
+                      .. (cleanup_err and "; " .. cleanup_err or "")
+                      .. "; see "
+                      .. state_paths.proxy_log,
                     nil
                   )
                 end)
@@ -2270,6 +2932,8 @@ local function spawn_pair(previous, deadline_ns, callback, excluded_public, excl
       end, 100)
     end)
   end, 50)
+    end)
+  end)
 end
 
 local function ensure_backend(callback)
@@ -2278,7 +2942,13 @@ local function ensure_backend(callback)
     return
   end
   ensure_active = true
-  local deadline_ns = uv.hrtime() + startup_timeout_ms * 1000000
+  local operation_timeout_ms = startup_timeout_ms
+  if vim.g.mkchad_opencode_test_api
+    and is_integer(vim.g.mkchad_opencode_test_timeout_ms, 100, startup_timeout_ms)
+  then
+    operation_timeout_ms = vim.g.mkchad_opencode_test_timeout_ms
+  end
+  local deadline_ns = uv.hrtime() + operation_timeout_ms * 1000000
   local state, initial_status = read_state()
   local requested, request_err = explicit_port()
   if request_err then
@@ -2359,7 +3029,12 @@ local function ensure_backend(callback)
           release_lock()
           finish_ensure(false, "Refusing to replace unsupported future OpenCode state")
         elseif locked_status == "malformed" then
-          uv.fs_unlink(paths().state)
+          local removed, remove_err = remove_malformed_state_while_locked("malformed lifecycle state removal")
+          if not removed then
+            release_lock()
+            finish_ensure(false, remove_err)
+            return
+          end
           launch(nil)
         elseif detail.kind == "legacy" and locked_state then
           stop_legacy(locked_state, deadline_ns, function(cleaned, cleanup_err)
@@ -2368,7 +3043,12 @@ local function ensure_backend(callback)
               finish_ensure(false, "Legacy OpenCode process could not be safely stopped: " .. (cleanup_err or "unknown error"))
               return
             end
-            remove_matching_state_while_locked(locked_state.generation, "legacy state migration")
+            local removed, remove_err = remove_matching_state_while_locked(locked_state.generation, "legacy state migration")
+            if not removed then
+              release_lock()
+              finish_ensure(false, remove_err)
+              return
+            end
             launch(locked_state)
           end)
         elseif detail.kind == "owned-unhealthy" then
@@ -2488,10 +3168,14 @@ local function stop_shared_server()
     if state.schema == 1 then
       stop_legacy(state, uv.hrtime() + startup_timeout_ms * 1000000, function(stopped, stop_err)
         if stopped then
-          remove_matching_state_while_locked(state.generation, "explicit legacy stop")
+          local removed, remove_err = remove_matching_state_while_locked(state.generation, "explicit legacy stop")
           release_lock()
+          if not removed then
+            notify(remove_err, vim.log.levels.ERROR)
+            return
+          end
           close_local_tui()
-          notify("Stopped verified legacy OpenCode server", vim.log.levels.INFO)
+          notify("Removed dead legacy OpenCode state", vim.log.levels.INFO)
         else
           release_lock()
           notify("Refusing to stop legacy OpenCode server: " .. (stop_err or "ownership mismatch"), vim.log.levels.ERROR)
@@ -2683,38 +3367,59 @@ local function reload_current_directory(callback)
                             "server returned " .. vim.inspect(path.directory) .. " instead of " .. directory
                           )
                         else
+                          -- TUI and plugin connection subprocesses are not lifecycle
+                          -- mutations. Revalidate under a newly acquired fence after
+                          -- they complete instead of holding exclusion while waiting.
+                          release_lock()
+                          local function fail_unlocked(phase, err)
+                            finish_reload(
+                              false,
+                              "OpenCode reload failed during "
+                                .. phase
+                                .. " for "
+                                .. directory
+                                .. ": "
+                                .. (err or "unknown error")
+                            )
+                          end
                           ensure_local_tui(rechecked, function(tui_ok, tui_err)
                             if not tui_ok then
-                              fail("local TUI recreation", tui_err)
+                              fail_unlocked("local TUI recreation", tui_err)
                               return
                             end
                             local loaded, discovery = pcall(require, "opencode.server.discovery")
                             if not loaded then
-                              fail("plugin reconnection", discovery)
+                              fail_unlocked("plugin reconnection", discovery)
                               return
                             end
                             discovery.get():next(function()
-                              local final_state = read_state()
-                              if not final_state
-                                or final_state.proxy.pid ~= rechecked.proxy.pid
-                                or final_state.backend.pid ~= rechecked.backend.pid
-                                or final_state.generation ~= rechecked.generation
-                                or final_state.url ~= rechecked.url
-                                or final_state.port ~= rechecked.port
-                                or final_state.certificate_identity ~= rechecked.certificate_identity
-                              then
-                                fail("shared-server validation", "shared server state changed during reload")
-                                return
-                              end
-                              release_lock()
-                              finish_reload(
-                                true,
-                                "Reloaded OpenCode instance for "
-                                  .. directory
-                                  .. "; global process-cached configuration may still require shared stop/start"
-                              )
+                              acquire_lock(function(final_locked, final_lock_err)
+                                if not final_locked then
+                                  fail_unlocked("shared-server validation", final_lock_err)
+                                  return
+                                end
+                                local final_state = read_state()
+                                if not final_state
+                                  or final_state.proxy.pid ~= rechecked.proxy.pid
+                                  or final_state.backend.pid ~= rechecked.backend.pid
+                                  or final_state.generation ~= rechecked.generation
+                                  or final_state.url ~= rechecked.url
+                                  or final_state.port ~= rechecked.port
+                                  or final_state.certificate_identity ~= rechecked.certificate_identity
+                                then
+                                  fail("shared-server validation", "shared server state changed during reload")
+                                  return
+                                end
+                                release_lock()
+                                finish_reload(
+                                  true,
+                                  "Reloaded OpenCode instance for "
+                                    .. directory
+                                    .. "; global process-cached configuration may still require shared stop/start"
+                                )
+                              end)
                             end):catch(function(err)
-                              fail("plugin reconnection", tostring(err))
+                              fail_unlocked("plugin reconnection", tostring(err))
                             end)
                           end)
                         end
@@ -2731,11 +3436,7 @@ local function reload_current_directory(callback)
   end)
 end
 
-local function show_info()
-  local state, state_status = read_state()
-  local configured, configured_err = explicit_port()
-  local url = configured and ("https://%s:%d"):format(host, configured) or (state and state.url)
-  local executable, local_version = resolve_executable()
+local function render_info(state, state_status, configured, configured_err, url, executable, local_version)
   local lines = {
     "State directory: " .. paths().root,
     "State status: " .. state_status,
@@ -2809,6 +3510,15 @@ local function show_info()
     end
     notify(table.concat(lines, "\n"), health and vim.log.levels.INFO or vim.log.levels.WARN)
   end, authenticated)
+end
+
+local function show_info()
+  local state, state_status = read_state()
+  local configured, configured_err = explicit_port()
+  local url = configured and ("https://%s:%d"):format(host, configured) or (state and state.url)
+  resolve_executable(uv.hrtime() + subprocess_timeout_ms * 1000000, function(executable, local_version)
+    render_info(state, state_status, configured, configured_err, url, executable, local_version)
+  end)
 end
 
 local function move_terminal(position)
@@ -2928,16 +3638,29 @@ if vim.g.mkchad_opencode_test_api then
     stop_pair = stop_pair,
     stop_legacy = stop_legacy,
     ensure_certificate_material = ensure_certificate_material,
+    resolve_executable = resolve_executable,
+    run_subprocess = run_subprocess,
     certificate_identity = certificate_identity,
     capture_process = capture_process,
     cleanup_pending = cleanup_pending,
+    cleanup_failed_pair = cleanup_failed_pair,
     current_boot_id = current_boot_id,
     file_identity = file_identity,
     proc_start_time = proc_start_time,
     process_identity_is_owned = process_identity_is_owned,
     read_state = read_state,
     read_pending = read_pending,
-    write_state = write_state,
+    write_pending = write_pending,
+    remove_matching_pending_while_locked = remove_matching_pending_while_locked,
+    write_state = write_state_while_locked,
+    remove_matching_state_while_locked = remove_matching_state_while_locked,
+    fence_is_held = fence_is_held,
+    set_test_hook = function(action, marker, resume)
+      assert(vim.tbl_contains({ "pending_write", "pending_remove", "state_publish", "state_remove", "logical_reclaim", "signal" }, action))
+      assert(absolute_path(marker) and absolute_path(resume))
+      test_hooks[action] = { marker = marker, resume = resume }
+    end,
+    signal_process = signal_process,
     ensure_local_tui = ensure_local_tui,
     reload_current_directory = reload_current_directory,
     show_info = show_info,

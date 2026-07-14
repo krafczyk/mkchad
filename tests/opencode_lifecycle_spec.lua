@@ -34,12 +34,14 @@ end
 local fake = vim.fs.joinpath(root, "opencode")
 vim.fn.writefile({
   "#!/usr/bin/env python3",
-  "import socket, sys, threading",
+  "import os, socket, sys, threading",
   "if len(sys.argv) > 1 and sys.argv[1] == '--version': print('fake-2'); raise SystemExit(0)",
   "sock = socket.socket(); sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)",
   "sock.bind(('127.0.0.1', int(sys.argv[-1]))); sock.listen(64)",
   "def handle(client):",
   "  with client:",
+  "    if os.environ.get('MKCHAD_LEGACY_REQUEST_RECORD'):",
+  "      open(os.environ['MKCHAD_LEGACY_REQUEST_RECORD'], 'wb').write(b'requested')",
   "    while True:",
   "      raw = b''",
   "      while b'\\r\\n\\r\\n' not in raw:",
@@ -84,6 +86,9 @@ vim.notify = function(message)
   inactive_info = message
 end
 lifecycle.show_info()
+assert(vim.wait(3000, function()
+  return inactive_info ~= nil
+end, 10), "inactive info version probe timed out")
 vim.notify = inactive_notify
 assert(inactive_info and inactive_info:find("inactive/untrusted", 1, true), inactive_info)
 assert(inactive_info:find("TLS authenticates the OpenCode server, not clients", 1, true), inactive_info)
@@ -234,6 +239,9 @@ vim.notify = function(message)
   malformed_info = message
 end
 lifecycle.show_info()
+assert(vim.wait(3000, function()
+  return malformed_info ~= nil
+end, 10), "malformed info version probe timed out")
 vim.notify = original_notify
 assert(malformed_info and malformed_info:find("State status: malformed", 1, true), malformed_info)
 local malformed_recovered, malformed_err = wait_for(vim.g.opencode_opts.server.ensure)
@@ -248,9 +256,14 @@ assert(stopped, stop_err)
 vim.uv.fs_unlink(state_paths.state)
 lifecycle.release_lock()
 
--- Schema 1 is diagnosed without a probe and migrated only after exact process verification.
+-- A live schema-1 PID is never signalable, even when its current path and argv
+-- exactly match the legacy record. Migration and explicit stop preserve state.
 local legacy_port = assert(lifecycle.select_port(nil))
+local legacy_request_record = vim.fs.joinpath(root, "legacy-http-requested")
+vim.uv.fs_unlink(legacy_request_record)
+vim.env.MKCHAD_LEGACY_REQUEST_RECORD = legacy_request_record
 local legacy_job = vim.fn.jobstart({ fake, "serve", "--hostname", "127.0.0.1", "--port", tostring(legacy_port) })
+vim.env.MKCHAD_LEGACY_REQUEST_RECORD = nil
 local legacy_pid = vim.fn.jobpid(legacy_job)
 assert(vim.wait(3000, function()
   return lifecycle.process_listens_on_port(legacy_pid, legacy_port)
@@ -265,7 +278,11 @@ local legacy = {
   process_executable = vim.uv.fs_readlink("/proc/" .. legacy_pid .. "/exe"),
   argv = process_argv(legacy_pid),
 }
+lock_ok, lock_err = wait_for(lifecycle.acquire_lock, 3000)
+assert(lock_ok, lock_err)
 assert(lifecycle.write_state(legacy))
+lifecycle.release_lock()
+local legacy_encoded = table.concat(vim.fn.readfile(state_paths.state), "\n")
 local observed
 original_notify = vim.notify
 package.loaded["opencode.server"] = package.loaded["opencode.server"] or {}
@@ -273,15 +290,40 @@ vim.notify = function(message)
   observed = message
 end
 lifecycle.show_info()
+assert(vim.wait(3000, function()
+  return observed ~= nil
+end, 10), "legacy info version probe timed out")
 vim.notify = original_notify
 assert(observed and observed:find("legacy", 1, true) and observed:find("never probed", 1, true), observed)
 local migrated, migrate_err = wait_for(vim.g.opencode_opts.server.ensure)
-assert(migrated, migrate_err)
-state = assert(lifecycle.read_state())
-assert(state.schema == 2 and state.generation ~= legacy.generation)
+assert(not migrated and migrate_err:find("trusted OS process accounting", 1, true), migrate_err)
+assert(not process_dead(legacy_pid), "migration signaled a live schema-1 PID")
+assert(table.concat(vim.fn.readfile(state_paths.state), "\n") == legacy_encoded, "migration changed live legacy state")
+assert(not vim.uv.fs_stat(legacy_request_record), "migration probed legacy HTTP")
+
+local stop_notice
+original_notify = vim.notify
+vim.notify = function(message)
+  stop_notice = tostring(message)
+end
+lifecycle.stop_shared_server()
+assert(vim.wait(3000, function()
+  return stop_notice ~= nil
+end, 20), "explicit legacy stop did not finish")
+vim.notify = original_notify
+assert(stop_notice:find("trusted OS process accounting", 1, true), stop_notice)
+assert(not process_dead(legacy_pid), "explicit stop signaled a live schema-1 PID")
+assert(table.concat(vim.fn.readfile(state_paths.state), "\n") == legacy_encoded, "explicit stop changed live legacy state")
+assert(not vim.uv.fs_stat(legacy_request_record), "explicit stop probed legacy HTTP")
+
+assert(vim.uv.kill(legacy_pid, "sigkill"))
 assert(vim.wait(2000, function()
   return process_dead(legacy_pid)
-end, 20), "verified legacy process survived migration")
+end, 20), "legacy fixture did not die")
+local dead_migrated, dead_migrate_err = wait_for(vim.g.opencode_opts.server.ensure)
+assert(dead_migrated, dead_migrate_err)
+state = assert(lifecycle.read_state())
+assert(state.schema == 2 and state.generation ~= legacy.generation)
 
 lock_ok, lock_err = wait_for(lifecycle.acquire_lock, 3000)
 assert(lock_ok, lock_err)
@@ -292,32 +334,32 @@ assert(stopped, stop_err)
 vim.uv.fs_unlink(state_paths.state)
 lifecycle.release_lock()
 
-local stop_port = assert(lifecycle.select_port(nil))
-local stop_job = vim.fn.jobstart({ fake, "serve", "--hostname", "127.0.0.1", "--port", tostring(stop_port) })
-local stop_pid = vim.fn.jobpid(stop_job)
-assert(vim.wait(3000, function()
-  return lifecycle.process_listens_on_port(stop_pid, stop_port)
-end, 20))
-local stop_state = {
+-- Malformed schema-1 metadata remains observational and cannot target even the
+-- current test process during explicit stop.
+local malformed_legacy = {
   schema = 1,
   hostname = vim.uv.os_gethostname():gsub("[^%w_.-]", "_"),
-  pid = stop_pid,
-  generation = "explicit-legacy-stop",
-  port = stop_port,
-  url = "http://127.0.0.1:" .. stop_port,
-  process_executable = vim.uv.fs_readlink("/proc/" .. stop_pid .. "/exe"),
-  argv = process_argv(stop_pid),
+  pid = vim.fn.getpid(),
+  generation = {},
+  port = 4096,
+  url = "http://127.0.0.1:4096",
 }
-assert(lifecycle.write_state(stop_state))
-lock_ok, lock_err = wait_for(lifecycle.acquire_lock, 3000)
-assert(lock_ok, lock_err)
-local legacy_stopped, legacy_stop_err = wait_for(function(done)
-  lifecycle.stop_legacy(stop_state, vim.uv.hrtime() + 8000 * 1000000, done)
-end, 10000)
-assert(legacy_stopped, legacy_stop_err)
+vim.fn.writefile({ vim.json.encode(malformed_legacy) }, state_paths.state)
+local malformed_legacy_encoded = table.concat(vim.fn.readfile(state_paths.state), "\n")
+stop_notice = nil
+original_notify = vim.notify
+vim.notify = function(message)
+  stop_notice = tostring(message)
+end
+lifecycle.stop_shared_server()
+assert(vim.wait(3000, function()
+  return stop_notice ~= nil
+end, 20), "malformed legacy stop did not finish")
+vim.notify = original_notify
+assert(stop_notice:find("state malformed", 1, true), stop_notice)
+assert(table.concat(vim.fn.readfile(state_paths.state), "\n") == malformed_legacy_encoded)
+assert(vim.uv.fs_stat("/proc/" .. vim.fn.getpid()), "malformed legacy state signaled the test process")
 vim.uv.fs_unlink(state_paths.state)
-lifecycle.release_lock()
-assert(process_dead(stop_pid), "explicit verified legacy stop left its process live")
 if tui_job and vim.fn.jobwait({ tui_job }, 0)[1] == -1 then
   vim.fn.jobstop(tui_job)
 end
