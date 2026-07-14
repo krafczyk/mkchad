@@ -90,6 +90,29 @@ assert(seen:find("GET /session/status HTTP/1.1|x%-opencode%-directory: " .. dire
 assert(seen:find("POST /instance/dispose HTTP/1.1|x%-opencode%-directory: " .. directory, 1), "dispose was not directory routed")
 assert(seen:find("GET /path HTTP/1.1|x%-opencode%-directory: " .. directory, 1), "recreation was not directory routed")
 local dispose_count = select(2, seen:gsub("POST /instance/dispose", ""))
+
+package.loaded["opencode.server.discovery"].get = function()
+  local pending = {}
+  function pending:next()
+    return self
+  end
+  function pending:catch(reject)
+    vim.schedule(function()
+      reject("initial SSE connection closed before server.connected")
+    end)
+    return self
+  end
+  return pending
+end
+local reconnect_done, reconnect_ok, reconnect_message = false, nil, nil
+lifecycle.reload_current_directory(function(result, detail)
+  reconnect_done, reconnect_ok, reconnect_message = true, result, detail
+end)
+assert(vim.wait(5000, function() return reconnect_done end, 10), "reload callback remained pending after SSE rejection")
+assert(not reconnect_ok and reconnect_message:find("plugin reconnection", 1, true), reconnect_message)
+assert(reconnect_message:find("closed before server.connected", 1, true), reconnect_message)
+dispose_count = select(2, table.concat(vim.fn.readfile(requests), "\n"):gsub("POST /instance/dispose", ""))
+
 vim.fn.writefile({ "busy" }, requests .. ".busy")
 local busy_done, busy_ok, busy_message = false, nil, nil
 lifecycle.reload_current_directory(function(result, detail)

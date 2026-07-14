@@ -28,6 +28,11 @@ local function iso_now()
   return os.date("!%Y-%m-%dT%H:%M:%SZ")
 end
 
+local function realtime_ms()
+  local seconds, microseconds = uv.gettimeofday()
+  return seconds * 1000 + math.floor(microseconds / 1000)
+end
+
 local function random_token()
   return table.concat({ tostring(vim.fn.getpid()), tostring(uv.hrtime()), tostring(math.random(0, 0x7fffffff)) }, "-")
 end
@@ -81,8 +86,8 @@ local function read_state()
   return state, "valid"
 end
 
-local function write_private(path, content)
-  local fd, err = uv.fs_open(path, "w", 384)
+local function write_private(path, content, exclusive)
+  local fd, err = uv.fs_open(path, exclusive and "wx" or "w", 384)
   if not fd then
     return nil, err
   end
@@ -126,7 +131,7 @@ local function curl_quote(value)
   return value:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", "\\n"):gsub("\r", "\\r")
 end
 
-local function probe_health(url, callback)
+local function probe_health(url, callback, authenticated)
   local started_at = uv.hrtime()
   local stdout, stderr = {}, {}
   local command = {
@@ -188,7 +193,7 @@ local function probe_health(url, callback)
     return
   end
   local config = 'header = "Accept: application/json"\n'
-  if vim.env.OPENCODE_SERVER_PASSWORD and vim.env.OPENCODE_SERVER_PASSWORD ~= "" then
+  if authenticated and vim.env.OPENCODE_SERVER_PASSWORD and vim.env.OPENCODE_SERVER_PASSWORD ~= "" then
     config = config
       .. 'user = "'
       .. curl_quote((vim.env.OPENCODE_SERVER_USERNAME or "opencode") .. ":" .. vim.env.OPENCODE_SERVER_PASSWORD)
@@ -414,7 +419,7 @@ local function terminate_generation(state, deadline_ns, callback)
       if not escalated then
         local killed, kill_err = signal_managed(state, "sigkill")
         if not killed then
-          callback(false, kill_err)
+          callback(not pid_is_live(state.pid), kill_err)
           return
         end
         escalated = true
@@ -430,7 +435,7 @@ local function terminate_generation(state, deadline_ns, callback)
   wait_for_exit()
 end
 
-local lock_token
+local lock_claim
 local function read_lock_owner()
   local owner_content = read_file(paths().lock_owner)
   if not owner_content then
@@ -442,26 +447,62 @@ end
 
 local function lock_is_owned()
   local owner = read_lock_owner()
+  local lock_stat = uv.fs_stat(paths().lock)
   return owner
-    and owner.token == lock_token
+    and lock_claim
+    and owner.token == lock_claim.token
     and owner.pid == vim.fn.getpid()
     and owner.hostname == hostname()
-    and type(owner.deadline_ns) == "number"
-    and uv.hrtime() < owner.deadline_ns
+    and lock_stat
+    and lock_stat.dev == lock_claim.dev
+    and lock_stat.ino == lock_claim.ino
+    and owner.lock_dev == lock_claim.dev
+    and owner.lock_ino == lock_claim.ino
+end
+
+local function same_lock(stat, claim)
+  return stat and claim and stat.dev == claim.dev and stat.ino == claim.ino
+end
+
+local function cleanup_created_lock(claim)
+  if not same_lock(uv.fs_stat(paths().lock), claim) then
+    return false
+  end
+  local detached = paths().lock .. ".unpublished-" .. claim.token
+  if not uv.fs_rename(paths().lock, detached) or not same_lock(uv.fs_stat(detached), claim) then
+    return false
+  end
+  local content = read_file(vim.fs.joinpath(detached, "owner.json"))
+  if content then
+    local ok, owner = pcall(vim.json.decode, content)
+    if not ok or not owner or owner.token ~= claim.token then
+      uv.fs_rename(detached, paths().lock)
+      return false
+    end
+    uv.fs_unlink(vim.fs.joinpath(detached, "owner.json"))
+  end
+  return uv.fs_rmdir(detached) and true or false
 end
 
 local function release_lock()
-  if lock_token and lock_is_owned() then
+  local claim = lock_claim
+  if claim and lock_is_owned() then
     -- Atomically detach the exact lock directory we validated. This cannot
     -- unlink a newly acquired startup.lock after an expiry/reclaim race.
-    local released = paths().lock .. ".release-" .. lock_token
+    local released = paths().lock .. ".release-" .. claim.token
     if uv.fs_rename(paths().lock, released) then
       local content = read_file(vim.fs.joinpath(released, "owner.json"))
       local ok, owner = false, nil
       if content then
         ok, owner = pcall(vim.json.decode, content)
       end
-      if ok and owner and owner.token == lock_token and owner.pid == vim.fn.getpid() and owner.hostname == hostname() then
+      if same_lock(uv.fs_stat(released), claim)
+        and ok
+        and owner
+        and owner.token == claim.token
+        and owner.pid == vim.fn.getpid()
+        and owner.hostname == hostname()
+      then
         uv.fs_unlink(vim.fs.joinpath(released, "owner.json"))
         uv.fs_rmdir(released)
       else
@@ -471,30 +512,51 @@ local function release_lock()
       end
     end
   end
-  lock_token = nil
+  lock_claim = nil
 end
 
-local function lock_is_stale()
-  local lock_stat = uv.fs_stat(paths().lock)
-  local owner = read_lock_owner()
+local function lock_is_stale(lock_stat, owner)
+  lock_stat = lock_stat or uv.fs_stat(paths().lock)
+  owner = owner or read_lock_owner()
+  if not lock_stat then
+    return false
+  end
+  local now_ms = realtime_ms()
+  local modified_ms = lock_stat.mtime and lock_stat.mtime.sec * 1000 + math.floor((lock_stat.mtime.nsec or 0) / 1000000)
+  local old_or_clock_invalid = modified_ms
+    and (now_ms >= modified_ms + startup_timeout_ms or modified_ms > now_ms + startup_timeout_ms)
   -- A contender can observe the directory between mkdir and atomic owner
   -- publication. It is not stale merely because metadata is briefly absent.
-  if not owner or owner.hostname ~= hostname() or type(owner.pid) ~= "number" or type(owner.token) ~= "string" then
-    local created_ns = lock_stat and lock_stat.mtime and lock_stat.mtime.sec * 1000000000 + (lock_stat.mtime.nsec or 0)
-    return created_ns and uv.hrtime() >= created_ns + startup_timeout_ms * 1000000 or false
+  if not owner
+    or owner.hostname ~= hostname()
+    or type(owner.pid) ~= "number"
+    or owner.pid <= 0
+    or type(owner.token) ~= "string"
+    or owner.token == ""
+    or owner.lock_dev ~= lock_stat.dev
+    or owner.lock_ino ~= lock_stat.ino
+    or type(owner.acquired_at_unix_ms) ~= "number"
+    or type(owner.deadline_unix_ms) ~= "number"
+    or owner.deadline_unix_ms < owner.acquired_at_unix_ms
+    or owner.deadline_unix_ms - owner.acquired_at_unix_ms > startup_timeout_ms
+    or owner.acquired_at_unix_ms > now_ms + startup_timeout_ms
+  then
+    return old_or_clock_invalid or false
   end
-  if type(owner.deadline_ns) ~= "number" or uv.hrtime() >= owner.deadline_ns then
+  if now_ms >= owner.deadline_unix_ms then
     return true
   end
   return not pid_is_live(owner.pid)
 end
 
 local function reclaim_stale_lock()
-  local owner = read_lock_owner()
-  if owner and not lock_is_stale() then
+  local lock_stat = uv.fs_stat(paths().lock)
+  if not lock_stat then
     return false
   end
-  if not owner and not lock_is_stale() then
+  local owner_content = read_file(paths().lock_owner)
+  local owner = read_lock_owner()
+  if not lock_is_stale(lock_stat, owner) then
     return false
   end
   -- Rename isolates exactly the directory that was checked. A new acquirer can
@@ -503,19 +565,37 @@ local function reclaim_stale_lock()
   if not uv.fs_rename(paths().lock, tombstone) then
     return false
   end
+  if not same_lock(uv.fs_stat(tombstone), lock_stat) then
+    uv.fs_rename(tombstone, paths().lock)
+    return false
+  end
   local moved_owner = read_file(vim.fs.joinpath(tombstone, "owner.json"))
-  if moved_owner then
-    local ok, decoded = pcall(vim.json.decode, moved_owner)
-    if ok and owner and decoded.token ~= owner.token then
-      -- This should be impossible after the atomic rename. Preserve evidence
-      -- rather than deleting an owner we did not validate.
-      uv.fs_rename(tombstone, paths().lock)
-      return false
-    end
+  if moved_owner ~= owner_content then
+    -- Owner publication raced the stale check. Restore it and let the next
+    -- bounded attempt validate the newly published owner.
+    uv.fs_rename(tombstone, paths().lock)
+    return false
   end
   uv.fs_unlink(vim.fs.joinpath(tombstone, "owner.json"))
   uv.fs_rmdir(tombstone)
   return true
+end
+
+local function publish_lock_owner(claim)
+  if not same_lock(uv.fs_stat(paths().lock), claim) then
+    return nil, "startup lock directory changed before owner publication"
+  end
+  local acquired_at = realtime_ms()
+  local owner = {
+    token = claim.token,
+    pid = vim.fn.getpid(),
+    hostname = hostname(),
+    lock_dev = claim.dev,
+    lock_ino = claim.ino,
+    acquired_at_unix_ms = acquired_at,
+    deadline_unix_ms = acquired_at + startup_timeout_ms,
+  }
+  return write_private(paths().lock_owner, vim.json.encode(owner), true)
 end
 
 local function acquire_lock(callback, retried, deadline_ns)
@@ -526,17 +606,18 @@ local function acquire_lock(callback, retried, deadline_ns)
   end
   local token = random_token()
   if uv.fs_mkdir(state_paths.lock, 448) then
-    lock_token = token
-    local owner = {
-      token = token,
-      pid = vim.fn.getpid(),
-      hostname = hostname(),
-      acquired_at_ns = uv.hrtime(),
-      deadline_ns = deadline_ns or uv.hrtime() + startup_timeout_ms * 1000000,
-    }
-    local wrote, write_err = write_private(state_paths.lock_owner, vim.json.encode(owner))
+    local lock_stat = uv.fs_stat(state_paths.lock)
+    local claim = lock_stat and { token = token, dev = lock_stat.dev, ino = lock_stat.ino } or nil
+    lock_claim = claim
+    local wrote, write_err
+    if claim then
+      wrote, write_err = publish_lock_owner(claim)
+    else
+      write_err = "unable to stat the newly created startup lock"
+    end
     if not wrote then
-      release_lock()
+      cleanup_created_lock(claim)
+      lock_claim = nil
       callback(false, "Unable to write OpenCode startup lock: " .. (write_err or "unknown error"))
       return
     end
@@ -555,18 +636,32 @@ local function acquire_lock(callback, retried, deadline_ns)
   callback(false, "OpenCode startup is already in progress")
 end
 
-local function wait_for_health(url, deadline_ns, callback)
-  probe_health(url, function(health, detail)
+local function wait_for_health(state, deadline_ns, callback)
+  local owned, ownership = process_is_owned(state)
+  local listening = owned and process_listens_on_port(state.pid, state.port)
+  if not owned or not listening then
+    if owned and not port_is_available(state.port) then
+      callback(nil, { kind = "unexpected endpoint process" })
+    elseif not owned or uv.hrtime() >= deadline_ns then
+      callback(nil, { kind = owned and "managed process is not listening" or ownership })
+    else
+      vim.defer_fn(function()
+        wait_for_health(state, deadline_ns, callback)
+      end, health_interval_ms)
+    end
+    return
+  end
+  probe_health(state.url, function(health, detail)
     if health then
       callback(health, detail)
     elseif uv.hrtime() >= deadline_ns then
       callback(nil, detail)
     else
       vim.defer_fn(function()
-        wait_for_health(url, deadline_ns, callback)
+        wait_for_health(state, deadline_ns, callback)
       end, health_interval_ms)
     end
-  end)
+  end, true)
 end
 
 local function resolve_executable()
@@ -684,7 +779,7 @@ local function spawn_server(state, deadline_ns, callback, excluded_ports)
       end)
       return
     end
-    wait_for_health(managed.url, deadline_ns, function(health, detail)
+    wait_for_health(managed, deadline_ns, function(health, detail)
       local still_owned, ownership_reason = process_is_owned(managed)
       if health and still_owned and process_listens_on_port(managed.pid, managed.port) then
         managed.server_version = health.version
@@ -838,8 +933,29 @@ local function managed_state_if_healthy(state, requested, callback)
     callback(nil, { kind = "missing" })
     return
   end
+  local owned, ownership = process_is_owned(state)
+  if not owned then
+    if pid_is_live(state.pid) then
+      callback(nil, { kind = "unverifiable-pid", message = ownership })
+    else
+      callback(nil, { kind = "stale", message = ownership })
+    end
+    return
+  end
+  if not process_listens_on_port(state.pid, state.port) then
+    probe_health(state.url, function(health, detail)
+      if health or detail.kind == "unauthorized" then
+        callback(nil, {
+          kind = "unmanaged-endpoint",
+          message = "managed PID does not own the listening socket for " .. state.url,
+        })
+      else
+        callback(nil, { kind = "owned-unhealthy", message = detail.kind })
+      end
+    end, false)
+    return
+  end
   probe_health(state.url, function(health, detail)
-    local owned, ownership = process_is_owned(state)
     if detail.kind == "unauthorized" then
       callback(nil, detail)
     elseif health then
@@ -848,24 +964,13 @@ local function managed_state_if_healthy(state, requested, callback)
           kind = "explicit-port-conflict",
           message = "A managed OpenCode server uses " .. state.url .. "; stop the shared server before changing OPENCODE_PORT",
         })
-      elseif not owned then
-        callback(nil, { kind = "unmanaged-endpoint", message = ownership })
-      elseif not process_listens_on_port(state.pid, state.port) then
-        callback(nil, {
-          kind = "unmanaged-endpoint",
-          message = "managed PID does not own the listening socket for " .. state.url,
-        })
       else
         callback(state, detail)
       end
-    elseif owned then
-      callback(nil, { kind = "owned-unhealthy", message = detail.kind })
-    elseif pid_is_live(state.pid) then
-      callback(nil, { kind = "unverifiable-pid", message = ownership })
     else
-      callback(nil, { kind = "stale", message = detail.kind })
+      callback(nil, { kind = "owned-unhealthy", message = detail.kind })
     end
-  end)
+  end, true)
 end
 
 local function ensure_backend(callback)
@@ -1083,7 +1188,7 @@ local function stop_shared_server()
           remaining = remaining - 1
           vim.defer_fn(wait_for_stop, health_interval_ms)
         end
-      end)
+      end, false)
     end
     wait_for_stop()
   end)
@@ -1312,6 +1417,11 @@ local function show_info()
     notify(table.concat(lines, "\n"), vim.log.levels.INFO)
     return
   end
+  local authenticated = state
+    and state.url == url
+    and process_is_owned(state)
+    and process_listens_on_port(state.pid, state.port)
+    or false
   probe_health(url, function(health, detail)
     table.insert(lines, "HTTP backend: " .. detail.kind)
     table.insert(lines, "Health latency: " .. detail.latency_ms .. "ms")
@@ -1322,7 +1432,7 @@ local function show_info()
       end
     end
     notify(table.concat(lines, "\n"), health and vim.log.levels.INFO or vim.log.levels.WARN)
-  end)
+  end, authenticated)
 end
 
 local function move_terminal(position)
@@ -1423,10 +1533,12 @@ if vim.g.mkchad_opencode_test_api then
   vim.g.mkchad_opencode_test_api = {
     acquire_lock = acquire_lock,
     lock_is_owned = lock_is_owned,
+    managed_state_if_healthy = managed_state_if_healthy,
     paths = paths,
     process_listens_on_port = process_listens_on_port,
     port_is_available = port_is_available,
     process_is_owned = process_is_owned,
+    publish_lock_owner = publish_lock_owner,
     release_lock = release_lock,
     spawn_server = spawn_server,
     select_port = select_port,
@@ -1435,6 +1547,7 @@ if vim.g.mkchad_opencode_test_api then
     write_state = write_state,
     ensure_local_tui = ensure_local_tui,
     reload_current_directory = reload_current_directory,
+    show_info = show_info,
     tui_valid = tui_valid,
   }
 end
