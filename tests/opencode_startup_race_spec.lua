@@ -21,9 +21,11 @@ end
 local acquired = await(lifecycle.acquire_lock)
 assert(acquired, "could not acquire test lock")
 local fake = vim.fs.joinpath(lifecycle.paths().root, "opencode")
+local pid_record = vim.fs.joinpath(lifecycle.paths().root, "spawned.pid")
 vim.fn.writefile({
   "#!/bin/sh",
   'if [ "$1" = "--version" ]; then echo fake; exit 0; fi',
+  "echo $$ > \"" .. pid_record .. "\"",
   "python3 -c 'import socket,sys; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind((\"127.0.0.1\",int(sys.argv[1]))); s.listen(); c,a=s.accept(); c.recv(4096); c.sendall(b\"HTTP/1.1 200 OK\\r\\nContent-Length: 16\\r\\n\\r\\n{\\\"healthy\\\":true}\"); c.close()' \"$5\" &",
   "exec python3 -c 'import time; time.sleep(30)' \"$@\"",
 }, fake)
@@ -35,5 +37,13 @@ end)
 assert(not state, "unknown health responder was incorrectly adopted")
 assert(err:find("unexpected endpoint process", 1, true), err)
 assert(not lifecycle.read_state(), "failed generation state was retained after cleanup")
+local spawned_pid = tonumber(vim.fn.readfile(pid_record)[1])
+assert(spawned_pid and vim.wait(1000, function()
+  if not vim.uv.fs_stat("/proc/" .. spawned_pid) then
+    return true
+  end
+  local stat = vim.fn.readfile("/proc/" .. spawned_pid .. "/stat")[1]
+  return stat and stat:match("%)%s+(%a)") == "Z"
+end, 10), "failed generation remained as a live orphan")
 lifecycle.release_lock()
 vim.cmd("qa!")
