@@ -2,7 +2,6 @@ local uv = vim.uv
 local host = "127.0.0.1"
 local preferred_port = 4096
 local startup_timeout_ms = 15000
-local health_attempts = 30
 local health_interval_ms = 200
 local local_tui_bootstrap_ms = 200
 
@@ -233,6 +232,57 @@ local function pid_is_live(pid)
   return state ~= "Z"
 end
 
+local function proc_cmdline(pid)
+  local command = read_file("/proc/" .. pid .. "/cmdline")
+  if not command or command == "" then
+    return nil
+  end
+  local argv = vim.split(command, "\0", { plain = true, trimempty = true })
+  return #argv > 0 and argv or nil
+end
+
+local function proc_executable(pid)
+  return uv.fs_readlink("/proc/" .. pid .. "/exe")
+end
+
+local function argv_equal(left, right)
+  if type(left) ~= "table" or type(right) ~= "table" or #left ~= #right then
+    return false
+  end
+  for index, value in ipairs(left) do
+    if value ~= right[index] then
+      return false
+    end
+  end
+  return true
+end
+
+local function process_listens_on_port(pid, port)
+  local wanted_port = string.format("%04X", port)
+  local tcp = read_file("/proc/net/tcp")
+  if not tcp then
+    return false
+  end
+  local inode
+  for line in tcp:gmatch("[^\n]+") do
+    local fields = vim.split(line, "%s+", { trimempty = true })
+    local address, listening = fields[2], fields[4] == "0A"
+    if address and listening and address:match("^[0-9A-Fa-f]+:" .. wanted_port .. "$") then
+      inode = fields[10]
+      break
+    end
+  end
+  if not inode then
+    return false
+  end
+  for _, fd in ipairs(vim.fn.glob("/proc/" .. pid .. "/fd/*", true, true)) do
+    if uv.fs_readlink(fd) == "socket:[" .. inode .. "]" then
+      return true
+    end
+  end
+  return false
+end
+
 local function process_is_owned(state)
   if not state or state.hostname ~= hostname() or type(state.pid) ~= "number" or state.pid <= 0 then
     return false, "invalid managed PID"
@@ -240,50 +290,164 @@ local function process_is_owned(state)
   if not pid_is_live(state.pid) then
     return false, "PID is not live"
   end
-  local command = read_file("/proc/" .. state.pid .. "/cmdline")
-  if command then
-    command = command:gsub("%z", " ")
-    if not command:find("opencode", 1, true)
-      or not command:find("serve", 1, true)
-      or not command:find("--port " .. state.port, 1, true)
-    then
-      return false, "PID command does not match managed opencode serve"
-    end
+  if type(state.process_executable) ~= "string" or type(state.argv) ~= "table" then
+    return false, "managed process identity is unavailable"
+  end
+  local executable = proc_executable(state.pid)
+  local argv = proc_cmdline(state.pid)
+  if executable ~= state.process_executable or not argv_equal(argv, state.argv) then
+    return false, "PID executable or argv does not match the managed opencode serve process"
+  end
+  if #state.argv < 6
+    or state.argv[#state.argv - 4] ~= "serve"
+    or state.argv[#state.argv - 3] ~= "--hostname"
+    or state.argv[#state.argv - 2] ~= host
+    or state.argv[#state.argv - 1] ~= "--port"
+    or state.argv[#state.argv] ~= tostring(state.port)
+  then
+    return false, "managed process argv is not an exact opencode serve command"
   end
   return true, "verified"
 end
 
+local function signal_managed(state, signal)
+  local owned, reason = process_is_owned(state)
+  if not owned then
+    return nil, reason
+  end
+  local ok, err = uv.kill(state.pid, signal)
+  if not ok then
+    return nil, err or "unable to signal managed process"
+  end
+  return true
+end
+
+local function terminate_generation(state, deadline_ns, callback)
+  local owned, reason = process_is_owned(state)
+  if not owned then
+    callback(not pid_is_live(state.pid), reason)
+    return
+  end
+  local sent, signal_err = signal_managed(state, "sigterm")
+  if not sent then
+    callback(false, signal_err)
+    return
+  end
+  local escalated = false
+  local function wait_for_exit()
+    if not pid_is_live(state.pid) then
+      callback(true)
+      return
+    end
+    if uv.hrtime() >= deadline_ns then
+      if not escalated then
+        local killed, kill_err = signal_managed(state, "sigkill")
+        if not killed then
+          callback(false, kill_err)
+          return
+        end
+        escalated = true
+        vim.defer_fn(wait_for_exit, health_interval_ms)
+        return
+      else
+        callback(false, "managed process did not exit after SIGKILL")
+        return
+      end
+    end
+    vim.defer_fn(wait_for_exit, health_interval_ms)
+  end
+  wait_for_exit()
+end
+
 local lock_token
-local function lock_is_owned()
+local function read_lock_owner()
   local owner_content = read_file(paths().lock_owner)
   if not owner_content then
-    return false
+    return nil
   end
   local ok, owner = pcall(vim.json.decode, owner_content)
-  return ok and owner.token == lock_token and owner.pid == vim.fn.getpid()
+  return ok and type(owner) == "table" and owner or nil
+end
+
+local function lock_is_owned()
+  local owner = read_lock_owner()
+  return owner
+    and owner.token == lock_token
+    and owner.pid == vim.fn.getpid()
+    and owner.hostname == hostname()
+    and type(owner.deadline_ns) == "number"
+    and uv.hrtime() < owner.deadline_ns
 end
 
 local function release_lock()
   if lock_token and lock_is_owned() then
-    uv.fs_unlink(paths().lock_owner)
-    uv.fs_rmdir(paths().lock)
+    -- Atomically detach the exact lock directory we validated. This cannot
+    -- unlink a newly acquired startup.lock after an expiry/reclaim race.
+    local released = paths().lock .. ".release-" .. lock_token
+    if uv.fs_rename(paths().lock, released) then
+      local content = read_file(vim.fs.joinpath(released, "owner.json"))
+      local ok, owner = false, nil
+      if content then
+        ok, owner = pcall(vim.json.decode, content)
+      end
+      if ok and owner and owner.token == lock_token and owner.pid == vim.fn.getpid() and owner.hostname == hostname() then
+        uv.fs_unlink(vim.fs.joinpath(released, "owner.json"))
+        uv.fs_rmdir(released)
+      else
+        -- Preserve an unexpected owner record for diagnosis rather than
+        -- removing it. A future bounded stale-lock reclaim can handle it.
+        uv.fs_rename(released, paths().lock)
+      end
+    end
   end
   lock_token = nil
 end
 
 local function lock_is_stale()
-  local content = read_file(paths().lock_owner)
-  local ok, owner = content and pcall(vim.json.decode, content)
-  if not ok or type(owner) ~= "table" or owner.hostname ~= hostname() or type(owner.pid) ~= "number" then
-    return true
+  local lock_stat = uv.fs_stat(paths().lock)
+  local owner = read_lock_owner()
+  -- A contender can observe the directory between mkdir and atomic owner
+  -- publication. It is not stale merely because metadata is briefly absent.
+  if not owner or owner.hostname ~= hostname() or type(owner.pid) ~= "number" or type(owner.token) ~= "string" then
+    local created_ns = lock_stat and lock_stat.mtime and lock_stat.mtime.sec * 1000000000 + (lock_stat.mtime.nsec or 0)
+    return created_ns and uv.hrtime() >= created_ns + startup_timeout_ms * 1000000 or false
   end
-  if owner.acquired_at_ns and uv.hrtime() - owner.acquired_at_ns > startup_timeout_ms * 1000000 then
+  if type(owner.deadline_ns) ~= "number" or uv.hrtime() >= owner.deadline_ns then
     return true
   end
   return not pid_is_live(owner.pid)
 end
 
-local function acquire_lock(callback, retried)
+local function reclaim_stale_lock()
+  local owner = read_lock_owner()
+  if owner and not lock_is_stale() then
+    return false
+  end
+  if not owner and not lock_is_stale() then
+    return false
+  end
+  -- Rename isolates exactly the directory that was checked. A new acquirer can
+  -- create startup.lock after this rename without being removed by this cleanup.
+  local tombstone = paths().lock .. ".stale-" .. random_token()
+  if not uv.fs_rename(paths().lock, tombstone) then
+    return false
+  end
+  local moved_owner = read_file(vim.fs.joinpath(tombstone, "owner.json"))
+  if moved_owner then
+    local ok, decoded = pcall(vim.json.decode, moved_owner)
+    if ok and owner and decoded.token ~= owner.token then
+      -- This should be impossible after the atomic rename. Preserve evidence
+      -- rather than deleting an owner we did not validate.
+      uv.fs_rename(tombstone, paths().lock)
+      return false
+    end
+  end
+  uv.fs_unlink(vim.fs.joinpath(tombstone, "owner.json"))
+  uv.fs_rmdir(tombstone)
+  return true
+end
+
+local function acquire_lock(callback, retried, deadline_ns)
   local state_paths, err = ensure_state_dir()
   if not state_paths then
     callback(false, err)
@@ -297,6 +461,7 @@ local function acquire_lock(callback, retried)
       pid = vim.fn.getpid(),
       hostname = hostname(),
       acquired_at_ns = uv.hrtime(),
+      deadline_ns = deadline_ns or uv.hrtime() + startup_timeout_ms * 1000000,
     }
     local wrote, write_err = write_private(state_paths.lock_owner, vim.json.encode(owner))
     if not wrote then
@@ -304,27 +469,30 @@ local function acquire_lock(callback, retried)
       callback(false, "Unable to write OpenCode startup lock: " .. (write_err or "unknown error"))
       return
     end
+    if not lock_is_owned() then
+      release_lock()
+      callback(false, "OpenCode startup lock ownership was lost before startup")
+      return
+    end
     callback(true)
     return
   end
-  if not retried and lock_is_stale() then
-    uv.fs_unlink(state_paths.lock_owner)
-    uv.fs_rmdir(state_paths.lock)
-    acquire_lock(callback, true)
+  if not retried and reclaim_stale_lock() then
+    acquire_lock(callback, true, deadline_ns)
     return
   end
   callback(false, "OpenCode startup is already in progress")
 end
 
-local function wait_for_health(url, remaining, callback)
+local function wait_for_health(url, deadline_ns, callback)
   probe_health(url, function(health, detail)
     if health then
       callback(health, detail)
-    elseif remaining <= 0 then
+    elseif uv.hrtime() >= deadline_ns then
       callback(nil, detail)
     else
       vim.defer_fn(function()
-        wait_for_health(url, remaining - 1, callback)
+        wait_for_health(url, deadline_ns, callback)
       end, health_interval_ms)
     end
   end)
@@ -366,7 +534,7 @@ local function select_port(state)
   return nil, nil, "Unable to find an available OpenCode port"
 end
 
-local function spawn_server(state, port_source, callback)
+local function spawn_server(state, deadline_ns, callback)
   local state_paths = paths()
   local executable, version, executable_err = resolve_executable()
   if not executable then
@@ -408,37 +576,73 @@ local function spawn_server(state, port_source, callback)
   end
   handle:unref()
   handle:close()
-  local managed = {
-    schema = 1,
-    hostname = hostname(),
-    pid = pid,
-    generation = generation,
-    host = host,
-    port = port,
-    url = ("http://%s:%d"):format(host, port),
-    port_source = source or port_source,
-    started_at = iso_now(),
-    cwd = vim.env.HOME or vim.fn.expand("~"),
-    log = state_paths.log,
-    executable = executable,
-    local_version = version,
-  }
-  local wrote, write_err = write_state(managed)
-  if not wrote then
-    uv.kill(pid, "sigterm")
-    callback(nil, write_err)
-    return
-  end
-  wait_for_health(managed.url, health_attempts, function(health, detail)
-    if health then
-      managed.server_version = health.version
-      write_state(managed)
-      callback(managed)
-    else
-      remove_matching_state(generation)
-      callback(nil, "OpenCode did not become healthy at " .. managed.url .. " (" .. detail.kind .. "); see " .. state_paths.log)
+  -- Wait one event-loop turn so procfs observes the exec rather than the
+  -- short-lived launcher. State records the complete observed identity, never
+  -- a substring match that a reused PID can satisfy.
+  vim.defer_fn(function()
+    local managed = {
+      schema = 1,
+      hostname = hostname(),
+      pid = pid,
+      generation = generation,
+      host = host,
+      port = port,
+      url = ("http://%s:%d"):format(host, port),
+      port_source = source,
+      started_at = iso_now(),
+      cwd = vim.env.HOME or vim.fn.expand("~"),
+      log = state_paths.log,
+      executable = executable,
+      local_version = version,
+      process_executable = proc_executable(pid),
+      argv = proc_cmdline(pid),
+    }
+    local owned, ownership = process_is_owned(managed)
+    if not owned then
+      callback(nil, "OpenCode child exited or did not exec the expected command (" .. ownership .. "); see " .. state_paths.log)
+      return
     end
-  end)
+    local wrote, write_err = write_state(managed)
+    if not wrote then
+      terminate_generation(managed, deadline_ns, function(cleaned, cleanup_err)
+        local suffix = cleaned and "" or "; cleanup failed: " .. (cleanup_err or "unknown error")
+        callback(nil, write_err .. suffix)
+      end)
+      return
+    end
+    wait_for_health(managed.url, deadline_ns, function(health, detail)
+      local still_owned, ownership_reason = process_is_owned(managed)
+      if health and still_owned and process_listens_on_port(managed.pid, managed.port) then
+        managed.server_version = health.version
+        write_state(managed)
+        callback(managed)
+        return
+      end
+      local failure = health and "unexpected endpoint process" or detail.kind
+      terminate_generation(managed, deadline_ns, function(cleaned, cleanup_err)
+        if cleaned then
+          remove_matching_state(generation)
+        else
+          managed.cleanup_error = cleanup_err or "failed cleanup after readiness failure"
+          write_state(managed)
+        end
+        local ownership_suffix = still_owned and "" or "; child identity lost: " .. ownership_reason
+        local cleanup_suffix = cleaned and "" or "; cleanup failed: " .. (cleanup_err or "unknown error")
+        callback(
+          nil,
+          "OpenCode did not become healthy at "
+            .. managed.url
+            .. " ("
+            .. failure
+            .. ")"
+            .. ownership_suffix
+            .. cleanup_suffix
+            .. "; see "
+            .. state_paths.log
+        )
+      end)
+    end)
+  end, 10)
 end
 
 local ensure_waiters = {}
@@ -455,7 +659,14 @@ local function finish_ensure(ok, err, state)
 end
 
 local function tui_valid()
-  return local_tui and local_tui.term and local_tui.term:valid()
+  if not local_tui or not local_tui.term or not local_tui.term:valid() then
+    return false
+  end
+  local job = local_tui.job
+  if type(job) ~= "number" or job <= 0 then
+    return false
+  end
+  return vim.fn.jobwait({ job }, 0)[1] == -1
 end
 
 local function close_local_tui()
@@ -508,7 +719,36 @@ local function ensure_local_tui(state, callback)
     callback(false, "Unable to create the local OpenCode attached TUI")
     return
   end
-  local_tui = { term = term, url = state.url, directory = cwd, generation = state.generation, command = command }
+  local buffer = term.buf or term.bufnr
+  local job = term.job or term.job_id
+  if (not job or job <= 0) and buffer and vim.api.nvim_buf_is_valid(buffer) then
+    job = vim.b[buffer].terminal_job_id
+  end
+  if type(job) ~= "number" or job <= 0 then
+    callback(false, "OpenCode attached TUI did not expose a live terminal job")
+    return
+  end
+  local_tui = {
+    term = term,
+    job = job,
+    url = state.url,
+    directory = cwd,
+    generation = state.generation,
+    command = command,
+  }
+  if buffer and vim.api.nvim_buf_is_valid(buffer) then
+    vim.api.nvim_create_autocmd("TermClose", {
+      buffer = buffer,
+      once = true,
+      callback = function()
+        -- TermClose status is not a liveness signal: SIGKILL and normal exit
+        -- are both dead local TUIs and must be recreated on the next operation.
+        if local_tui and local_tui.term == term then
+          local_tui = nil
+        end
+      end,
+    })
+  end
   if created then
     vim.defer_fn(function()
       callback(true)
@@ -518,13 +758,33 @@ local function ensure_local_tui(state, callback)
   end
 end
 
-local function managed_state_if_healthy(state, callback)
+local function managed_state_if_healthy(state, requested, callback)
   if not state then
-    callback(nil)
+    callback(nil, { kind = "missing" })
     return
   end
-  probe_health(state.url, function(health)
-    callback(health and state or nil)
+  probe_health(state.url, function(health, detail)
+    local owned, ownership = process_is_owned(state)
+    if detail.kind == "unauthorized" then
+      callback(nil, detail)
+    elseif health then
+      if requested and state.port ~= requested then
+        callback(nil, {
+          kind = "explicit-port-conflict",
+          message = "A managed OpenCode server uses " .. state.url .. "; stop the shared server before changing OPENCODE_PORT",
+        })
+      elseif not owned then
+        callback(nil, { kind = "unmanaged-endpoint", message = ownership })
+      else
+        callback(state, detail)
+      end
+    elseif owned then
+      callback(nil, { kind = "owned-unhealthy", message = detail.kind })
+    elseif pid_is_live(state.pid) then
+      callback(nil, { kind = "unverifiable-pid", message = ownership })
+    else
+      callback(nil, { kind = "stale", message = detail.kind })
+    end
   end)
 end
 
@@ -534,15 +794,31 @@ local function ensure_backend(callback)
     return
   end
   ensure_active = true
+  local deadline_ns = uv.hrtime() + startup_timeout_ms * 1000000
   local state = read_state()
   local requested, request_err = explicit_port()
   if request_err then
     finish_ensure(false, request_err)
     return
   end
-  local function start_while_locked()
+  local function detail_error(detail, endpoint_state)
+    if detail.kind == "unauthorized" then
+      return "OpenCode authentication failed at " .. (endpoint_state and endpoint_state.url or "the managed endpoint") .. " (HTTP 401)"
+    elseif detail.kind == "explicit-port-conflict" then
+      return detail.message
+    elseif detail.kind == "unmanaged-endpoint" then
+      return "Refusing to adopt a healthy unmanaged OpenCode endpoint: " .. (detail.message or "ownership mismatch")
+    elseif detail.kind == "unverifiable-pid" then
+      return "Refusing to replace a live unverifiable managed PID: " .. (detail.message or "ownership mismatch")
+    end
+  end
+  local function start_while_locked(attempt)
+    if not lock_is_owned() then
+      finish_ensure(false, "OpenCode startup lock ownership was lost before the critical section")
+      return
+    end
     local locked_state = read_state()
-    managed_state_if_healthy(locked_state, function(rechecked)
+    managed_state_if_healthy(locked_state, requested, function(rechecked, detail)
       if rechecked then
         release_lock()
         ensure_local_tui(rechecked, function(ok, err)
@@ -550,50 +826,98 @@ local function ensure_backend(callback)
         end)
         return
       end
-      spawn_server(locked_state, nil, function(started, start_err)
+      local hard_error = detail_error(detail, locked_state)
+      if hard_error then
         release_lock()
-        if not started then
-          finish_ensure(false, start_err)
-          return
-        end
-        ensure_local_tui(started, function(ok, err)
-          finish_ensure(ok, err, started)
-        end)
-      end)
-    end)
-  end
-  managed_state_if_healthy(state, function(healthy_state)
-    if healthy_state then
-      if requested and healthy_state.port ~= requested then
-        finish_ensure(
-          false,
-          "A managed OpenCode server uses " .. healthy_state.url .. "; stop the shared server before changing OPENCODE_PORT"
-        )
+        finish_ensure(false, hard_error)
         return
       end
+      local function launch()
+        if not lock_is_owned() then
+          finish_ensure(false, "OpenCode startup lock ownership was lost before launch")
+          return
+        end
+        spawn_server(locked_state, deadline_ns, function(started, start_err)
+          if not started and not requested and attempt < 2 and uv.hrtime() < deadline_ns then
+            -- A bind race may only retry through automatic port selection.
+            if not lock_is_owned() then
+              finish_ensure(false, "OpenCode startup lock ownership was lost before automatic retry")
+              return
+            end
+            spawn_server(nil, deadline_ns, function(retried, retry_err)
+              release_lock()
+              if not retried then
+                finish_ensure(false, retry_err)
+                return
+              end
+              ensure_local_tui(retried, function(ok, err)
+                finish_ensure(ok, err, retried)
+              end)
+            end)
+            return
+          end
+          release_lock()
+          if not started then
+            finish_ensure(false, start_err)
+            return
+          end
+          ensure_local_tui(started, function(ok, err)
+            finish_ensure(ok, err, started)
+          end)
+        end)
+      end
+      if detail.kind == "owned-unhealthy" then
+        terminate_generation(locked_state, deadline_ns, function(cleaned, cleanup_err)
+          if not cleaned then
+            release_lock()
+            finish_ensure(false, "Managed OpenCode process is unhealthy and cleanup failed: " .. (cleanup_err or "unknown error"))
+            return
+          end
+          remove_matching_state(locked_state.generation)
+          launch()
+        end)
+      else
+        if detail.kind == "stale" and locked_state then
+          remove_matching_state(locked_state.generation)
+        end
+        launch()
+      end
+    end)
+  end
+  managed_state_if_healthy(state, requested, function(healthy_state, detail)
+    if healthy_state then
       ensure_local_tui(healthy_state, function(ok, err)
         finish_ensure(ok, err, healthy_state)
       end)
       return
     end
+    local hard_error = detail_error(detail, state)
+    if hard_error then
+      finish_ensure(false, hard_error)
+      return
+    end
     acquire_lock(function(locked, lock_err)
       if not locked then
-        local deadline = uv.hrtime() + startup_timeout_ms * 1000000
         local function wait_for_winner()
           local waiting_state = read_state()
-          managed_state_if_healthy(waiting_state, function(winner)
+          managed_state_if_healthy(waiting_state, requested, function(winner, winner_detail)
             if winner then
               ensure_local_tui(winner, function(ok, err)
                 finish_ensure(ok, err, winner)
               end)
-            elseif uv.hrtime() >= deadline then
+              return
+            end
+            local winner_error = detail_error(winner_detail, waiting_state)
+            if winner_error then
+              finish_ensure(false, winner_error)
+            elseif uv.hrtime() >= deadline_ns then
               acquire_lock(function(relocked, retry_err)
                 if relocked then
-                  start_while_locked()
+                  start_while_locked(1)
                 else
                   finish_ensure(false, retry_err or lock_err)
                 end
-              end)
+              end, true, deadline_ns)
             else
               vim.defer_fn(wait_for_winner, health_interval_ms)
             end
@@ -602,8 +926,8 @@ local function ensure_backend(callback)
         wait_for_winner()
         return
       end
-      start_while_locked()
-    end)
+      start_while_locked(1)
+    end, nil, deadline_ns)
   end)
 end
 
@@ -646,7 +970,12 @@ local function stop_shared_server()
       notify("Refusing to stop shared OpenCode server: " .. ownership, vim.log.levels.ERROR)
       return
     end
-    uv.kill(state.pid, "sigterm")
+    local sent, signal_err = signal_managed(state, "sigterm")
+    if not sent then
+      release_lock()
+      notify("Refusing to stop shared OpenCode server: " .. signal_err, vim.log.levels.ERROR)
+      return
+    end
     local remaining = 25
     local escalated = false
     local function wait_for_stop()
@@ -657,15 +986,14 @@ local function stop_shared_server()
           close_local_tui()
           notify("Stopped shared OpenCode server", vim.log.levels.INFO)
         elseif remaining <= 0 and not escalated then
-          local still_owned = process_is_owned(state)
-          if still_owned then
-            uv.kill(state.pid, "sigkill")
+          local killed, kill_err = signal_managed(state, "sigkill")
+          if killed then
             escalated = true
             remaining = 25
             vim.defer_fn(wait_for_stop, health_interval_ms)
           else
             release_lock()
-            notify("Refusing to escalate an unverifiable shared OpenCode PID", vim.log.levels.ERROR)
+            notify("Refusing to escalate an unverifiable shared OpenCode PID: " .. kill_err, vim.log.levels.ERROR)
           end
         elseif remaining <= 0 then
           release_lock()
@@ -811,3 +1139,22 @@ vim.api.nvim_create_user_command("OpenCodeInfo", show_info, {
   desc = "Show live OpenCode server information without starting it",
   force = true,
 })
+
+-- Narrow test seam for the headless lifecycle regression script. It is only
+-- installed when explicitly requested before this configuration is sourced.
+if vim.g.mkchad_opencode_test_api then
+  vim.g.mkchad_opencode_test_api = {
+    acquire_lock = acquire_lock,
+    lock_is_owned = lock_is_owned,
+    paths = paths,
+    process_listens_on_port = process_listens_on_port,
+    process_is_owned = process_is_owned,
+    release_lock = release_lock,
+    spawn_server = spawn_server,
+    terminate_generation = terminate_generation,
+    read_state = read_state,
+    write_state = write_state,
+    ensure_local_tui = ensure_local_tui,
+    tui_valid = tui_valid,
+  }
+end

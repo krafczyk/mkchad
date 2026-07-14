@@ -15,7 +15,11 @@ fresh server health without changing lifecycle state.
 State lives in `${XDG_STATE_HOME:-$HOME/.local/state}/mkchad/opencode/<host>/`:
 `state.json`, `server.log`, and a startup lock. The directory is mode `0700`;
 state and log files are mode `0600`. State intentionally contains no password
-or provider credential.
+or provider credential. It records the launched process's exact executable and
+argument vector so recovery and `:OpenCodeStop` refuse a reused or near-match
+PID. A healthy endpoint is reused only when that managed process identity and
+the configured port match; authentication failures are reported without
+starting a replacement.
 
 Without `OPENCODE_PORT`, the server prefers port `4096` and persists a high
 fallback port when `4096` is occupied. An explicit `OPENCODE_PORT` is used
