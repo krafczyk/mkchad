@@ -146,8 +146,8 @@ return {
   -- },
 
   {
-    "nickjvandyke/opencode.nvim",
-    version = "*",
+    "krafczyk/opencode.nvim",
+    commit = "ab5eefe",
     cmd = { "Opencode", "OpenCodeStart", "OpenCodeStop", "OpenCodeInfo" },
     keys = {
       {
