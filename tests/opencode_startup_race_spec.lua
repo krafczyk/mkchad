@@ -9,15 +9,15 @@ local function await(invoke)
     values = { ... }
     done = true
   end)
-  assert(vim.wait(5000, function()
+  assert(vim.wait(40000, function()
     return done
   end, 10), "timed out")
   return unpack(values)
 end
 
--- The shell harness puts a fake, long-lived `opencode serve` on PATH and a
--- separate health responder on its requested port. Readiness must not adopt
--- that responder: the spawned PID does not own the listening socket.
+-- A fake backend launches a separate listener on its assigned internal port.
+-- Backend listener proof must fail before the TLS proxy or any credentialed
+-- public request is launched.
 local acquired = await(lifecycle.acquire_lock)
 assert(acquired, "could not acquire test lock")
 local fake = vim.fs.joinpath(lifecycle.paths().root, "opencode")
@@ -38,12 +38,12 @@ assert(vim.uv.fs_chmod(fake, 493))
 vim.env.PATH = lifecycle.paths().root .. ":" .. vim.env.PATH
 vim.env.OPENCODE_SERVER_PASSWORD = "must-not-reach-startup-race-listener"
 local state, err = await(function(done)
-  lifecycle.spawn_server(nil, vim.uv.hrtime() + 2500 * 1000000, done)
+  lifecycle.spawn_pair(nil, vim.uv.hrtime() + 30000 * 1000000, done)
 end)
-assert(not state, "unknown health responder was incorrectly adopted")
-assert(err:find("unexpected endpoint process", 1, true), err)
+assert(not state, "separate internal listener was incorrectly adopted")
+assert(err:find("backend listener failed", 1, true), err)
 assert(not lifecycle.read_state(), "failed generation state was retained after cleanup")
-assert(not vim.uv.fs_stat(request_record), "startup readiness sent credentials to an unverified listener")
+assert(not vim.uv.fs_stat(request_record), "startup sent any HTTP bytes to an unverified internal listener")
 local spawned_pid = tonumber(vim.fn.readfile(pid_record)[1])
 assert(spawned_pid and vim.wait(1000, function()
   if not vim.uv.fs_stat("/proc/" .. spawned_pid) then

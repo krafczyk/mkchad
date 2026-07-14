@@ -147,7 +147,7 @@ return {
 
   {
     "krafczyk/opencode.nvim",
-    commit = "e04b7a7",
+    commit = "a383638",
     cmd = { "Opencode", "OpenCodeStart", "OpenCodeStop", "OpenCodeInfo", "OpenCodeReload" },
     keys = {
       {

@@ -1,13 +1,24 @@
 local uv = vim.uv
 local host = "127.0.0.1"
 local preferred_port = 4096
-local startup_timeout_ms = 15000
+local startup_timeout_ms = 30000
 local health_interval_ms = 200
 local local_tui_bootstrap_ms = 200
 local lock_renew_interval_ms = 3000
+local proxy_max_connections = 128
+local password_warning_shown = false
+
+local no_password_warning = "WARNING: OPENCODE_SERVER_PASSWORD is not set. TLS authenticates the OpenCode server, not clients; both the public proxy and discoverable internal loopback backend are accessible to other local users. Set a strong existing environment password, then stop and restart the shared server."
 
 local function notify(message, level)
   vim.notify(message, level, { title = "OpenCode" })
+end
+
+local function warn_no_password()
+  if not password_warning_shown and (not vim.env.OPENCODE_SERVER_PASSWORD or vim.env.OPENCODE_SERVER_PASSWORD == "") then
+    password_warning_shown = true
+    notify(no_password_warning, vim.log.levels.WARN)
+  end
 end
 
 local function hostname()
@@ -19,9 +30,18 @@ local function paths()
   return {
     root = root,
     state = vim.fs.joinpath(root, "state.json"),
+    pending = vim.fs.joinpath(root, "pending.json"),
     log = vim.fs.joinpath(root, "server.log"),
+    proxy_log = vim.fs.joinpath(root, "proxy.log"),
     lock = vim.fs.joinpath(root, "startup.lock"),
     lock_owner = vim.fs.joinpath(root, "startup.lock", "owner.json"),
+    tls = vim.fs.joinpath(root, "tls"),
+    ca = vim.fs.joinpath(root, "tls", "ca.pem"),
+    ca_store = vim.fs.joinpath(root, "tls", "ca.p12"),
+    server_store = vim.fs.joinpath(root, "tls", "server.p12"),
+    server_cert = vim.fs.joinpath(root, "tls", "server.pem"),
+    password = vim.fs.joinpath(root, "tls", "store.password"),
+    proxy_source = vim.fs.joinpath(vim.fn.stdpath("config"), "java", "MkChadTlsProxy.java"),
   }
 end
 
@@ -71,6 +91,204 @@ local function current_boot_id()
   return value and value:match("^%s*(.-)%s*$") or nil
 end
 
+local function is_integer(value, minimum, maximum)
+  return type(value) == "number"
+    and value == value
+    and value % 1 == 0
+    and value >= minimum
+    and value <= maximum
+end
+
+local function safe_string(value, maximum)
+  return type(value) == "string"
+    and value ~= ""
+    and #value <= maximum
+    and not value:find("[%z\1-\31\127]")
+end
+
+local function absolute_path(value)
+  return safe_string(value, 4096) and value:sub(1, 1) == "/"
+end
+
+local function decimal_identity(value, allow_zero)
+  if type(value) ~= "string" or not value:match("^%d+$") or (#value > 1 and value:sub(1, 1) == "0") then
+    return false
+  end
+  if not allow_zero and value == "0" then
+    return false
+  end
+  return #value < 20 or (#value == 20 and value <= "18446744073709551615")
+end
+
+local function valid_argv(argv)
+  if type(argv) ~= "table" or #argv < 1 or #argv > 128 then
+    return false
+  end
+  for key, value in pairs(argv) do
+    if not is_integer(key, 1, #argv) or not safe_string(value, 4096) then
+      return false
+    end
+  end
+  return true
+end
+
+local function valid_process_record(process, role)
+  if type(process) ~= "table"
+    or not is_integer(process.pid, 1, 2147483647)
+    or not is_integer(process.port, 1, 65535)
+    or not valid_argv(process.argv)
+    or not absolute_path(process.process_executable)
+    or not decimal_identity(process.process_executable_dev, true)
+    or not decimal_identity(process.process_executable_ino, false)
+    or not absolute_path(process.executable)
+    or not decimal_identity(process.executable_dev, true)
+    or not decimal_identity(process.executable_ino, false)
+    or type(process.start_time) ~= "string"
+    or #process.start_time > 32
+    or not process.start_time:match("^[1-9]%d*$")
+    or not absolute_path(process.log)
+  then
+    return false
+  end
+  local runtime_path = process.process_executable:gsub(" %(deleted%)$", "")
+  if runtime_path == process.executable
+    and (process.process_executable_dev ~= process.executable_dev or process.process_executable_ino ~= process.executable_ino)
+  then
+    return false
+  end
+  if role == "proxy" then
+    return process.log == paths().proxy_log
+      and absolute_path(process.source)
+      and process.source == paths().proxy_source
+      and decimal_identity(process.source_dev, true)
+      and decimal_identity(process.source_ino, false)
+  end
+  return process.log == paths().log
+    and safe_string(process.local_version, 128)
+    and (process.server_version == nil or safe_string(process.server_version, 128))
+end
+
+local function valid_generation(value)
+  return safe_string(value, 256) and value:match("^[%w_.%+-]+$") ~= nil
+end
+
+local function valid_boot_id(value)
+  if type(value) ~= "string" then
+    return false
+  end
+  local first, second, third, fourth, fifth = value:match("^([0-9a-fA-F]+)%-([0-9a-fA-F]+)%-([0-9a-fA-F]+)%-([0-9a-fA-F]+)%-([0-9a-fA-F]+)$")
+  return first ~= nil and #first == 8 and #second == 4 and #third == 4 and #fourth == 4 and #fifth == 12
+end
+
+local function argv_option(argv, option)
+  for index, value in ipairs(argv or {}) do
+    if value == option then
+      return argv[index + 1]
+    end
+  end
+end
+
+local function valid_role_relationships(state)
+  local backend = state.backend
+  local backend_launch_seen = false
+  for index = 1, #backend.argv - 5 do
+    backend_launch_seen = backend_launch_seen or backend.argv[index] == backend.executable
+  end
+  if #backend.argv < 6
+    or not backend_launch_seen
+    or backend.argv[#backend.argv - 4] ~= "serve"
+    or backend.argv[#backend.argv - 3] ~= "--hostname"
+    or backend.argv[#backend.argv - 2] ~= host
+    or backend.argv[#backend.argv - 1] ~= "--port"
+    or backend.argv[#backend.argv] ~= tostring(backend.port)
+  then
+    return false
+  end
+  local proxy = state.proxy
+  if not proxy then
+    return true
+  end
+  return proxy.port ~= backend.port
+    and #proxy.argv == 20
+    and proxy.argv[1] == proxy.executable
+    and proxy.argv[2] == "--source"
+    and proxy.argv[3] == "21"
+    and proxy.argv[4] == proxy.source
+    and proxy.argv[5] == "--listen-port"
+    and proxy.argv[6] == tostring(proxy.port)
+    and proxy.argv[7] == "--backend-port"
+    and proxy.argv[8] == tostring(backend.port)
+    and proxy.argv[9] == "--backend-pid"
+    and proxy.argv[10] == tostring(backend.pid)
+    and proxy.argv[11] == "--backend-start"
+    and proxy.argv[12] == backend.start_time
+    and proxy.argv[13] == "--boot-id"
+    and proxy.argv[14] == state.boot_id
+    and proxy.argv[15] == "--keystore"
+    and proxy.argv[16] == paths().server_store
+    and proxy.argv[17] == "--password-file"
+    and proxy.argv[18] == paths().password
+    and proxy.argv[19] == "--max-connections"
+    and proxy.argv[20] == tostring(proxy_max_connections)
+end
+
+local function valid_pending(pending)
+  return type(pending) == "table"
+    and pending.schema == 2
+    and pending.hostname == hostname()
+    and valid_generation(pending.generation)
+    and valid_boot_id(pending.boot_id)
+    and valid_process_record(pending.backend, "backend")
+    and (pending.proxy == nil or valid_process_record(pending.proxy, "proxy"))
+    and valid_role_relationships(pending)
+end
+
+local function valid_complete_state(state)
+  if type(state) ~= "table"
+    or state.schema ~= 2
+    or state.hostname ~= hostname()
+    or not valid_generation(state.generation)
+    or state.host ~= host
+    or not is_integer(state.port, 1, 65535)
+    or state.url ~= ("https://%s:%d"):format(host, state.port)
+    or not vim.tbl_contains({ "explicit", "persisted", "preferred 4096", "fallback" }, state.port_source)
+    or type(state.started_at) ~= "string"
+    or not absolute_path(state.cwd)
+    or not valid_boot_id(state.boot_id)
+    or state.ca_path ~= paths().ca
+    or type(state.certificate_identity) ~= "string"
+    or #state.certificate_identity ~= 64
+    or not state.certificate_identity:match("^[0-9a-f]+$")
+    or not valid_process_record(state.proxy, "proxy")
+    or not valid_process_record(state.backend, "backend")
+    or state.proxy.port ~= state.port
+  then
+    return false
+  end
+  local year, month, day, hour, minute, second = state.started_at:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)T(%d%d):(%d%d):(%d%d)Z$")
+  if not year
+    or tonumber(year) < 1970
+    or tonumber(month) < 1
+    or tonumber(month) > 12
+    or tonumber(day) < 1
+    or tonumber(day) > 31
+    or tonumber(hour) > 23
+    or tonumber(minute) > 59
+    or tonumber(second) > 60
+  then
+    return false
+  end
+  year, month, day = tonumber(year), tonumber(month), tonumber(day)
+  local days_in_month = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 }
+  if month == 2 and (year % 400 == 0 or (year % 4 == 0 and year % 100 ~= 0)) then
+    days_in_month[2] = 29
+  end
+  if day > days_in_month[month] then
+    return false
+  end
+  return valid_role_relationships(state)
+end
+
 local function read_state()
   local state_path = paths().state
   local content = read_file(state_path)
@@ -81,16 +299,20 @@ local function read_state()
   if not ok or type(state) ~= "table" then
     return nil, "malformed"
   end
-  if state.schema ~= 1 then
-    return nil, state.schema and "unsupported schema" or "malformed"
-  end
-  if state.hostname ~= hostname()
-    or type(state.pid) ~= "number"
-    or state.pid <= 0
-    or type(state.generation) ~= "string"
-    or type(state.port) ~= "number"
-    or type(state.url) ~= "string"
-  then
+  if state.schema == 1 then
+    if state.hostname ~= hostname()
+      or type(state.pid) ~= "number"
+      or state.pid <= 0
+      or type(state.generation) ~= "string"
+      or type(state.port) ~= "number"
+      or type(state.url) ~= "string"
+    then
+      return nil, "malformed"
+    end
+    return state, "legacy"
+  elseif type(state.schema) == "number" and state.schema % 1 == 0 and state.schema > 2 then
+    return nil, "unsupported schema"
+  elseif not valid_complete_state(state) then
     return nil, "malformed"
   end
   return state, "valid"
@@ -102,6 +324,9 @@ local function write_private(path, content, exclusive)
     return nil, err
   end
   local ok, write_err = uv.fs_write(fd, content, 0)
+  if ok then
+    ok, write_err = uv.fs_fsync(fd)
+  end
   uv.fs_close(fd)
   uv.fs_chmod(path, 384)
   if not ok then
@@ -141,7 +366,19 @@ local function curl_quote(value)
   return value:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", "\\n"):gsub("\r", "\\r")
 end
 
-local function probe_health(url, callback, authenticated)
+local function curl_ca_config(state)
+  if not state or state.schema ~= 2 or type(state.ca_path) ~= "string" then
+    return nil
+  end
+  return 'cacert = "' .. curl_quote(state.ca_path) .. '"\n'
+end
+
+local function probe_health(state, callback, authenticated)
+  local ca_config = curl_ca_config(state)
+  if not ca_config then
+    callback(nil, { kind = "untrusted state", latency_ms = 0 })
+    return
+  end
   local started_at = uv.hrtime()
   local stdout, stderr = {}, {}
   local command = {
@@ -152,11 +389,12 @@ local function probe_health(url, callback, authenticated)
     "1",
     "--max-time",
     "2",
+    "--http1.1",
     "--config",
     "-",
     "--write-out",
     "\n%{http_code}",
-    url .. "/global/health",
+    state.url .. "/global/health",
   }
   local job = vim.fn.jobstart(command, {
     on_stdout = function(_, data)
@@ -202,7 +440,7 @@ local function probe_health(url, callback, authenticated)
     callback(nil, { kind = "unable to launch curl", latency_ms = 0 })
     return
   end
-  local config = 'header = "Accept: application/json"\n'
+  local config = ca_config .. 'header = "Accept: application/json"\n'
   if authenticated and vim.env.OPENCODE_SERVER_PASSWORD and vim.env.OPENCODE_SERVER_PASSWORD ~= "" then
     config = config
       .. 'user = "'
@@ -215,7 +453,12 @@ end
 
 -- Keep reload credentials and payloads on curl's stdin, as with health probes.
 -- The directory header deliberately matches the attached TUI's current cwd.
-local function request_json(url, path, method, body, directory, callback)
+local function request_json(state, path, method, body, directory, callback)
+  local ca_config = curl_ca_config(state)
+  if not ca_config then
+    callback(nil, { kind = "untrusted state" })
+    return
+  end
   local stdout = {}
   local command = {
     "curl",
@@ -225,13 +468,14 @@ local function request_json(url, path, method, body, directory, callback)
     "1",
     "--max-time",
     "4",
+    "--http1.1",
     "--config",
     "-",
     "--write-out",
     "\n%{http_code}",
     "-X",
     method,
-    url .. path,
+    state.url .. path,
   }
   local job = vim.fn.jobstart(command, {
     on_stdout = function(_, data)
@@ -274,7 +518,7 @@ local function request_json(url, path, method, body, directory, callback)
   if body then
     table.insert(config, 'data-binary = "' .. curl_quote(vim.json.encode(body)) .. '"')
   end
-  vim.fn.chansend(job, table.concat(config, "\n") .. "\n")
+  vim.fn.chansend(job, ca_config .. table.concat(config, "\n") .. "\n")
   vim.fn.chanclose(job, "stdin")
 end
 
@@ -331,6 +575,33 @@ local function proc_executable(pid)
   return uv.fs_readlink("/proc/" .. pid .. "/exe")
 end
 
+local function file_identity(path)
+  local stat = vim.fn.exepath("stat")
+  if stat == "" then
+    return nil
+  end
+  local result = vim.system({ stat, "-Lc", "%d:%i", "--", path }, { text = true }):wait(1000)
+  if not result or result.code ~= 0 then
+    return nil
+  end
+  local dev, ino = result.stdout:match("^(%d+):(%d+)%s*$")
+  return dev and decimal_identity(dev, true) and decimal_identity(ino, false) and { dev = dev, ino = ino } or nil
+end
+
+local function proc_executable_identity(pid)
+  return file_identity("/proc/" .. pid .. "/exe")
+end
+
+local function proc_start_time(pid)
+  local stat = read_file("/proc/" .. pid .. "/stat")
+  if not stat then
+    return nil
+  end
+  local remainder = stat:match("^.*%)%s+(.+)$")
+  local fields = remainder and vim.split(remainder, "%s+", { trimempty = true }) or nil
+  return fields and fields[20] or nil
+end
+
 local function argv_equal(left, right)
   if type(left) ~= "table" or type(right) ~= "table" or #left ~= #right then
     return false
@@ -343,46 +614,271 @@ local function argv_equal(left, right)
   return true
 end
 
-local function process_listens_on_port(pid, port)
-  local wanted_port = string.format("%04X", port)
-  local tcp = read_file("/proc/net/tcp")
-  if not tcp then
+local proc_line_limit = 4096
+local proc_entry_limit = 200000
+local proc_byte_limit = 16 * 1024 * 1024
+local proc_scan_timeout_ns = 5 * 1000000000
+local proc_headers = {
+  tcp = {
+    "sl",
+    "local_address",
+    "rem_address",
+    "st",
+    "tx_queue",
+    "rx_queue",
+    "tr",
+    "tm->when",
+    "retrnsmt",
+    "uid",
+    "timeout",
+    "inode",
+  },
+  tcp6 = {
+    "sl",
+    "local_address",
+    "remote_address",
+    "st",
+    "tx_queue",
+    "rx_queue",
+    "tr",
+    "tm->when",
+    "retrnsmt",
+    "uid",
+    "timeout",
+    "inode",
+  },
+}
+local proc_loopbacks = {
+  tcp = { ["0100007F"] = true },
+  tcp6 = {
+    ["00000000000000000000000001000000"] = true,
+    ["0000000000000000FFFF00000100007F"] = true,
+  },
+}
+
+local function proc_fixed_hex(value, width)
+  return type(value) == "string" and #value == width and value:match("^[%da-fA-F]+$") ~= nil
+end
+
+local function proc_unsigned_decimal(value, maximum)
+  if type(value) ~= "string"
+    or not value:match("^%d+$")
+    or (#value > 1 and value:sub(1, 1) == "0")
+    or #value > #maximum
+  then
     return false
   end
-  local inode
-  for line in tcp:gmatch("[^\n]+") do
-    local fields = vim.split(line, "%s+", { trimempty = true })
-    local address, listening = fields[2], fields[4] == "0A"
-    if address and listening and address:match("^[0-9A-Fa-f]+:" .. wanted_port .. "$") then
-      inode = fields[10]
-      break
-    end
+  return #value < #maximum or value <= maximum
+end
+
+local function proc_hex_pair(value, left_width, right_width)
+  return type(value) == "string"
+    and #value == left_width + right_width + 1
+    and value:sub(left_width + 1, left_width + 1) == ":"
+    and proc_fixed_hex(value:sub(1, left_width), left_width)
+    and proc_fixed_hex(value:sub(left_width + 2), right_width)
+end
+
+local function proc_endpoint(value, address_width)
+  return proc_hex_pair(value, address_width, 4)
+end
+
+local function valid_proc_tcp_row(fields, family)
+  local address_width = family == "tcp6" and 32 or 8
+  local slot = fields[1] and fields[1]:match("^(%d+):$")
+  if #fields < 4
+    or not proc_unsigned_decimal(slot, "2147483647")
+    or not proc_endpoint(fields[2], address_width)
+    or not proc_endpoint(fields[3], address_width)
+    or not proc_fixed_hex(fields[4], 2)
+  then
+    return false
   end
+  local state = tonumber(fields[4], 16)
+  local expected_fields = (state == 3 or state == 6) and 12 or 17
+  if not state
+    or state < 1
+    or state > 13
+    or #fields ~= expected_fields
+    or not proc_hex_pair(fields[5], 8, 8)
+    or not proc_hex_pair(fields[6], 2, 8)
+    or tonumber(fields[6]:sub(1, 2), 16) > 4
+    or not proc_fixed_hex(fields[7], 8)
+    or not proc_unsigned_decimal(fields[8], "4294967295")
+    or not proc_unsigned_decimal(fields[9], "2147483647")
+    or not proc_unsigned_decimal(fields[10], "18446744073709551615")
+    or not proc_unsigned_decimal(fields[11], "2147483647")
+    or not (proc_fixed_hex(fields[12], 8) or proc_fixed_hex(fields[12], 16))
+  then
+    return false
+  end
+  return expected_fields == 12
+    or (proc_unsigned_decimal(fields[13], "18446744073709551615")
+      and proc_unsigned_decimal(fields[14], "18446744073709551615")
+      and proc_unsigned_decimal(fields[15], "4294967295")
+      and proc_unsigned_decimal(fields[16], "4294967295")
+      and (fields[17] == "-1" or proc_unsigned_decimal(fields[17], "2147483647")))
+end
+
+local function scan_proc_tcp_table(path, family, wanted_port, scan)
+  local fd = uv.fs_open(path, "r", 0)
+  if not fd then
+    return false
+  end
+  local function scan_open_file()
+    local offset, line_count = 0, 0
+    local pending = ""
+    while true do
+      if uv.hrtime() > scan.deadline_ns then
+        return false
+      end
+      local chunk = uv.fs_read(fd, 16 * 1024, offset)
+      if chunk == nil then
+        return false
+      end
+      if chunk == "" then
+        break
+      end
+      offset = offset + #chunk
+      scan.bytes = scan.bytes + #chunk
+      if scan.bytes > proc_byte_limit then
+        return false
+      end
+      pending = pending .. chunk
+      while true do
+        local newline = pending:find("\n", 1, true)
+        if not newline then
+          if #pending > proc_line_limit then
+            return false
+          end
+          break
+        end
+        local line = pending:sub(1, newline - 1)
+        pending = pending:sub(newline + 1)
+        if #line > proc_line_limit
+          or line:find("[%z\1-\31\127-\255]")
+          or uv.hrtime() > scan.deadline_ns
+        then
+          return false
+        end
+        scan.entries = scan.entries + 1
+        if scan.entries > proc_entry_limit then
+          return false
+        end
+        local fields = vim.split(vim.trim(line), "%s+", { trimempty = true })
+        if line_count == 0 then
+          if not vim.deep_equal(fields, proc_headers[family]) then
+            return false
+          end
+        else
+          if not valid_proc_tcp_row(fields, family) then
+            return false
+          end
+          local address, state, inode = fields[2], fields[4], fields[10]
+          local ip, port = address:match("^([^:]+):([%da-fA-F]+)$")
+          if state == "0A" and port:upper() == wanted_port and proc_loopbacks[family][ip:upper()] then
+            scan.matches = scan.matches + 1
+            scan.inode = inode
+          end
+        end
+        line_count = line_count + 1
+      end
+    end
+    return pending == "" and line_count > 0 and uv.hrtime() <= scan.deadline_ns
+  end
+  local ok, complete = pcall(scan_open_file)
+  uv.fs_close(fd)
+  return ok and complete or false
+end
+
+local function find_unique_listener_inode(port, table_paths)
+  if not is_integer(port, 1, 65535) then
+    return nil
+  end
+  table_paths = table_paths or { "/proc/net/tcp", "/proc/net/tcp6" }
+  if type(table_paths) ~= "table" or #table_paths ~= 2 then
+    return nil
+  end
+  local scan = {
+    bytes = 0,
+    entries = 0,
+    matches = 0,
+    deadline_ns = uv.hrtime() + proc_scan_timeout_ns,
+  }
+  local wanted_port = string.format("%04X", port)
+  if not scan_proc_tcp_table(table_paths[1], "tcp", wanted_port, scan)
+    or not scan_proc_tcp_table(table_paths[2], "tcp6", wanted_port, scan)
+    or scan.matches ~= 1
+  then
+    return nil
+  end
+  return scan.inode
+end
+
+local function process_listens_on_port(pid, port)
+  local inode = find_unique_listener_inode(port)
   if not inode then
     return false
   end
   for _, fd in ipairs(vim.fn.glob("/proc/" .. pid .. "/fd/*", true, true)) do
-    if uv.fs_readlink(fd) == "socket:[" .. inode .. "]" then
+    local owned_inode = (uv.fs_readlink(fd) or ""):match("^socket:%[(%d+)%]$")
+    if owned_inode == inode then
       return true
     end
   end
   return false
 end
 
-local function process_is_owned(state)
-  if not state or state.hostname ~= hostname() or type(state.pid) ~= "number" or state.pid <= 0 then
+local function process_identity_is_owned(process, boot_id)
+  if not process or type(process.pid) ~= "number" or process.pid <= 0 then
     return false, "invalid managed PID"
+  end
+  if boot_id ~= current_boot_id() then
+    return false, "host boot identity changed"
+  end
+  if not pid_is_live(process.pid) then
+    return false, "PID is not live"
+  end
+  if not valid_process_record(process, process.source and "proxy" or "backend") then
+    return false, "managed process identity is unavailable"
+  end
+  local executable = proc_executable_identity(process.pid)
+  local argv = proc_cmdline(process.pid)
+  if not executable
+    or executable.dev ~= process.process_executable_dev
+    or executable.ino ~= process.process_executable_ino
+    or not argv_equal(argv, process.argv)
+    or proc_start_time(process.pid) ~= process.start_time
+  then
+    return false, "PID executable inode, argv, or start identity does not match"
+  end
+  if process.executable_dev ~= process.process_executable_dev or process.executable_ino ~= process.process_executable_ino then
+    local launch = file_identity(process.executable)
+    if not launch or launch.dev ~= process.executable_dev or launch.ino ~= process.executable_ino then
+      return false, "interpreted launch executable identity does not match"
+    end
+  end
+  if process.source then
+    local source = file_identity(process.source)
+    if not source or source.dev ~= process.source_dev or source.ino ~= process.source_ino then
+      return false, "Java proxy source identity does not match"
+    end
+  end
+  return true, "verified"
+end
+
+local function legacy_process_is_owned(state)
+  if not state or state.hostname ~= hostname() or type(state.pid) ~= "number" or state.pid <= 0 then
+    return false, "invalid legacy PID"
   end
   if not pid_is_live(state.pid) then
     return false, "PID is not live"
   end
   if type(state.process_executable) ~= "string" or type(state.argv) ~= "table" then
-    return false, "managed process identity is unavailable"
+    return false, "legacy process identity is unavailable"
   end
-  local executable = proc_executable(state.pid)
-  local argv = proc_cmdline(state.pid)
-  if executable ~= state.process_executable or not argv_equal(argv, state.argv) then
-    return false, "PID executable or argv does not match the managed opencode serve process"
+  if proc_executable(state.pid) ~= state.process_executable or not argv_equal(proc_cmdline(state.pid), state.argv) then
+    return false, "legacy PID executable or argv does not match"
   end
   if #state.argv < 6
     or state.argv[#state.argv - 4] ~= "serve"
@@ -391,51 +887,91 @@ local function process_is_owned(state)
     or state.argv[#state.argv - 1] ~= "--port"
     or state.argv[#state.argv] ~= tostring(state.port)
   then
-    return false, "managed process argv is not an exact opencode serve command"
+    return false, "legacy process argv is not an exact opencode serve command"
+  end
+  return true, "verified"
+end
+
+local function process_is_owned(state)
+  if state and state.schema == 1 then
+    return legacy_process_is_owned(state)
+  end
+  if not state or state.hostname ~= hostname() then
+    return false, "state hostname does not match"
+  end
+  local backend_ok, backend_reason = process_identity_is_owned(state.backend, state.boot_id)
+  if not backend_ok then
+    return false, "backend " .. backend_reason
+  end
+  if #state.backend.argv < 6
+    or state.backend.argv[#state.backend.argv - 4] ~= "serve"
+    or state.backend.argv[#state.backend.argv - 3] ~= "--hostname"
+    or state.backend.argv[#state.backend.argv - 2] ~= host
+    or state.backend.argv[#state.backend.argv - 1] ~= "--port"
+    or state.backend.argv[#state.backend.argv] ~= tostring(state.backend.port)
+  then
+    return false, "backend argv is not an exact opencode serve command"
+  end
+  local proxy_ok, proxy_reason = process_identity_is_owned(state.proxy, state.boot_id)
+  if not proxy_ok then
+    return false, "proxy " .. proxy_reason
+  end
+  if state.proxy.port ~= state.port then
+    return false, "proxy public port does not match state"
+  end
+  if argv_option(state.proxy.argv, "--listen-port") ~= tostring(state.port)
+    or argv_option(state.proxy.argv, "--backend-port") ~= tostring(state.backend.port)
+    or argv_option(state.proxy.argv, "--backend-pid") ~= tostring(state.backend.pid)
+    or argv_option(state.proxy.argv, "--backend-start") ~= state.backend.start_time
+    or argv_option(state.proxy.argv, "--boot-id") ~= state.boot_id
+    or argv_option(state.proxy.argv, "--keystore") ~= paths().server_store
+    or argv_option(state.proxy.argv, "--password-file") ~= paths().password
+  then
+    return false, "proxy argv does not pin the recorded backend and certificate"
   end
   return true, "verified"
 end
 
 local renew_lock
 
-local function signal_managed(state, signal)
+local function signal_process(process, boot_id, signal)
   local renewed, lease_err = renew_lock()
   if not renewed then
     return nil, "lifecycle lock ownership was lost before " .. signal .. ": " .. (lease_err or "lease renewal failed")
   end
-  local owned, reason = process_is_owned(state)
+  local owned, reason = process_identity_is_owned(process, boot_id)
   if not owned then
     return nil, reason
   end
-  local ok, err = uv.kill(state.pid, signal)
+  local ok, err = uv.kill(process.pid, signal)
   if not ok then
     return nil, err or "unable to signal managed process"
   end
   return true
 end
 
-local function terminate_generation(state, deadline_ns, callback)
-  local owned, reason = process_is_owned(state)
+local function terminate_process(process, boot_id, deadline_ns, callback)
+  local owned, reason = process_identity_is_owned(process, boot_id)
   if not owned then
-    callback(not pid_is_live(state.pid), reason)
+    callback(not process or not pid_is_live(process.pid), reason)
     return
   end
-  local sent, signal_err = signal_managed(state, "sigterm")
+  local sent, signal_err = signal_process(process, boot_id, "sigterm")
   if not sent then
     callback(false, signal_err)
     return
   end
   local escalated = false
   local function wait_for_exit()
-    if not pid_is_live(state.pid) then
+    if not pid_is_live(process.pid) then
       callback(true)
       return
     end
     if uv.hrtime() >= deadline_ns then
       if not escalated then
-        local killed, kill_err = signal_managed(state, "sigkill")
+        local killed, kill_err = signal_process(process, boot_id, "sigkill")
         if not killed then
-          callback(not pid_is_live(state.pid), kill_err)
+          callback(not pid_is_live(process.pid), kill_err)
           return
         end
         escalated = true
@@ -859,34 +1395,6 @@ local function acquire_lock(callback, retried, deadline_ns)
   callback(false, "OpenCode startup is already in progress")
 end
 
-local function wait_for_health(state, deadline_ns, callback)
-  local owned, ownership = process_is_owned(state)
-  local listening = owned and process_listens_on_port(state.pid, state.port)
-  if not owned or not listening then
-    if owned and not port_is_available(state.port) then
-      callback(nil, { kind = "unexpected endpoint process" })
-    elseif not owned or uv.hrtime() >= deadline_ns then
-      callback(nil, { kind = owned and "managed process is not listening" or ownership })
-    else
-      vim.defer_fn(function()
-        wait_for_health(state, deadline_ns, callback)
-      end, health_interval_ms)
-    end
-    return
-  end
-  probe_health(state.url, function(health, detail)
-    if health then
-      callback(health, detail)
-    elseif uv.hrtime() >= deadline_ns then
-      callback(nil, detail)
-    else
-      vim.defer_fn(function()
-        wait_for_health(state, deadline_ns, callback)
-      end, health_interval_ms)
-    end
-  end, true)
-end
-
 local function resolve_executable()
   local executable = vim.fn.exepath("opencode")
   if executable == "" then
@@ -926,14 +1434,282 @@ local function select_port(state, excluded_ports)
   return nil, nil, "Unable to find an available OpenCode port"
 end
 
-local function spawn_server(state, deadline_ns, callback, excluded_ports)
-  local state_paths = paths()
-  local executable, version, executable_err = resolve_executable()
-  if not executable then
-    callback(nil, executable_err)
-    return
+local function remove_known_directory(directory, names)
+  for _, name in ipairs(names) do
+    uv.fs_unlink(vim.fs.joinpath(directory, name))
   end
-  local log_fd, log_err = uv.fs_open(state_paths.log, "a", 384)
+  uv.fs_rmdir(directory)
+end
+
+local function run_keytool(arguments)
+  local command = { "keytool" }
+  vim.list_extend(command, arguments)
+  local output = vim.fn.system(command)
+  return vim.v.shell_error == 0, output:gsub("%s+$", "")
+end
+
+local function certificate_identity(state_paths)
+  local ca = read_file(state_paths.ca)
+  local store = read_file(state_paths.server_store)
+  return ca and store and vim.fn.sha256(ca .. store) or nil
+end
+
+local function validate_certificate_material(state_paths)
+  for _, path in ipairs({ state_paths.password, state_paths.ca, state_paths.ca_store, state_paths.server_store, state_paths.server_cert }) do
+    local stat = uv.fs_stat(path)
+    if not stat or stat.type ~= "file" then
+      return nil, "certificate material is incomplete"
+    end
+    uv.fs_chmod(path, 384)
+  end
+  uv.fs_chmod(state_paths.tls, 448)
+  local ca_ok = run_keytool({
+    "-list",
+    "-alias",
+    "mkchad-ca",
+    "-keystore",
+    state_paths.ca_store,
+    "-storetype",
+    "PKCS12",
+    "-storepass:file",
+    state_paths.password,
+  })
+  local server_ok = run_keytool({
+    "-list",
+    "-alias",
+    "server",
+    "-keystore",
+    state_paths.server_store,
+    "-storetype",
+    "PKCS12",
+    "-storepass:file",
+    state_paths.password,
+  })
+  local java = vim.fn.exepath("java")
+  local proxy_source = uv.fs_stat(state_paths.proxy_source)
+  local certificate_ok = false
+  if java ~= "" and proxy_source then
+    vim.fn.system({
+      java,
+      "--source",
+      "21",
+      state_paths.proxy_source,
+      "--validate-keystore",
+      state_paths.server_store,
+      "--password-file",
+      state_paths.password,
+      "--ca-file",
+      state_paths.ca,
+      "--ca-keystore",
+      state_paths.ca_store,
+    })
+    certificate_ok = vim.v.shell_error == 0
+  end
+  local identity = certificate_identity(state_paths)
+  if not ca_ok or not server_ok or not certificate_ok or not identity then
+    return nil, "certificate keystore validation failed"
+  end
+  return identity
+end
+
+local function generate_certificate_material(state_paths)
+  local staging = state_paths.tls .. ".new-" .. random_token()
+  if not uv.fs_mkdir(staging, 448) then
+    return nil, "unable to create certificate staging directory"
+  end
+  local files = {
+    password = vim.fs.joinpath(staging, "store.password"),
+    ca = vim.fs.joinpath(staging, "ca.pem"),
+    ca_store = vim.fs.joinpath(staging, "ca.p12"),
+    server_store = vim.fs.joinpath(staging, "server.p12"),
+    server_cert = vim.fs.joinpath(staging, "server.pem"),
+    request = vim.fs.joinpath(staging, "server.csr"),
+  }
+  local random = uv.random(32) or random_token()
+  local wrote, write_err = write_private(files.password, vim.fn.sha256(random .. random_token()), true)
+  if not wrote then
+    remove_known_directory(staging, { "store.password" })
+    return nil, "unable to create certificate password file: " .. (write_err or "unknown error")
+  end
+  local commands = {
+    {
+      "-genkeypair",
+      "-alias",
+      "mkchad-ca",
+      "-keyalg",
+      "EC",
+      "-groupname",
+      "secp256r1",
+      "-dname",
+      "CN=MkChad OpenCode " .. hostname() .. " CA",
+      "-ext",
+      "bc:c",
+      "-ext",
+      "ku=keyCertSign,cRLSign",
+      "-validity",
+      "3650",
+      "-keystore",
+      files.ca_store,
+      "-storetype",
+      "PKCS12",
+      "-storepass:file",
+      files.password,
+      "-noprompt",
+    },
+    {
+      "-exportcert",
+      "-rfc",
+      "-alias",
+      "mkchad-ca",
+      "-keystore",
+      files.ca_store,
+      "-storepass:file",
+      files.password,
+      "-file",
+      files.ca,
+    },
+    {
+      "-genkeypair",
+      "-alias",
+      "server",
+      "-keyalg",
+      "EC",
+      "-groupname",
+      "secp256r1",
+      "-dname",
+      "CN=127.0.0.1",
+      "-ext",
+      "SAN=IP:127.0.0.1",
+      "-validity",
+      "825",
+      "-keystore",
+      files.server_store,
+      "-storetype",
+      "PKCS12",
+      "-storepass:file",
+      files.password,
+      "-noprompt",
+    },
+    {
+      "-certreq",
+      "-alias",
+      "server",
+      "-keystore",
+      files.server_store,
+      "-storepass:file",
+      files.password,
+      "-file",
+      files.request,
+    },
+    {
+      "-gencert",
+      "-rfc",
+      "-alias",
+      "mkchad-ca",
+      "-keystore",
+      files.ca_store,
+      "-storepass:file",
+      files.password,
+      "-infile",
+      files.request,
+      "-outfile",
+      files.server_cert,
+      "-validity",
+      "825",
+      "-ext",
+      "SAN=IP:127.0.0.1",
+      "-ext",
+      "KU=digitalSignature,keyEncipherment",
+      "-ext",
+      "EKU=serverAuth",
+    },
+    {
+      "-importcert",
+      "-alias",
+      "mkchad-ca",
+      "-keystore",
+      files.server_store,
+      "-storepass:file",
+      files.password,
+      "-file",
+      files.ca,
+      "-noprompt",
+    },
+    {
+      "-importcert",
+      "-alias",
+      "server",
+      "-keystore",
+      files.server_store,
+      "-storepass:file",
+      files.password,
+      "-file",
+      files.server_cert,
+      "-noprompt",
+    },
+  }
+  for _, command in ipairs(commands) do
+    local ok, output = run_keytool(command)
+    if not ok then
+      remove_known_directory(staging, { "store.password", "ca.pem", "ca.p12", "server.p12", "server.pem", "server.csr" })
+      return nil, "keytool certificate generation failed: " .. (output ~= "" and output or "unknown error")
+    end
+  end
+  uv.fs_unlink(files.request)
+  for _, path in pairs(files) do
+    if path ~= files.request then
+      uv.fs_chmod(path, 384)
+    end
+  end
+  local previous
+  if uv.fs_stat(state_paths.tls) then
+    previous = state_paths.tls .. ".invalid-" .. random_token()
+    if not uv.fs_rename(state_paths.tls, previous) then
+      remove_known_directory(staging, { "store.password", "ca.pem", "ca.p12", "server.p12", "server.pem" })
+      return nil, "unable to isolate invalid certificate material"
+    end
+  end
+  if not uv.fs_rename(staging, state_paths.tls) then
+    if previous then
+      uv.fs_rename(previous, state_paths.tls)
+    end
+    remove_known_directory(staging, { "store.password", "ca.pem", "ca.p12", "server.p12", "server.pem" })
+    return nil, "unable to publish generated certificate material"
+  end
+  if previous then
+    remove_known_directory(previous, { "store.password", "ca.pem", "ca.p12", "server.p12", "server.pem", "server.csr" })
+  end
+  return validate_certificate_material(state_paths)
+end
+
+local function ensure_certificate_material()
+  local state_paths, state_err = ensure_state_dir()
+  if not state_paths then
+    return nil, state_err
+  end
+  local identity, validation_err = validate_certificate_material(state_paths)
+  if identity then
+    return identity
+  end
+  local generated, generation_err = generate_certificate_material(state_paths)
+  if not generated then
+    return nil, generation_err .. " (existing material: " .. validation_err .. ")"
+  end
+  return generated
+end
+
+local function select_internal_port(public_port, excluded)
+  for _ = 1, 40 do
+    local candidate = math.random(49152, 65535)
+    if candidate ~= public_port and not (excluded and excluded[candidate]) and port_is_available(candidate) then
+      return candidate
+    end
+  end
+  return nil, "Unable to find an available internal OpenCode port"
+end
+
+local function open_process_stdio(log_path)
+  local log_fd, log_err = uv.fs_open(log_path, "a", 384)
   local stdin_fd = uv.fs_open("/dev/null", "r", 0)
   if not log_fd or not stdin_fd then
     if log_fd then
@@ -942,20 +1718,19 @@ local function spawn_server(state, deadline_ns, callback, excluded_ports)
     if stdin_fd then
       uv.fs_close(stdin_fd)
     end
-    callback(nil, "Unable to open OpenCode server log " .. state_paths.log .. ": " .. (log_err or "unknown error"))
-    return
+    return nil, nil, log_err or "unable to open process stdio"
   end
-  uv.fs_chmod(state_paths.log, 384)
-  local port, source, port_err = select_port(state, excluded_ports)
-  if not port then
-    uv.fs_close(stdin_fd)
-    uv.fs_close(log_fd)
-    callback(nil, port_err .. "; see " .. state_paths.log)
-    return
+  uv.fs_chmod(log_path, 384)
+  return stdin_fd, log_fd
+end
+
+local function spawn_detached(executable, arguments, log_path)
+  local stdin_fd, log_fd, io_err = open_process_stdio(log_path)
+  if not stdin_fd then
+    return nil, io_err
   end
-  local generation = random_token()
   local handle, pid = uv.spawn(executable, {
-    args = { "serve", "--hostname", host, "--port", tostring(port) },
+    args = arguments,
     cwd = vim.env.HOME or vim.fn.expand("~"),
     detached = true,
     stdio = { stdin_fd, log_fd, log_fd },
@@ -963,83 +1738,41 @@ local function spawn_server(state, deadline_ns, callback, excluded_ports)
   uv.fs_close(stdin_fd)
   uv.fs_close(log_fd)
   if not handle or not pid then
-    callback(nil, "Unable to launch OpenCode server; see " .. state_paths.log)
-    return
+    return nil, "unable to launch detached process"
   end
   handle:unref()
   handle:close()
-  -- Wait one event-loop turn so procfs observes the exec rather than the
-  -- short-lived launcher. State records the complete observed identity, never
-  -- a substring match that a reused PID can satisfy.
-  vim.defer_fn(function()
-    local managed = {
-      schema = 1,
-      hostname = hostname(),
-      pid = pid,
-      generation = generation,
-      host = host,
-      port = port,
-      url = ("http://%s:%d"):format(host, port),
-      port_source = source,
-      started_at = iso_now(),
-      cwd = vim.env.HOME or vim.fn.expand("~"),
-      log = state_paths.log,
-      executable = executable,
-      local_version = version,
-      process_executable = proc_executable(pid),
-      argv = proc_cmdline(pid),
-    }
-    local owned, ownership = process_is_owned(managed)
-    if not owned then
-      callback(nil, "OpenCode child exited or did not exec the expected command (" .. ownership .. "); see " .. state_paths.log, port)
-      return
-    end
-    local wrote, write_err = write_state_while_locked(managed, "initial managed state write")
-    if not wrote then
-      terminate_generation(managed, deadline_ns, function(cleaned, cleanup_err)
-        local suffix = cleaned and "" or "; cleanup failed: " .. (cleanup_err or "unknown error")
-        callback(nil, write_err .. suffix, port)
-      end)
-      return
-    end
-    wait_for_health(managed, deadline_ns, function(health, detail)
-      local still_owned, ownership_reason = process_is_owned(managed)
-      if health and still_owned and process_listens_on_port(managed.pid, managed.port) then
-        managed.server_version = health.version
-        local updated, update_err = write_state_while_locked(managed, "ready managed state update")
-        if not updated then
-          callback(nil, update_err, port)
-          return
-        end
-        callback(managed)
-        return
-      end
-      local failure = health and "unexpected endpoint process" or detail.kind
-      terminate_generation(managed, deadline_ns, function(cleaned, cleanup_err)
-        if cleaned then
-          remove_matching_state_while_locked(generation, "failed generation state removal")
-        else
-          managed.cleanup_error = cleanup_err or "failed cleanup after readiness failure"
-          write_state_while_locked(managed, "failed cleanup state update")
-        end
-        local ownership_suffix = still_owned and "" or "; child identity lost: " .. ownership_reason
-        local cleanup_suffix = cleaned and "" or "; cleanup failed: " .. (cleanup_err or "unknown error")
-        callback(
-          nil,
-          "OpenCode did not become healthy at "
-            .. managed.url
-            .. " ("
-            .. failure
-            .. ")"
-            .. ownership_suffix
-            .. cleanup_suffix
-            .. "; see "
-            .. state_paths.log,
-          port
-        )
-      end)
-    end)
-  end, 10)
+  return pid
+end
+
+local function capture_process(pid, extra)
+  local executable_identity = proc_executable_identity(pid)
+  local process = vim.tbl_extend("force", extra or {}, {
+    pid = pid,
+    process_executable = proc_executable(pid),
+    process_executable_dev = executable_identity and executable_identity.dev,
+    process_executable_ino = executable_identity and executable_identity.ino,
+    argv = proc_cmdline(pid),
+    start_time = proc_start_time(pid),
+  })
+  if not process.process_executable or not executable_identity or not process.argv or not process.start_time then
+    return nil, "child exited before its identity could be recorded"
+  end
+  return process
+end
+
+local function write_pending(pending)
+  local temporary = paths().pending .. "." .. random_token() .. ".tmp"
+  local wrote, write_err = write_private(temporary, vim.json.encode(pending), true)
+  if not wrote then
+    return nil, write_err
+  end
+  local renamed, rename_err = uv.fs_rename(temporary, paths().pending)
+  if not renamed then
+    uv.fs_unlink(temporary)
+    return nil, rename_err
+  end
+  return true
 end
 
 local ensure_waiters = {}
@@ -1050,6 +1783,9 @@ local function finish_ensure(ok, err, state)
   local callbacks = ensure_waiters
   ensure_waiters = {}
   ensure_active = false
+  if ok then
+    warn_no_password()
+  end
   for _, callback in ipairs(callbacks) do
     callback(ok, err, state)
   end
@@ -1105,13 +1841,17 @@ local function ensure_local_tui(state, callback)
     and local_tui.url == state.url
     and local_tui.directory == cwd
     and local_tui.generation == state.generation
+    and local_tui.certificate_identity == state.certificate_identity
   then
     callback(true)
     return
   end
   close_local_tui()
   local command = { "opencode", "attach", state.url, "--dir", cwd }
-  local term, created = require("snacks.terminal").get(command, vim.tbl_deep_extend("force", terminal_opts(), { create = true }))
+  local term, created = require("snacks.terminal").get(
+    command,
+    vim.tbl_deep_extend("force", terminal_opts(), { create = true, env = { NODE_EXTRA_CA_CERTS = state.ca_path } })
+  )
   if not term then
     callback(false, "Unable to create the local OpenCode attached TUI")
     return
@@ -1131,6 +1871,7 @@ local function ensure_local_tui(state, callback)
     url = state.url,
     directory = cwd,
     generation = state.generation,
+    certificate_identity = state.certificate_identity,
     command = command,
   }
   if buffer and vim.api.nvim_buf_is_valid(buffer) then
@@ -1160,29 +1901,33 @@ local function managed_state_if_healthy(state, requested, callback)
     callback(nil, { kind = "missing" })
     return
   end
+  if state.schema == 1 then
+    callback(nil, { kind = "legacy", message = "schema 1 is legacy and is never probed" })
+    return
+  end
   local owned, ownership = process_is_owned(state)
   if not owned then
-    if pid_is_live(state.pid) then
+    local proxy_live = state.proxy and pid_is_live(state.proxy.pid)
+    local backend_live = state.backend and pid_is_live(state.backend.pid)
+    if not proxy_live or not backend_live then
+      callback(nil, { kind = "owned-unhealthy", message = ownership })
+    elseif proxy_live or backend_live then
       callback(nil, { kind = "unverifiable-pid", message = ownership })
-    else
-      callback(nil, { kind = "stale", message = ownership })
     end
     return
   end
-  if not process_listens_on_port(state.pid, state.port) then
-    probe_health(state.url, function(health, detail)
-      if health or detail.kind == "unauthorized" then
-        callback(nil, {
-          kind = "unmanaged-endpoint",
-          message = "managed PID does not own the listening socket for " .. state.url,
-        })
-      else
-        callback(nil, { kind = "owned-unhealthy", message = detail.kind })
-      end
-    end, false)
+  if not process_listens_on_port(state.proxy.pid, state.port)
+    or not process_listens_on_port(state.backend.pid, state.backend.port)
+  then
+    callback(nil, { kind = "owned-unhealthy", message = "proxy or backend listener ownership is missing" })
     return
   end
-  probe_health(state.url, function(health, detail)
+  local identity = certificate_identity(paths())
+  if state.ca_path ~= paths().ca or not identity or identity ~= state.certificate_identity then
+    callback(nil, { kind = "owned-unhealthy", message = "certificate identity changed or is unavailable" })
+    return
+  end
+  probe_health(state, function(health, detail)
     if detail.kind == "unauthorized" then
       callback(nil, detail)
     elseif health then
@@ -1200,6 +1945,333 @@ local function managed_state_if_healthy(state, requested, callback)
   end, true)
 end
 
+local function wait_for_listener(process, boot_id, port, deadline_ns, callback)
+  local owned, reason = process_identity_is_owned(process, boot_id)
+  if not owned then
+    callback(false, reason)
+  elseif process_listens_on_port(process.pid, port) then
+    callback(true)
+  elseif uv.hrtime() >= deadline_ns then
+    callback(false, "process did not acquire its expected loopback listener")
+  else
+    vim.defer_fn(function()
+      wait_for_listener(process, boot_id, port, deadline_ns, callback)
+    end, health_interval_ms)
+  end
+end
+
+local function stop_pair(state, deadline_ns, callback)
+  local function stop_backend()
+    if not state.backend or not pid_is_live(state.backend.pid) then
+      callback(true)
+      return
+    end
+    terminate_process(state.backend, state.boot_id, deadline_ns, callback)
+  end
+  if not state.proxy or not pid_is_live(state.proxy.pid) then
+    stop_backend()
+    return
+  end
+  terminate_process(state.proxy, state.boot_id, deadline_ns, function(stopped, err)
+    if not stopped then
+      callback(false, "proxy cleanup failed: " .. (err or "unknown error"))
+      return
+    end
+    stop_backend()
+  end)
+end
+
+local function stop_legacy(state, deadline_ns, callback)
+  local owned, reason = legacy_process_is_owned(state)
+  if not owned then
+    callback(not pid_is_live(state.pid), reason)
+    return
+  end
+  local identity = proc_executable_identity(state.pid)
+  local process = identity and capture_process(state.pid, {
+    port = state.port,
+    executable = state.process_executable,
+    executable_dev = identity.dev,
+    executable_ino = identity.ino,
+    local_version = "legacy",
+    log = paths().log,
+  }) or nil
+  if not process then
+    callback(false, "legacy process identity changed before stop")
+    return
+  end
+  terminate_process(process, current_boot_id(), deadline_ns, callback)
+end
+
+local function read_pending()
+  local content = read_file(paths().pending)
+  if not content then
+    return nil
+  end
+  local ok, pending = pcall(vim.json.decode, content)
+  if not ok or not valid_pending(pending) then
+    return nil, "malformed"
+  end
+  return pending, "valid"
+end
+
+local function cleanup_pending(deadline_ns, callback)
+  local pending = read_pending()
+  if not pending then
+    if uv.fs_stat(paths().pending) then
+      callback(false, "malformed pending startup metadata requires manual inspection: " .. paths().pending)
+    else
+      callback(true)
+    end
+    return
+  end
+  stop_pair(pending, deadline_ns, function(stopped, err)
+    if stopped then
+      uv.fs_unlink(paths().pending)
+    end
+    callback(stopped, err)
+  end)
+end
+
+local function cleanup_failed_pair(state, deadline_ns, callback)
+  stop_pair(state, deadline_ns, function(stopped, err)
+    if stopped then
+      uv.fs_unlink(paths().pending)
+    end
+    callback(stopped, err)
+  end)
+end
+
+local function spawn_pair(previous, deadline_ns, callback, excluded_public, excluded_internal)
+  local state_paths = paths()
+  local certificate, certificate_err = ensure_certificate_material()
+  if not certificate then
+    callback(nil, "Unable to prepare host TLS certificate material: " .. certificate_err)
+    return
+  end
+  if lock_claim then
+    local still_locked, lock_err = require_lock_ownership("post-certificate server launch")
+    if not still_locked then
+      callback(nil, lock_err)
+      return
+    end
+  end
+  if not uv.fs_stat(state_paths.proxy_source) then
+    callback(nil, "TLS proxy source is unavailable: " .. state_paths.proxy_source)
+    return
+  end
+  local executable, version, executable_err = resolve_executable()
+  local java = vim.fn.exepath("java")
+  if not executable or java == "" then
+    callback(nil, executable_err or "Unable to find Java 21 on PATH")
+    return
+  end
+  local backend_executable = file_identity(executable)
+  local proxy_executable = file_identity(java)
+  local proxy_source = file_identity(state_paths.proxy_source)
+  if not backend_executable or not proxy_executable or not proxy_source then
+    callback(nil, "Unable to record backend, Java, or proxy source file identity before launch")
+    return
+  end
+  local public_port, source, public_err = select_port(previous, excluded_public)
+  if not public_port then
+    callback(nil, public_err .. "; see " .. state_paths.proxy_log)
+    return
+  end
+  local internal_port, internal_err = select_internal_port(public_port, excluded_internal)
+  if not internal_port then
+    callback(nil, internal_err)
+    return
+  end
+  local boot_id = current_boot_id()
+  if not boot_id then
+    callback(nil, "Unable to read the host boot identity")
+    return
+  end
+  local generation = random_token()
+  local backend_pid, backend_spawn_err = spawn_detached(
+    executable,
+    { "serve", "--hostname", host, "--port", tostring(internal_port) },
+    state_paths.log
+  )
+  if not backend_pid then
+    callback(nil, "Unable to launch OpenCode backend: " .. backend_spawn_err .. "; see " .. state_paths.log, nil, internal_port)
+    return
+  end
+  vim.defer_fn(function()
+    local backend, capture_err = capture_process(backend_pid, {
+      port = internal_port,
+      executable = executable,
+      executable_dev = backend_executable.dev,
+      executable_ino = backend_executable.ino,
+      local_version = version,
+      log = state_paths.log,
+    })
+    if not backend then
+      callback(nil, "OpenCode backend " .. capture_err .. "; see " .. state_paths.log, nil, internal_port)
+      return
+    end
+    local pending = {
+      schema = 2,
+      hostname = hostname(),
+      generation = generation,
+      boot_id = boot_id,
+      backend = backend,
+    }
+    local pending_ok, pending_err = write_pending(pending)
+    if not pending_ok then
+      terminate_process(backend, boot_id, deadline_ns, function()
+        callback(nil, "Unable to record pending backend identity: " .. (pending_err or "unknown error"))
+      end)
+      return
+    end
+    wait_for_listener(backend, boot_id, internal_port, deadline_ns, function(backend_ready, backend_err)
+      if not backend_ready then
+        cleanup_failed_pair(pending, deadline_ns, function(_, cleanup_err)
+          callback(
+            nil,
+            "OpenCode backend listener failed: " .. backend_err .. (cleanup_err and "; " .. cleanup_err or "") .. "; see " .. state_paths.log,
+            nil,
+            internal_port
+          )
+        end)
+        return
+      end
+      local proxy_arguments = {
+        "--source",
+        "21",
+        state_paths.proxy_source,
+        "--listen-port",
+        tostring(public_port),
+        "--backend-port",
+        tostring(internal_port),
+        "--backend-pid",
+        tostring(backend.pid),
+        "--backend-start",
+        backend.start_time,
+        "--boot-id",
+        boot_id,
+        "--keystore",
+        state_paths.server_store,
+        "--password-file",
+        state_paths.password,
+        "--max-connections",
+        tostring(proxy_max_connections),
+      }
+      local proxy_pid, proxy_spawn_err = spawn_detached(java, proxy_arguments, state_paths.proxy_log)
+      if not proxy_pid then
+        cleanup_failed_pair(pending, deadline_ns, function(_, cleanup_err)
+          callback(
+            nil,
+            "Unable to launch TLS proxy: " .. proxy_spawn_err .. (cleanup_err and "; " .. cleanup_err or "") .. "; see " .. state_paths.proxy_log,
+            public_port
+          )
+        end)
+        return
+      end
+      vim.defer_fn(function()
+        local proxy, proxy_capture_err = capture_process(proxy_pid, {
+          port = public_port,
+          executable = java,
+          executable_dev = proxy_executable.dev,
+          executable_ino = proxy_executable.ino,
+          source = state_paths.proxy_source,
+          source_dev = proxy_source.dev,
+          source_ino = proxy_source.ino,
+          log = state_paths.proxy_log,
+        })
+        if not proxy then
+          cleanup_failed_pair(pending, deadline_ns, function(_, cleanup_err)
+            callback(
+              nil,
+              "TLS proxy " .. proxy_capture_err .. (cleanup_err and "; " .. cleanup_err or "") .. "; see " .. state_paths.proxy_log,
+              public_port
+            )
+          end)
+          return
+        end
+        pending.proxy = proxy
+        local updated, update_err = write_pending(pending)
+        if not updated then
+          cleanup_failed_pair(pending, deadline_ns, function(_, cleanup_err)
+            callback(
+              nil,
+              "Unable to record pending proxy identity: " .. (update_err or "unknown error") .. (cleanup_err and "; " .. cleanup_err or ""),
+              public_port
+            )
+          end)
+          return
+        end
+        wait_for_listener(proxy, boot_id, public_port, deadline_ns, function(proxy_ready, proxy_err)
+          if not proxy_ready then
+            cleanup_failed_pair(pending, deadline_ns, function(_, cleanup_err)
+              callback(
+                nil,
+                "TLS proxy listener failed: " .. proxy_err .. (cleanup_err and "; " .. cleanup_err or "") .. "; see " .. state_paths.proxy_log,
+                public_port
+              )
+            end)
+            return
+          end
+          local state = {
+            schema = 2,
+            hostname = hostname(),
+            generation = generation,
+            host = host,
+            port = public_port,
+            url = ("https://%s:%d"):format(host, public_port),
+            port_source = source,
+            started_at = iso_now(),
+            cwd = vim.env.HOME or vim.fn.expand("~"),
+            boot_id = boot_id,
+            ca_path = state_paths.ca,
+            certificate_identity = certificate,
+            proxy = proxy,
+            backend = backend,
+          }
+          local function wait_for_health()
+            local pair_owned = process_is_owned(state)
+            if not pair_owned
+              or not process_listens_on_port(proxy.pid, public_port)
+              or not process_listens_on_port(backend.pid, internal_port)
+            then
+              cleanup_failed_pair(state, deadline_ns, function(_, cleanup_err)
+                callback(nil, "Managed pair identity was lost before readiness" .. (cleanup_err and "; " .. cleanup_err or ""))
+              end)
+              return
+            end
+            probe_health(state, function(health, detail)
+              if health then
+                state.backend.server_version = health.version
+                local wrote, state_err = write_state_while_locked(state, "complete schema-2 state publication")
+                if not wrote then
+                  cleanup_failed_pair(state, deadline_ns, function(_, cleanup_err)
+                    callback(nil, state_err .. (cleanup_err and "; " .. cleanup_err or ""))
+                  end)
+                  return
+                end
+                uv.fs_unlink(state_paths.pending)
+                callback(state)
+              elseif uv.hrtime() >= deadline_ns or detail.kind == "unauthorized" then
+                cleanup_failed_pair(state, deadline_ns, function(_, cleanup_err)
+                  callback(
+                    nil,
+                    "Pinned HTTPS health failed (" .. detail.kind .. ")" .. (cleanup_err and "; " .. cleanup_err or "") .. "; see " .. state_paths.proxy_log,
+                    nil
+                  )
+                end)
+              else
+                vim.defer_fn(wait_for_health, health_interval_ms)
+              end
+            end, true)
+          end
+          wait_for_health()
+        end)
+      end, 100)
+    end)
+  end, 50)
+end
+
 local function ensure_backend(callback)
   table.insert(ensure_waiters, callback)
   if ensure_active then
@@ -1207,7 +2279,7 @@ local function ensure_backend(callback)
   end
   ensure_active = true
   local deadline_ns = uv.hrtime() + startup_timeout_ms * 1000000
-  local state = read_state()
+  local state, initial_status = read_state()
   local requested, request_err = explicit_port()
   if request_err then
     finish_ensure(false, request_err)
@@ -1218,19 +2290,17 @@ local function ensure_backend(callback)
       return "OpenCode authentication failed at " .. (endpoint_state and endpoint_state.url or "the managed endpoint") .. " (HTTP 401)"
     elseif detail.kind == "explicit-port-conflict" then
       return detail.message
-    elseif detail.kind == "unmanaged-endpoint" then
-      return "Refusing to adopt a healthy unmanaged OpenCode endpoint: " .. (detail.message or "ownership mismatch")
     elseif detail.kind == "unverifiable-pid" then
-      return "Refusing to replace a live unverifiable managed PID: " .. (detail.message or "ownership mismatch")
+      return "Refusing to replace a live unverifiable managed process: " .. (detail.message or "ownership mismatch")
     end
   end
-  local function start_while_locked(attempt)
+  local function start_while_locked(attempt, excluded_public, excluded_internal)
     if not require_lock_ownership("startup critical section") then
       release_lock()
       finish_ensure(false, "OpenCode startup lock ownership was lost before the critical section")
       return
     end
-    local locked_state = read_state()
+    local locked_state, locked_status = read_state()
     managed_state_if_healthy(locked_state, requested, function(rechecked, detail)
       if rechecked then
         release_lock()
@@ -1245,31 +2315,33 @@ local function ensure_backend(callback)
         finish_ensure(false, hard_error)
         return
       end
-      local function launch()
+      local function launch(previous)
         if not require_lock_ownership("server launch") then
           release_lock()
           finish_ensure(false, "OpenCode startup lock ownership was lost before launch")
           return
         end
-        spawn_server(locked_state, deadline_ns, function(started, start_err, failed_port)
-          if not started and not requested and attempt < 2 and uv.hrtime() < deadline_ns then
-            -- A bind race may only retry through automatic port selection.
+        spawn_pair(previous, deadline_ns, function(started, start_err, failed_public, failed_internal)
+          if not started
+            and not requested
+            and (failed_public or failed_internal)
+            and attempt < 2
+            and uv.hrtime() < deadline_ns
+          then
             if not require_lock_ownership("automatic startup retry") then
               release_lock()
               finish_ensure(false, "OpenCode startup lock ownership was lost before automatic retry")
               return
             end
-            local excluded_ports = failed_port and { [failed_port] = true } or nil
-            spawn_server(nil, deadline_ns, function(retried, retry_err)
-              release_lock()
-              if not retried then
-                finish_ensure(false, retry_err)
-                return
-              end
-              ensure_local_tui(retried, function(ok, err)
-                finish_ensure(ok, err, retried)
-              end)
-            end, excluded_ports)
+            excluded_public = excluded_public or {}
+            excluded_internal = excluded_internal or {}
+            if failed_public then
+              excluded_public[failed_public] = true
+            end
+            if failed_internal then
+              excluded_internal[failed_internal] = true
+            end
+            start_while_locked(attempt + 1, excluded_public, excluded_internal)
             return
           end
           release_lock()
@@ -1282,35 +2354,61 @@ local function ensure_backend(callback)
           end)
         end)
       end
-      if detail.kind == "owned-unhealthy" then
-        terminate_generation(locked_state, deadline_ns, function(cleaned, cleanup_err)
-          if not cleaned then
-            release_lock()
-            finish_ensure(false, "Managed OpenCode process is unhealthy and cleanup failed: " .. (cleanup_err or "unknown error"))
-            return
-          end
-          local removed, remove_err = remove_matching_state_while_locked(
-            locked_state.generation,
-            "unhealthy generation state removal"
-          )
-          if not removed then
-            release_lock()
-            finish_ensure(false, remove_err)
-            return
-          end
-          launch()
-        end)
-      else
-        if detail.kind == "stale" and locked_state then
+      local function after_pending_cleanup()
+        if locked_status == "unsupported schema" then
+          release_lock()
+          finish_ensure(false, "Refusing to replace unsupported future OpenCode state")
+        elseif locked_status == "malformed" then
+          uv.fs_unlink(paths().state)
+          launch(nil)
+        elseif detail.kind == "legacy" and locked_state then
+          stop_legacy(locked_state, deadline_ns, function(cleaned, cleanup_err)
+            if not cleaned then
+              release_lock()
+              finish_ensure(false, "Legacy OpenCode process could not be safely stopped: " .. (cleanup_err or "unknown error"))
+              return
+            end
+            remove_matching_state_while_locked(locked_state.generation, "legacy state migration")
+            launch(locked_state)
+          end)
+        elseif detail.kind == "owned-unhealthy" then
+          stop_pair(locked_state, deadline_ns, function(cleaned, cleanup_err)
+            if not cleaned then
+              release_lock()
+              finish_ensure(false, "Managed OpenCode pair is unhealthy and cleanup failed: " .. (cleanup_err or "unknown error"))
+              return
+            end
+            local removed, remove_err = remove_matching_state_while_locked(
+              locked_state.generation,
+              "unhealthy generation state removal"
+            )
+            if not removed then
+              release_lock()
+              finish_ensure(false, remove_err)
+              return
+            end
+            launch(locked_state)
+          end)
+        elseif detail.kind == "stale" and locked_state then
           local removed, remove_err = remove_matching_state_while_locked(locked_state.generation, "stale state removal")
           if not removed then
             release_lock()
             finish_ensure(false, remove_err)
             return
           end
+          launch(locked_state)
+        else
+          launch(locked_state)
         end
-        launch()
       end
+      cleanup_pending(deadline_ns, function(cleaned, cleanup_err)
+        if not cleaned then
+          release_lock()
+          finish_ensure(false, "Unable to clean interrupted OpenCode startup: " .. (cleanup_err or "unknown error"))
+          return
+        end
+        after_pending_cleanup()
+      end)
     end)
   end
   managed_state_if_healthy(state, requested, function(healthy_state, detail)
@@ -1387,9 +2485,23 @@ local function stop_shared_server()
       notify("No managed shared OpenCode server is active (state " .. state_status .. ")", vim.log.levels.INFO)
       return
     end
+    if state.schema == 1 then
+      stop_legacy(state, uv.hrtime() + startup_timeout_ms * 1000000, function(stopped, stop_err)
+        if stopped then
+          remove_matching_state_while_locked(state.generation, "explicit legacy stop")
+          release_lock()
+          close_local_tui()
+          notify("Stopped verified legacy OpenCode server", vim.log.levels.INFO)
+        else
+          release_lock()
+          notify("Refusing to stop legacy OpenCode server: " .. (stop_err or "ownership mismatch"), vim.log.levels.ERROR)
+        end
+      end)
+      return
+    end
     local owned, ownership = process_is_owned(state)
     if not owned then
-      if ownership == "PID is not live" then
+      if not pid_is_live(state.proxy.pid) and not pid_is_live(state.backend.pid) then
         local removed, remove_err = remove_matching_state_while_locked(state.generation, "stopped generation state removal")
         if not removed then
           release_lock()
@@ -1405,46 +2517,21 @@ local function stop_shared_server()
       notify("Refusing to stop shared OpenCode server: " .. ownership, vim.log.levels.ERROR)
       return
     end
-    local sent, signal_err = signal_managed(state, "sigterm")
-    if not sent then
+    stop_pair(state, uv.hrtime() + startup_timeout_ms * 1000000, function(stopped, stop_err)
+      if not stopped then
+        release_lock()
+        notify("Refusing to stop shared OpenCode pair: " .. (stop_err or "unknown error"), vim.log.levels.ERROR)
+        return
+      end
+      local removed, remove_err = remove_matching_state_while_locked(state.generation, "stopped generation state removal")
       release_lock()
-      notify("Refusing to stop shared OpenCode server: " .. signal_err, vim.log.levels.ERROR)
-      return
-    end
-    local remaining = 25
-    local escalated = false
-    local function wait_for_stop()
-      probe_health(state.url, function(health)
-        if not health and not pid_is_live(state.pid) then
-          local removed, remove_err = remove_matching_state_while_locked(state.generation, "stopped generation state removal")
-          if not removed then
-            release_lock()
-            notify(remove_err, vim.log.levels.ERROR)
-            return
-          end
-          release_lock()
-          close_local_tui()
-          notify("Stopped shared OpenCode server", vim.log.levels.INFO)
-        elseif remaining <= 0 and not escalated then
-          local killed, kill_err = signal_managed(state, "sigkill")
-          if killed then
-            escalated = true
-            remaining = 25
-            vim.defer_fn(wait_for_stop, health_interval_ms)
-          else
-            release_lock()
-            notify("Refusing to escalate an unverifiable shared OpenCode PID: " .. kill_err, vim.log.levels.ERROR)
-          end
-        elseif remaining <= 0 then
-          release_lock()
-          notify("Timed out stopping shared OpenCode server at " .. state.url, vim.log.levels.ERROR)
-        else
-          remaining = remaining - 1
-          vim.defer_fn(wait_for_stop, health_interval_ms)
-        end
-      end, false)
-    end
-    wait_for_stop()
+      if not removed then
+        notify(remove_err, vim.log.levels.ERROR)
+        return
+      end
+      close_local_tui()
+      notify("Stopped shared OpenCode proxy and backend", vim.log.levels.INFO)
+    end)
   end)
 end
 
@@ -1531,7 +2618,7 @@ local function reload_current_directory(callback)
         )
       end
       local function request(path, method, body, done)
-        request_json(healthy_state.url, path, method, body, directory, function(result, request_detail)
+        request_json(healthy_state, path, method, body, directory, function(result, request_detail)
           if result then
             done(result)
           else
@@ -1545,7 +2632,12 @@ local function reload_current_directory(callback)
           fail("managed-state validation", recheck_detail and recheck_detail.kind)
           return
         end
-        if rechecked.pid ~= healthy_state.pid or rechecked.generation ~= healthy_state.generation or rechecked.url ~= healthy_state.url then
+        if rechecked.proxy.pid ~= healthy_state.proxy.pid
+          or rechecked.backend.pid ~= healthy_state.backend.pid
+          or rechecked.generation ~= healthy_state.generation
+          or rechecked.url ~= healthy_state.url
+          or rechecked.certificate_identity ~= healthy_state.certificate_identity
+        then
           fail("managed-state validation", "the shared server changed while reload was waiting")
           return
         end
@@ -1604,10 +2696,12 @@ local function reload_current_directory(callback)
                             discovery.get():next(function()
                               local final_state = read_state()
                               if not final_state
-                                or final_state.pid ~= rechecked.pid
+                                or final_state.proxy.pid ~= rechecked.proxy.pid
+                                or final_state.backend.pid ~= rechecked.backend.pid
                                 or final_state.generation ~= rechecked.generation
                                 or final_state.url ~= rechecked.url
                                 or final_state.port ~= rechecked.port
+                                or final_state.certificate_identity ~= rechecked.certificate_identity
                               then
                                 fail("shared-server validation", "shared server state changed during reload")
                                 return
@@ -1640,7 +2734,7 @@ end
 local function show_info()
   local state, state_status = read_state()
   local configured, configured_err = explicit_port()
-  local url = configured and ("http://%s:%d"):format(host, configured) or (state and state.url)
+  local url = configured and ("https://%s:%d"):format(host, configured) or (state and state.url)
   local executable, local_version = resolve_executable()
   local lines = {
     "State directory: " .. paths().root,
@@ -1655,38 +2749,61 @@ local function show_info()
           and ("valid; " .. local_tui.url .. "; " .. local_tui.directory .. "; generation " .. local_tui.generation)
         or "absent"),
     "TUI API presence: unknown/unsupported",
-    "Log path: " .. (state and state.log or paths().log),
+    "CA certificate: " .. (state and state.schema == 2 and state.ca_path or paths().ca),
+    "Backend log: " .. (state and state.schema == 2 and state.backend.log or paths().log),
+    "Proxy log: " .. paths().proxy_log,
+    "Client authentication: "
+      .. ((vim.env.OPENCODE_SERVER_PASSWORD and vim.env.OPENCODE_SERVER_PASSWORD ~= "")
+          and "OpenCode Basic Auth password is configured in this process environment"
+        or no_password_warning),
   }
   if configured_err then
     table.insert(lines, "Port error: " .. configured_err)
   end
   if state then
     local owned, ownership = process_is_owned(state)
-    vim.list_extend(lines, {
-      "PID: " .. state.pid .. " (" .. ownership .. ")",
-      "Generation: " .. state.generation,
-      "Started: " .. state.started_at,
-    })
+    if state.schema == 1 then
+      vim.list_extend(lines, {
+        "Legacy PID: " .. state.pid .. " (" .. ownership .. ")",
+        "Generation: " .. state.generation,
+        "Security: legacy schema 1 HTTP is never probed or sent credentials",
+      })
+    else
+      vim.list_extend(lines, {
+        "Proxy PID: " .. state.proxy.pid,
+        "Backend PID: " .. state.backend.pid,
+        "Backend internal port: " .. state.backend.port,
+        "Pair identity: " .. ownership,
+        "Generation: " .. state.generation,
+        "Certificate identity: " .. state.certificate_identity,
+        "Started: " .. state.started_at,
+      })
+    end
     if not owned then
       table.insert(lines, "PID warning: state must not be used to signal this process")
     end
   end
-  if not url then
-    table.insert(lines, "HTTP backend: inactive")
+  if not state or state.schema ~= 2 then
+    table.insert(lines, "HTTPS endpoint: " .. (state_status == "legacy" and "legacy state blocked" or "inactive/untrusted"))
     notify(table.concat(lines, "\n"), vim.log.levels.INFO)
     return
   end
-  local authenticated = state
-    and state.url == url
+  local authenticated = state.url == url
     and process_is_owned(state)
-    and process_listens_on_port(state.pid, state.port)
+    and process_listens_on_port(state.proxy.pid, state.port)
+    and process_listens_on_port(state.backend.pid, state.backend.port)
     or false
-  probe_health(url, function(health, detail)
-    table.insert(lines, "HTTP backend: " .. detail.kind)
+  if not authenticated then
+    table.insert(lines, "HTTPS endpoint: ownership or listener validation failed; no request sent")
+    notify(table.concat(lines, "\n"), vim.log.levels.WARN)
+    return
+  end
+  probe_health(state, function(health, detail)
+    table.insert(lines, "HTTPS endpoint: " .. detail.kind)
     table.insert(lines, "Health latency: " .. detail.latency_ms .. "ms")
     if health then
       table.insert(lines, "Server version: " .. (health.version or "unknown"))
-      if state and state.local_version ~= "unknown" and health.version and state.local_version ~= health.version then
+      if state.backend.local_version ~= "unknown" and health.version and state.backend.local_version ~= health.version then
         table.insert(lines, "Version warning: stop the shared server and use OpenCode again to launch the updated executable")
       end
     end
@@ -1749,12 +2866,16 @@ vim.g.opencode_opts = {
   server = {
     url = function(callback)
       local state = read_state()
-      callback(state and state.url or nil)
+      callback(state and state.schema == 2 and state.url or nil)
     end,
     ensure = function(callback)
       ensure_backend(function(ok, err)
         callback(ok, err)
       end)
+    end,
+    ca_cert = function()
+      local state = read_state()
+      return state and state.schema == 2 and state.ca_path or nil
     end,
     start = false,
   },
@@ -1794,20 +2915,33 @@ if vim.g.mkchad_opencode_test_api then
     lock_is_owned = lock_is_owned,
     managed_state_if_healthy = managed_state_if_healthy,
     paths = paths,
+    find_unique_listener_inode = find_unique_listener_inode,
     process_listens_on_port = process_listens_on_port,
     port_is_available = port_is_available,
     process_is_owned = process_is_owned,
     publish_lock_owner = publish_lock_owner,
     renew_lock = renew_lock,
     release_lock = release_lock,
-    spawn_server = spawn_server,
+    spawn_pair = spawn_pair,
     select_port = select_port,
-    terminate_generation = terminate_generation,
+    terminate_process = terminate_process,
+    stop_pair = stop_pair,
+    stop_legacy = stop_legacy,
+    ensure_certificate_material = ensure_certificate_material,
+    certificate_identity = certificate_identity,
+    capture_process = capture_process,
+    cleanup_pending = cleanup_pending,
+    current_boot_id = current_boot_id,
+    file_identity = file_identity,
+    proc_start_time = proc_start_time,
+    process_identity_is_owned = process_identity_is_owned,
     read_state = read_state,
+    read_pending = read_pending,
     write_state = write_state,
     ensure_local_tui = ensure_local_tui,
     reload_current_directory = reload_current_directory,
     show_info = show_info,
+    stop_shared_server = stop_shared_server,
     tui_valid = tui_valid,
   }
 end

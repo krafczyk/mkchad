@@ -2,69 +2,83 @@ local config = assert(arg[1], "pass the MkChad config path")
 vim.g.mkchad_opencode_test_api = true
 dofile(config)
 local lifecycle = vim.g.mkchad_opencode_test_api
-
 local root = lifecycle.paths().root
 assert(vim.fn.mkdir(root, "p", 448) ~= 0 or vim.uv.fs_stat(root))
 local directory = vim.fn.fnamemodify(vim.fn.getcwd(), ":p"):gsub("/$", "")
-local inactive_done, inactive_ok, inactive_message = false, nil, nil
-lifecycle.reload_current_directory(function(ok, message)
-  inactive_done, inactive_ok, inactive_message = true, ok, message
-end)
-assert(vim.wait(1000, function() return inactive_done end, 10), "inactive reload did not finish")
+
+local function await(invoke, timeout)
+  local done, values = false, nil
+  invoke(function(...)
+    done, values = true, { ... }
+  end)
+  assert(vim.wait(timeout or 40000, function()
+    return done
+  end, 20), "timed out")
+  return unpack(values)
+end
+
+local inactive_ok, inactive_message = await(lifecycle.reload_current_directory, 1000)
 assert(not inactive_ok and inactive_message:find("did not start a server", 1, true), inactive_message)
 assert(not lifecycle.read_state(), "inactive reload created lifecycle state")
 
-local port = 49889
-local responder = vim.fs.joinpath(root, "reload_responder.py")
 local requests = vim.fs.joinpath(root, "reload_requests.log")
+local fake = vim.fs.joinpath(root, "opencode")
 vim.fn.writefile({
-  "import json, os, socket, sys",
-  "port, directory, log = int(sys.argv[1]), sys.argv[2], sys.argv[3]",
+  "#!/usr/bin/env python3",
+  "import json, os, socket, sys, threading",
+  "if len(sys.argv) > 1 and sys.argv[1] == '--version': print('fake'); raise SystemExit(0)",
+  "directory = " .. vim.json.encode(directory),
+  "log = " .. vim.json.encode(requests),
   "sock = socket.socket(); sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)",
-  "sock.bind(('127.0.0.1', port)); sock.listen()",
+  "sock.bind(('127.0.0.1', int(sys.argv[-1]))); sock.listen(64)",
+  "def handle(client):",
+  "  with client:",
+  "    while True:",
+  "      raw = b''",
+  "      while b'\\r\\n\\r\\n' not in raw:",
+  "        part = client.recv(8192)",
+  "        if not part: return",
+  "        raw += part",
+  "      lines = raw.decode('latin1').split('\\r\\n'); target = lines[0].split()[1]",
+  "      routed = next((line for line in lines if line.lower().startswith('x-opencode-directory:')), '')",
+  "      with open(log, 'a') as out: out.write(lines[0] + '|' + routed + '\\n')",
+  "      if target == '/global/health': body = {'healthy': True, 'version': 'fake'}",
+  "      elif target == '/session/status' and os.path.exists(log + '.busy'): body = {'status': 'busy'}",
+  "      elif target == '/path': body = {'directory': directory}",
+  "      else: body = [] if target in ('/permission', '/question') else {}",
+  "      encoded = json.dumps(body).encode()",
+  "      client.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nContent-Length: ' + str(len(encoded)).encode() + b'\\r\\nConnection: keep-alive\\r\\n\\r\\n' + encoded)",
   "while True:",
-  "  client, _ = sock.accept(); raw = client.recv(8192).decode(); lines = raw.split('\\r\\n')",
-  "  with open(log, 'a') as out: out.write(lines[0] + '|' + next((x for x in lines if x.lower().startswith('x-opencode-directory:')), '') + '\\n')",
-  "  target = lines[0].split()[1]",
-  "  if target == '/global/health': body = {'healthy': True, 'version': 'fake'}",
-  "  elif target == '/session/status' and os.path.exists(log + '.busy'): body = {'status': 'busy'}",
-  "  elif target == '/path': body = {'directory': directory}",
-  "  else: body = [] if target in ('/permission', '/question') else {}",
-  "  encoded = json.dumps(body).encode(); client.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nContent-Length: ' + str(len(encoded)).encode() + b'\\r\\n\\r\\n' + encoded); client.close()",
-}, responder)
-local job = vim.fn.jobstart({ "python3", responder, tostring(port), directory, requests, "serve", "--hostname", "127.0.0.1", "--port", tostring(port) })
-assert(job > 0, "could not start reload responder")
-local pid = vim.fn.jobpid(job)
-assert(vim.wait(1000, function()
-  return lifecycle.process_listens_on_port(pid, port)
-end, 10), "reload responder did not listen")
-local cmdline_fd = assert(vim.uv.fs_open("/proc/" .. pid .. "/cmdline", "r", 0))
-local cmdline_size = vim.uv.fs_fstat(cmdline_fd).size
-local cmdline = assert(vim.uv.fs_read(cmdline_fd, cmdline_size == 0 and 8192 or cmdline_size, 0))
-vim.uv.fs_close(cmdline_fd)
-local state = {
-  schema = 1,
-  hostname = vim.uv.os_gethostname():gsub("[^%w_.-]", "_"),
-  pid = pid,
-  generation = "reload-test",
-  host = "127.0.0.1",
-  port = port,
-  url = "http://127.0.0.1:" .. port,
-  process_executable = vim.uv.fs_readlink("/proc/" .. pid .. "/exe"),
-  argv = vim.split(cmdline, "\0", { plain = true, trimempty = true }),
-}
-assert(lifecycle.process_is_owned(state))
-assert(lifecycle.write_state(state))
+  "  client, _ = sock.accept(); threading.Thread(target=handle, args=(client,), daemon=True).start()",
+}, fake)
+assert(vim.uv.fs_chmod(fake, 493))
+vim.env.PATH = root .. ":" .. vim.env.PATH
 
-local disconnected, tui_creations = false, 0
-package.loaded["opencode.server"] = { connected = { disconnect = function() disconnected = true end } }
+local tui_creations, tui_jobs = 0, {}
 package.loaded["snacks.terminal"] = {
-  get = function()
+  get = function(_, opts)
+    assert(opts.env.NODE_EXTRA_CA_CERTS)
     tui_creations = tui_creations + 1
-    local tui_job = vim.fn.jobstart({ "python3", "-c", "import time; time.sleep(10)" })
-    return { job = tui_job, valid = function() return true end, close = function(self) vim.fn.jobstop(self.job) end }, true
+    local job = vim.fn.jobstart({ "python3", "-c", "import time; time.sleep(60)" })
+    table.insert(tui_jobs, job)
+    return {
+      job = job,
+      valid = function()
+        return true
+      end,
+      close = function(self)
+        vim.fn.jobstop(self.job)
+      end,
+    }, true
   end,
 }
+local ensured, ensure_err = await(vim.g.opencode_opts.server.ensure)
+assert(ensured, ensure_err)
+local state = assert(lifecycle.read_state())
+local disconnected = false
+package.loaded["opencode.server"] = { connected = { disconnect = function()
+  disconnected = true
+end } }
 package.loaded["opencode.server.discovery"] = {
   get = function()
     return {
@@ -75,20 +89,19 @@ package.loaded["opencode.server.discovery"] = {
     }
   end,
 }
-local done, ok, message = false, nil, nil
-lifecycle.reload_current_directory(function(result, detail)
-  done, ok, message = true, result, detail
-end)
-assert(vim.wait(5000, function() return done end, 10), "reload did not finish")
+
+local ok, message = await(lifecycle.reload_current_directory, 10000)
 assert(ok, message)
 assert(disconnected, "reload did not clear stale plugin connection")
-assert(tui_creations == 1, "reload did not recreate the local TUI")
-local final = lifecycle.read_state()
-assert(final.pid == state.pid and final.generation == state.generation and final.url == state.url and final.port == state.port, "reload changed shared state")
+assert(tui_creations == 2, "reload did not recreate the local TUI")
+local final = assert(lifecycle.read_state())
+assert(final.proxy.pid == state.proxy.pid and final.backend.pid == state.backend.pid)
+assert(final.generation == state.generation and final.url == state.url and final.port == state.port)
+assert(final.certificate_identity == state.certificate_identity)
 local seen = table.concat(vim.fn.readfile(requests), "\n")
-assert(seen:find("GET /session/status HTTP/1.1|x%-opencode%-directory: " .. directory, 1), "status preflight was not directory routed")
-assert(seen:find("POST /instance/dispose HTTP/1.1|x%-opencode%-directory: " .. directory, 1), "dispose was not directory routed")
-assert(seen:find("GET /path HTTP/1.1|x%-opencode%-directory: " .. directory, 1), "recreation was not directory routed")
+assert(seen:find("GET /session/status HTTP/1.1|x%-opencode%-directory: " .. directory, 1))
+assert(seen:find("POST /instance/dispose HTTP/1.1|x%-opencode%-directory: " .. directory, 1))
+assert(seen:find("GET /path HTTP/1.1|x%-opencode%-directory: " .. directory, 1))
 local dispose_count = select(2, seen:gsub("POST /instance/dispose", ""))
 
 package.loaded["opencode.server.discovery"].get = function()
@@ -104,23 +117,28 @@ package.loaded["opencode.server.discovery"].get = function()
   end
   return pending
 end
-local reconnect_done, reconnect_ok, reconnect_message = false, nil, nil
-lifecycle.reload_current_directory(function(result, detail)
-  reconnect_done, reconnect_ok, reconnect_message = true, result, detail
-end)
-assert(vim.wait(5000, function() return reconnect_done end, 10), "reload callback remained pending after SSE rejection")
+local reconnect_ok, reconnect_message = await(lifecycle.reload_current_directory, 10000)
 assert(not reconnect_ok and reconnect_message:find("plugin reconnection", 1, true), reconnect_message)
 assert(reconnect_message:find("closed before server.connected", 1, true), reconnect_message)
 dispose_count = select(2, table.concat(vim.fn.readfile(requests), "\n"):gsub("POST /instance/dispose", ""))
 
 vim.fn.writefile({ "busy" }, requests .. ".busy")
-local busy_done, busy_ok, busy_message = false, nil, nil
-lifecycle.reload_current_directory(function(result, detail)
-  busy_done, busy_ok, busy_message = true, result, detail
-end)
-assert(vim.wait(3000, function() return busy_done end, 10), "busy reload did not finish")
+local busy_ok, busy_message = await(lifecycle.reload_current_directory, 5000)
 assert(not busy_ok and busy_message:find("work is active", 1, true), busy_message)
 local final_requests = table.concat(vim.fn.readfile(requests), "\n")
 assert(dispose_count == select(2, final_requests:gsub("POST /instance/dispose", "")), "busy reload disposed the instance")
-vim.fn.jobstop(job)
+
+local locked, lock_err = await(lifecycle.acquire_lock, 3000)
+assert(locked, lock_err)
+local stopped, stop_err = await(function(done)
+  lifecycle.stop_pair(final, vim.uv.hrtime() + 8000 * 1000000, done)
+end, 10000)
+assert(stopped, stop_err)
+vim.uv.fs_unlink(lifecycle.paths().state)
+lifecycle.release_lock()
+for _, job in ipairs(tui_jobs) do
+  if vim.fn.jobwait({ job }, 0)[1] == -1 then
+    vim.fn.jobstop(job)
+  end
+end
 vim.cmd("qa!")

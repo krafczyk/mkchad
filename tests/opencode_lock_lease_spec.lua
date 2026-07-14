@@ -21,7 +21,7 @@ if mode == "owner" then
     assert(ok, err)
   end)
   vim.fn.writefile({ tostring(vim.fn.getpid()) }, control .. ".ready")
-  assert(vim.wait(30000, function()
+  assert(vim.wait(60000, function()
     return vim.uv.fs_stat(control .. ".release") ~= nil
   end, 20), "owner did not receive release request")
   lifecycle.release_lock()
@@ -77,10 +77,10 @@ end
 
 local owner_job = start_worker("owner")
 wait_for_file(prefix .. ".ready", 3000, "lease owner did not acquire the lock")
-vim.wait(16200, function()
+vim.wait(31200, function()
   return false
 end, 20)
-assert(vim.fn.jobwait({ owner_job }, 0)[1] == -1, "lease owner exited before the original 15-second lease")
+assert(vim.fn.jobwait({ owner_job }, 0)[1] == -1, "lease owner exited before the renewed 30-second lease")
 run_contender("blocked")
 
 vim.fn.writefile({ "release" }, prefix .. ".release")
