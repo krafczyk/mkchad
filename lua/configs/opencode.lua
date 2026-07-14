@@ -4,6 +4,7 @@ local preferred_port = 4096
 local startup_timeout_ms = 15000
 local health_interval_ms = 200
 local local_tui_bootstrap_ms = 200
+local lock_renew_interval_ms = 3000
 
 local function notify(message, level)
   vim.notify(message, level, { title = "OpenCode" })
@@ -59,6 +60,15 @@ local function read_file(path)
   local data = uv.fs_read(fd, size, 0)
   uv.fs_close(fd)
   return data
+end
+
+local function monotonic_ms()
+  return math.floor(uv.hrtime() / 1000000)
+end
+
+local function current_boot_id()
+  local value = read_file("/proc/sys/kernel/random/boot_id")
+  return value and value:match("^%s*(.-)%s*$") or nil
 end
 
 local function read_state()
@@ -386,7 +396,13 @@ local function process_is_owned(state)
   return true, "verified"
 end
 
+local renew_lock
+
 local function signal_managed(state, signal)
+  local renewed, lease_err = renew_lock()
+  if not renewed then
+    return nil, "lifecycle lock ownership was lost before " .. signal .. ": " .. (lease_err or "lease renewal failed")
+  end
   local owned, reason = process_is_owned(state)
   if not owned then
     return nil, reason
@@ -436,6 +452,19 @@ local function terminate_generation(state, deadline_ns, callback)
 end
 
 local lock_claim
+local lock_renew_timer
+
+local function valid_lock_token(token)
+  return type(token) == "string" and token ~= "" and token:match("^[%w_.%+-]+$") ~= nil
+end
+
+local function lock_lease_path(token, root)
+  if not valid_lock_token(token) then
+    return nil
+  end
+  return vim.fs.joinpath(root or paths().lock, "lease-" .. token .. ".json")
+end
+
 local function read_lock_owner()
   local owner_content = read_file(paths().lock_owner)
   if not owner_content then
@@ -445,19 +474,60 @@ local function read_lock_owner()
   return ok and type(owner) == "table" and owner or nil
 end
 
+local function read_lock_lease(owner, root)
+  local lease_path = owner and lock_lease_path(owner.token, root)
+  local content = lease_path and read_file(lease_path)
+  if not content then
+    return nil
+  end
+  local ok, lease = pcall(vim.json.decode, content)
+  return ok and type(lease) == "table" and lease or nil
+end
+
+local function owner_matches_claim(owner, lock_stat, claim)
+  return owner
+    and claim
+    and owner.token == claim.token
+    and owner.pid == vim.fn.getpid()
+    and owner.hostname == hostname()
+    and owner.boot_id == claim.boot_id
+    and lock_stat
+    and lock_stat.dev == claim.dev
+    and lock_stat.ino == claim.ino
+    and owner.lock_dev == claim.dev
+    and owner.lock_ino == claim.ino
+end
+
+local function valid_lock_lease(lock_stat, owner, lease, now_ms)
+  return lock_stat
+    and owner
+    and lease
+    and valid_lock_token(owner.token)
+    and owner.hostname == hostname()
+    and owner.boot_id == current_boot_id()
+    and owner.lock_dev == lock_stat.dev
+    and owner.lock_ino == lock_stat.ino
+    and lease.token == owner.token
+    and lease.pid == owner.pid
+    and lease.hostname == owner.hostname
+    and lease.boot_id == owner.boot_id
+    and lease.lock_dev == lock_stat.dev
+    and lease.lock_ino == lock_stat.ino
+    and type(lease.renewed_monotonic_ms) == "number"
+    and type(lease.deadline_monotonic_ms) == "number"
+    and lease.deadline_monotonic_ms >= lease.renewed_monotonic_ms
+    and lease.deadline_monotonic_ms - lease.renewed_monotonic_ms <= startup_timeout_ms
+    and lease.renewed_monotonic_ms <= now_ms
+end
+
 local function lock_is_owned()
   local owner = read_lock_owner()
   local lock_stat = uv.fs_stat(paths().lock)
-  return owner
-    and lock_claim
-    and owner.token == lock_claim.token
-    and owner.pid == vim.fn.getpid()
-    and owner.hostname == hostname()
-    and lock_stat
-    and lock_stat.dev == lock_claim.dev
-    and lock_stat.ino == lock_claim.ino
-    and owner.lock_dev == lock_claim.dev
-    and owner.lock_ino == lock_claim.ino
+  local lease = read_lock_lease(owner)
+  local now_ms = monotonic_ms()
+  return owner_matches_claim(owner, lock_stat, lock_claim)
+    and valid_lock_lease(lock_stat, owner, lease, now_ms)
+    and lease.deadline_monotonic_ms > now_ms
 end
 
 local function same_lock(stat, claim)
@@ -481,10 +551,113 @@ local function cleanup_created_lock(claim)
     end
     uv.fs_unlink(vim.fs.joinpath(detached, "owner.json"))
   end
+  local lease_path = claim and lock_lease_path(claim.token, detached)
+  if lease_path then
+    uv.fs_unlink(lease_path)
+  end
   return uv.fs_rmdir(detached) and true or false
 end
 
+local function stop_lock_renewal()
+  if lock_renew_timer then
+    lock_renew_timer:stop()
+    lock_renew_timer:close()
+    lock_renew_timer = nil
+  end
+end
+
+renew_lock = function()
+  local claim = lock_claim
+  if not claim or not lock_is_owned() then
+    return nil, "the current lease is absent, expired, or no longer owned"
+  end
+  local owner = read_lock_owner()
+  local lock_stat = uv.fs_stat(paths().lock)
+  if not owner_matches_claim(owner, lock_stat, claim) then
+    return nil, "the startup lock directory or owner changed"
+  end
+  local now_ms = monotonic_ms()
+  local lease = {
+    token = claim.token,
+    pid = vim.fn.getpid(),
+    hostname = hostname(),
+    boot_id = claim.boot_id,
+    lock_dev = claim.dev,
+    lock_ino = claim.ino,
+    renewed_monotonic_ms = now_ms,
+    deadline_monotonic_ms = now_ms + startup_timeout_ms,
+  }
+  local encoded = vim.json.encode(lease)
+  local temporary = paths().root .. "/.lease-" .. random_token() .. ".tmp"
+  local wrote, write_err = write_private(temporary, encoded, true)
+  if not wrote then
+    return nil, write_err or "unable to write renewed lease"
+  end
+  owner = read_lock_owner()
+  lock_stat = uv.fs_stat(paths().lock)
+  if not owner_matches_claim(owner, lock_stat, claim) or not lock_is_owned() then
+    uv.fs_unlink(temporary)
+    return nil, "the startup lock changed during lease renewal"
+  end
+  local lease_path = lock_lease_path(claim.token)
+  local renamed, rename_err = uv.fs_rename(temporary, lease_path)
+  if not renamed then
+    uv.fs_unlink(temporary)
+    return nil, rename_err or "unable to publish renewed lease"
+  end
+  local published = read_lock_lease(owner)
+  lock_stat = uv.fs_stat(paths().lock)
+  if not owner_matches_claim(read_lock_owner(), lock_stat, claim)
+    or not valid_lock_lease(lock_stat, owner, published, monotonic_ms())
+    or published.renewed_monotonic_ms ~= now_ms
+  then
+    return nil, "startup lock ownership changed while publishing the renewed lease"
+  end
+  return true
+end
+
+local function start_lock_renewal()
+  stop_lock_renewal()
+  lock_renew_timer = uv.new_timer()
+  if not lock_renew_timer then
+    return nil, "unable to create startup lock renewal timer"
+  end
+  lock_renew_timer:start(lock_renew_interval_ms, lock_renew_interval_ms, vim.schedule_wrap(function()
+    local renewed = renew_lock()
+    if not renewed then
+      stop_lock_renewal()
+    end
+  end))
+  return true
+end
+
+local function require_lock_ownership(action)
+  local renewed, err = renew_lock()
+  if not renewed then
+    return nil, "OpenCode lifecycle lock ownership was lost before " .. action .. ": " .. (err or "lease renewal failed")
+  end
+  return true
+end
+
+local function write_state_while_locked(state, action)
+  local owned, ownership_err = require_lock_ownership(action or "lifecycle state update")
+  if not owned then
+    return nil, ownership_err
+  end
+  return write_state(state)
+end
+
+local function remove_matching_state_while_locked(generation, action)
+  local owned, ownership_err = require_lock_ownership(action or "lifecycle state removal")
+  if not owned then
+    return nil, ownership_err
+  end
+  remove_matching_state(generation)
+  return true
+end
+
 local function release_lock()
+  stop_lock_renewal()
   local claim = lock_claim
   if claim and lock_is_owned() then
     -- Atomically detach the exact lock directory we validated. This cannot
@@ -496,13 +669,17 @@ local function release_lock()
       if content then
         ok, owner = pcall(vim.json.decode, content)
       end
+      local lease = read_lock_lease(owner, released)
       if same_lock(uv.fs_stat(released), claim)
         and ok
         and owner
         and owner.token == claim.token
         and owner.pid == vim.fn.getpid()
         and owner.hostname == hostname()
+        and lease
+        and lease.token == claim.token
       then
+        uv.fs_unlink(lock_lease_path(claim.token, released))
         uv.fs_unlink(vim.fs.joinpath(released, "owner.json"))
         uv.fs_rmdir(released)
       else
@@ -527,6 +704,8 @@ local function lock_is_stale(lock_stat, owner)
     and (now_ms >= modified_ms + startup_timeout_ms or modified_ms > now_ms + startup_timeout_ms)
   -- A contender can observe the directory between mkdir and atomic owner
   -- publication. It is not stale merely because metadata is briefly absent.
+  local lease = read_lock_lease(owner)
+  local monotonic_now_ms = monotonic_ms()
   if not owner
     or owner.hostname ~= hostname()
     or type(owner.pid) ~= "number"
@@ -536,17 +715,21 @@ local function lock_is_stale(lock_stat, owner)
     or owner.lock_dev ~= lock_stat.dev
     or owner.lock_ino ~= lock_stat.ino
     or type(owner.acquired_at_unix_ms) ~= "number"
-    or type(owner.deadline_unix_ms) ~= "number"
-    or owner.deadline_unix_ms < owner.acquired_at_unix_ms
-    or owner.deadline_unix_ms - owner.acquired_at_unix_ms > startup_timeout_ms
-    or owner.acquired_at_unix_ms > now_ms + startup_timeout_ms
+    or type(owner.boot_id) ~= "string"
+    or owner.boot_id == ""
   then
     return old_or_clock_invalid or false
   end
-  if now_ms >= owner.deadline_unix_ms then
+  if owner.boot_id ~= current_boot_id() then
     return true
   end
-  return not pid_is_live(owner.pid)
+  if not pid_is_live(owner.pid) then
+    return true
+  end
+  if not valid_lock_lease(lock_stat, owner, lease, monotonic_now_ms) then
+    return old_or_clock_invalid or false
+  end
+  return monotonic_now_ms >= lease.deadline_monotonic_ms
 end
 
 local function reclaim_stale_lock()
@@ -556,6 +739,8 @@ local function reclaim_stale_lock()
   end
   local owner_content = read_file(paths().lock_owner)
   local owner = read_lock_owner()
+  local lease_path = owner and lock_lease_path(owner.token)
+  local lease_content = lease_path and read_file(lease_path) or nil
   if not lock_is_stale(lock_stat, owner) then
     return false
   end
@@ -570,11 +755,16 @@ local function reclaim_stale_lock()
     return false
   end
   local moved_owner = read_file(vim.fs.joinpath(tombstone, "owner.json"))
-  if moved_owner ~= owner_content then
+  local moved_lease_path = owner and lock_lease_path(owner.token, tombstone)
+  local moved_lease = moved_lease_path and read_file(moved_lease_path) or nil
+  if moved_owner ~= owner_content or moved_lease ~= lease_content then
     -- Owner publication raced the stale check. Restore it and let the next
     -- bounded attempt validate the newly published owner.
     uv.fs_rename(tombstone, paths().lock)
     return false
+  end
+  if moved_lease_path then
+    uv.fs_unlink(moved_lease_path)
   end
   uv.fs_unlink(vim.fs.joinpath(tombstone, "owner.json"))
   uv.fs_rmdir(tombstone)
@@ -586,16 +776,43 @@ local function publish_lock_owner(claim)
     return nil, "startup lock directory changed before owner publication"
   end
   local acquired_at = realtime_ms()
+  local acquired_monotonic_ms = monotonic_ms()
+  local boot_id = current_boot_id()
+  if not boot_id or boot_id == "" then
+    return nil, "unable to read the host boot identity"
+  end
+  claim.boot_id = boot_id
   local owner = {
     token = claim.token,
     pid = vim.fn.getpid(),
     hostname = hostname(),
     lock_dev = claim.dev,
     lock_ino = claim.ino,
+    boot_id = boot_id,
     acquired_at_unix_ms = acquired_at,
-    deadline_unix_ms = acquired_at + startup_timeout_ms,
+    acquired_monotonic_ms = acquired_monotonic_ms,
   }
-  return write_private(paths().lock_owner, vim.json.encode(owner), true)
+  local lease = {
+    token = claim.token,
+    pid = vim.fn.getpid(),
+    hostname = hostname(),
+    boot_id = boot_id,
+    lock_dev = claim.dev,
+    lock_ino = claim.ino,
+    renewed_monotonic_ms = acquired_monotonic_ms,
+    deadline_monotonic_ms = acquired_monotonic_ms + startup_timeout_ms,
+  }
+  local lease_path = lock_lease_path(claim.token)
+  local wrote_lease, lease_err = write_private(lease_path, vim.json.encode(lease), true)
+  if not wrote_lease then
+    return nil, lease_err
+  end
+  local wrote_owner, owner_err = write_private(paths().lock_owner, vim.json.encode(owner), true)
+  if not wrote_owner then
+    uv.fs_unlink(lease_path)
+    return nil, owner_err
+  end
+  return true
 end
 
 local function acquire_lock(callback, retried, deadline_ns)
@@ -621,9 +838,15 @@ local function acquire_lock(callback, retried, deadline_ns)
       callback(false, "Unable to write OpenCode startup lock: " .. (write_err or "unknown error"))
       return
     end
-    if not lock_is_owned() then
+    if not require_lock_ownership("startup critical section") then
       release_lock()
       callback(false, "OpenCode startup lock ownership was lost before startup")
+      return
+    end
+    local renewing, renewal_err = start_lock_renewal()
+    if not renewing then
+      release_lock()
+      callback(false, "Unable to renew OpenCode startup lock: " .. renewal_err)
       return
     end
     callback(true)
@@ -771,7 +994,7 @@ local function spawn_server(state, deadline_ns, callback, excluded_ports)
       callback(nil, "OpenCode child exited or did not exec the expected command (" .. ownership .. "); see " .. state_paths.log, port)
       return
     end
-    local wrote, write_err = write_state(managed)
+    local wrote, write_err = write_state_while_locked(managed, "initial managed state write")
     if not wrote then
       terminate_generation(managed, deadline_ns, function(cleaned, cleanup_err)
         local suffix = cleaned and "" or "; cleanup failed: " .. (cleanup_err or "unknown error")
@@ -783,17 +1006,21 @@ local function spawn_server(state, deadline_ns, callback, excluded_ports)
       local still_owned, ownership_reason = process_is_owned(managed)
       if health and still_owned and process_listens_on_port(managed.pid, managed.port) then
         managed.server_version = health.version
-        write_state(managed)
+        local updated, update_err = write_state_while_locked(managed, "ready managed state update")
+        if not updated then
+          callback(nil, update_err, port)
+          return
+        end
         callback(managed)
         return
       end
       local failure = health and "unexpected endpoint process" or detail.kind
       terminate_generation(managed, deadline_ns, function(cleaned, cleanup_err)
         if cleaned then
-          remove_matching_state(generation)
+          remove_matching_state_while_locked(generation, "failed generation state removal")
         else
           managed.cleanup_error = cleanup_err or "failed cleanup after readiness failure"
-          write_state(managed)
+          write_state_while_locked(managed, "failed cleanup state update")
         end
         local ownership_suffix = still_owned and "" or "; child identity lost: " .. ownership_reason
         local cleanup_suffix = cleaned and "" or "; cleanup failed: " .. (cleanup_err or "unknown error")
@@ -998,7 +1225,8 @@ local function ensure_backend(callback)
     end
   end
   local function start_while_locked(attempt)
-    if not lock_is_owned() then
+    if not require_lock_ownership("startup critical section") then
+      release_lock()
       finish_ensure(false, "OpenCode startup lock ownership was lost before the critical section")
       return
     end
@@ -1018,14 +1246,16 @@ local function ensure_backend(callback)
         return
       end
       local function launch()
-        if not lock_is_owned() then
+        if not require_lock_ownership("server launch") then
+          release_lock()
           finish_ensure(false, "OpenCode startup lock ownership was lost before launch")
           return
         end
         spawn_server(locked_state, deadline_ns, function(started, start_err, failed_port)
           if not started and not requested and attempt < 2 and uv.hrtime() < deadline_ns then
             -- A bind race may only retry through automatic port selection.
-            if not lock_is_owned() then
+            if not require_lock_ownership("automatic startup retry") then
+              release_lock()
               finish_ensure(false, "OpenCode startup lock ownership was lost before automatic retry")
               return
             end
@@ -1059,12 +1289,25 @@ local function ensure_backend(callback)
             finish_ensure(false, "Managed OpenCode process is unhealthy and cleanup failed: " .. (cleanup_err or "unknown error"))
             return
           end
-          remove_matching_state(locked_state.generation)
+          local removed, remove_err = remove_matching_state_while_locked(
+            locked_state.generation,
+            "unhealthy generation state removal"
+          )
+          if not removed then
+            release_lock()
+            finish_ensure(false, remove_err)
+            return
+          end
           launch()
         end)
       else
         if detail.kind == "stale" and locked_state then
-          remove_matching_state(locked_state.generation)
+          local removed, remove_err = remove_matching_state_while_locked(locked_state.generation, "stale state removal")
+          if not removed then
+            release_lock()
+            finish_ensure(false, remove_err)
+            return
+          end
         end
         launch()
       end
@@ -1146,13 +1389,19 @@ local function stop_shared_server()
     end
     local owned, ownership = process_is_owned(state)
     if not owned then
-      release_lock()
       if ownership == "PID is not live" then
-        remove_matching_state(state.generation)
+        local removed, remove_err = remove_matching_state_while_locked(state.generation, "stopped generation state removal")
+        if not removed then
+          release_lock()
+          notify(remove_err, vim.log.levels.ERROR)
+          return
+        end
+        release_lock()
         close_local_tui()
         notify("Removed stale state for an already stopped shared OpenCode server", vim.log.levels.INFO)
         return
       end
+      release_lock()
       notify("Refusing to stop shared OpenCode server: " .. ownership, vim.log.levels.ERROR)
       return
     end
@@ -1167,7 +1416,12 @@ local function stop_shared_server()
     local function wait_for_stop()
       probe_health(state.url, function(health)
         if not health and not pid_is_live(state.pid) then
-          remove_matching_state(state.generation)
+          local removed, remove_err = remove_matching_state_while_locked(state.generation, "stopped generation state removal")
+          if not removed then
+            release_lock()
+            notify(remove_err, vim.log.levels.ERROR)
+            return
+          end
           release_lock()
           close_local_tui()
           notify("Stopped shared OpenCode server", vim.log.levels.INFO)
@@ -1313,6 +1567,11 @@ local function reload_current_directory(callback)
                   elseif contains_pending_item(questions) then
                     fail("question preflight", "a current-directory question is pending; reload was not attempted")
                   else
+                    local owns_lock, ownership_err = require_lock_ownership("instance disposal request")
+                    if not owns_lock then
+                      fail("instance disposal", ownership_err)
+                      return
+                    end
                     request("/instance/dispose", "POST", nil, function(_, dispose_err)
                       if dispose_err then
                         fail("instance disposal", dispose_err)
@@ -1539,6 +1798,7 @@ if vim.g.mkchad_opencode_test_api then
     port_is_available = port_is_available,
     process_is_owned = process_is_owned,
     publish_lock_owner = publish_lock_owner,
+    renew_lock = renew_lock,
     release_lock = release_lock,
     spawn_server = spawn_server,
     select_port = select_port,

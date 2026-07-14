@@ -378,6 +378,18 @@ assert_equal(lifecycle.lock_is_owned(), true, "acquirer token revalidation")
 lifecycle.release_lock()
 assert_equal(vim.uv.fs_stat(lifecycle.paths().lock), nil, "owned lock release")
 
+-- Wall-clock jumps must not expire a valid boot-scoped monotonic lease.
+assert(wait_for(lifecycle.acquire_lock), "clock-change fixture could not acquire lock")
+local owner = vim.json.decode(table.concat(vim.fn.readfile(lifecycle.paths().lock_owner), "\n"))
+owner.acquired_at_unix_ms = 9000000000000000
+vim.fn.writefile({ vim.json.encode(owner) }, lifecycle.paths().lock_owner)
+local future = os.time() + 30
+assert(vim.uv.fs_utime(lifecycle.paths().lock, future, future))
+local clock_contender, clock_err = wait_for(lifecycle.acquire_lock)
+assert(not clock_contender and clock_err:find("already in progress", 1, true), clock_err)
+assert(lifecycle.lock_is_owned(), "wall-clock metadata invalidated the monotonic lease")
+lifecycle.release_lock()
+
 local function remove_lock_fixture()
   vim.uv.fs_unlink(lifecycle.paths().lock_owner)
   vim.uv.fs_rmdir(lifecycle.paths().lock)

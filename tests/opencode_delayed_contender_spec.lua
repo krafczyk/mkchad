@@ -57,6 +57,14 @@ end
 if mode == "cleanup" then
   local state = lifecycle.read_state()
   if state then
+    local lock_done, locked, lock_err = false, nil, nil
+    lifecycle.acquire_lock(function(ok, err)
+      lock_done, locked, lock_err = true, ok, err
+    end)
+    assert(vim.wait(1000, function()
+      return lock_done
+    end, 10), "cleanup lock timed out")
+    assert(locked, lock_err)
     local done, cleaned = false, nil
     lifecycle.terminate_generation(state, vim.uv.hrtime() + 3000 * 1000000, function(ok)
       cleaned, done = ok, true
@@ -66,6 +74,7 @@ if mode == "cleanup" then
     end, 10), "server cleanup timed out")
     assert(cleaned, "server cleanup failed")
     vim.uv.fs_unlink(lifecycle.paths().state)
+    lifecycle.release_lock()
   end
   vim.cmd("qa!")
 end
