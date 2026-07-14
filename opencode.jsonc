@@ -4,6 +4,6 @@
     "opencode-codex-usage@latest"
   ],
   "compaction": {
-      "auto": false
+      "auto": true
   }
 }
