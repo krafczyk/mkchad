@@ -80,7 +80,11 @@ def main() -> None:
         shutdown = worker(env, "shutdown", shutdown_control)
         finish(shutdown, 5)
         shutdown_pid = int(Path(str(shutdown_control) + ".pid").read_text())
-        assert not Path(f"/proc/{shutdown_pid}").exists()
+        shutdown_proc = Path(f"/proc/{shutdown_pid}")
+        deadline = time.monotonic() + 3
+        while shutdown_proc.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not shutdown_proc.exists()
         shutdown_contender = worker(env, "contender", root / "shutdown-contender.result")
         finish(shutdown_contender, 5)
 

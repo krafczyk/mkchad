@@ -43,13 +43,29 @@ assert(vim.env.OPENCODE_SERVER_USERNAME == "configured-user")
 assert(vim.env.OPENCODE_SERVER_PASSWORD == secret)
 assert(lifecycle.server_setting_source("OPENCODE_PORT") == "config file")
 assert(lifecycle.server_setting_source("OPENCODE_SERVER_PASSWORD") == "config file")
+assert(lifecycle.requested_transport() == "tls-proxy", "absent tls_proxy must preserve TLS")
 
 vim.env.OPENCODE_PORT = "45678"
 vim.env.OPENCODE_SERVER_PASSWORD = "replacement-secret"
 assert(lifecycle.server_setting_source("OPENCODE_PORT") == "environment")
 assert(lifecycle.server_setting_source("OPENCODE_SERVER_PASSWORD") == "environment")
-vim.env.OPENCODE_PORT = tostring(occupied_port)
-vim.env.OPENCODE_SERVER_PASSWORD = secret
+vim.env.OPENCODE_PORT = nil
+vim.env.OPENCODE_SERVER_USERNAME = nil
+vim.env.OPENCODE_SERVER_PASSWORD = nil
+
+write_config({ port = occupied_port, tls_proxy = false })
+assert(lifecycle.load_server_config())
+assert(lifecycle.requested_transport() == "loopback-http", "false tls_proxy was not retained")
+write_config({ port = occupied_port, tls_proxy = true })
+assert(lifecycle.load_server_config())
+assert(lifecycle.requested_transport() == "tls-proxy", "true tls_proxy was not retained")
+for _, value in ipairs({ '"false"', "0", "null", "[]", "{}" }) do
+  write_raw('{"tls_proxy":' .. value .. "}")
+  expect_config_error("tls_proxy must be a JSON Boolean")
+end
+write_config({ port = occupied_port })
+assert(lifecycle.load_server_config())
+assert(lifecycle.requested_transport() == "tls-proxy", "absent tls_proxy stopped defaulting to TLS")
 
 local selected, _, conflict_err = lifecycle.select_port(nil)
 assert(not selected and conflict_err:find("Configured OpenCode port", 1, true), conflict_err)
@@ -105,6 +121,7 @@ vim.env.OPENCODE_PORT = nil
 vim.env.OPENCODE_SERVER_USERNAME = nil
 vim.env.OPENCODE_SERVER_PASSWORD = nil
 assert(lifecycle.load_server_config())
+assert(lifecycle.requested_transport() == "tls-proxy")
 listener:close()
 
 print("opencode server config tests passed")

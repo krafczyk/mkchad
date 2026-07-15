@@ -21,6 +21,8 @@ local server_config_path = vim.g.mkchad_opencode_test_api
   or vim.fs.joinpath(vim.fn.stdpath("config"), "opencode-server.json")
 local server_config_error
 local server_config_applied = {}
+local server_config_tls_proxy = true
+local requested_transport
 
 local ffi_ok, ffi = pcall(require, "ffi")
 if ffi_ok then
@@ -30,7 +32,12 @@ local flock_exclusive = 2
 local flock_nonblocking = 4
 local flock_unlock = 8
 
-local no_password_warning = "WARNING: OPENCODE_SERVER_PASSWORD is not set. TLS authenticates the OpenCode server, not clients; both the public proxy and discoverable internal loopback backend are accessible to other local users. Set a strong existing password in opencode-server.json or the process environment, then stop and restart the shared server."
+local function no_password_warning()
+  if requested_transport and requested_transport() == "loopback-http" then
+    return "WARNING: OPENCODE_SERVER_PASSWORD is not set. The trusted-host direct HTTP endpoint is accessible to other local users and processes; Basic Auth remains optional and does not encrypt loopback traffic. Set a strong existing password in opencode-server.json or the process environment, then stop and restart the shared server."
+  end
+  return "WARNING: OPENCODE_SERVER_PASSWORD is not set. TLS authenticates the OpenCode server, not clients; both the public proxy and discoverable internal loopback backend are accessible to other local users. Set a strong existing password in opencode-server.json or the process environment, then stop and restart the shared server."
+end
 
 local function notify(message, level)
   vim.notify(message, level, { title = "OpenCode" })
@@ -39,7 +46,7 @@ end
 local function warn_no_password()
   if not password_warning_shown and (not vim.env.OPENCODE_SERVER_PASSWORD or vim.env.OPENCODE_SERVER_PASSWORD == "") then
     password_warning_shown = true
-    notify(no_password_warning, vim.log.levels.WARN)
+    notify(no_password_warning(), vim.log.levels.WARN)
   end
 end
 
@@ -53,6 +60,7 @@ local function paths()
     root = root,
     state = vim.fs.joinpath(root, "state.json"),
     pending = vim.fs.joinpath(root, "pending.json"),
+    launch = vim.fs.joinpath(root, "launch.json"),
     log = vim.fs.joinpath(root, "server.log"),
     proxy_log = vim.fs.joinpath(root, "proxy.log"),
     fence = vim.fs.joinpath(root, "lifecycle.fence"),
@@ -64,8 +72,10 @@ local function paths()
     server_store = vim.fs.joinpath(root, "tls", "server.p12"),
     server_cert = vim.fs.joinpath(root, "tls", "server.pem"),
     password = vim.fs.joinpath(root, "tls", "store.password"),
-    proxy_source = vim.fs.joinpath(vim.fn.stdpath("config"), "java", "MkChadTlsProxy.java"),
-    pidfd_helper = vim.fs.joinpath(config_root, "scripts", "opencode_pidfd_signal.py"),
+    proxy_source = vim.g.mkchad_opencode_test_api and vim.g.mkchad_opencode_test_proxy_source
+        or vim.fs.joinpath(config_root, "java", "MkChadTlsProxy.java"),
+    pidfd_helper = vim.g.mkchad_opencode_test_api and vim.g.mkchad_opencode_test_pidfd_helper
+        or vim.fs.joinpath(config_root, "scripts", "opencode_pidfd_signal.py"),
   }
 end
 
@@ -553,6 +563,7 @@ local function load_server_config()
   end
   server_config_applied = {}
   server_config_error = nil
+  server_config_tls_proxy = true
 
   local config = {}
   local metadata, metadata_err = uv.fs_lstat(server_config_path)
@@ -607,7 +618,7 @@ local function load_server_config()
       server_config_error = "must contain one JSON object"
       return nil, server_config_error
     end
-    local allowed = { port = true, username = true, password = true }
+    local allowed = { port = true, username = true, password = true, tls_proxy = true }
     for key in pairs(parsed) do
       if not allowed[key] then
         server_config_error = "contains an unsupported key"
@@ -626,8 +637,14 @@ local function load_server_config()
       server_config_error = "password must be a non-empty control-free string"
       return nil, server_config_error
     end
+    if parsed.tls_proxy ~= nil and type(parsed.tls_proxy) ~= "boolean" then
+      server_config_error = "tls_proxy must be a JSON Boolean"
+      return nil, server_config_error
+    end
     config = parsed
   end
+
+  server_config_tls_proxy = config.tls_proxy ~= false
 
   local settings = {
     { name = "OPENCODE_PORT", value = config.port and tostring(config.port) or nil },
@@ -652,6 +669,10 @@ local function server_setting_source(name)
     return nil
   end
   return server_config_applied[name] == value and "config file" or "environment"
+end
+
+requested_transport = function()
+  return server_config_tls_proxy and "tls-proxy" or "loopback-http"
 end
 
 local function absolute_path(value)
@@ -780,37 +801,74 @@ local function valid_role_relationships(state)
     and proxy.argv[20] == tostring(proxy_max_connections)
 end
 
+local function state_transport(state)
+  if state and state.schema == 2 then
+    return "tls-proxy"
+  end
+  return state and state.transport or nil
+end
+
 local function valid_pending(pending)
-  return type(pending) == "table"
-    and pending.schema == 2
-    and pending.hostname == hostname()
-    and valid_generation(pending.generation)
-    and valid_boot_id(pending.boot_id)
-    and valid_process_record(pending.backend, "backend")
-    and (pending.proxy == nil or valid_process_record(pending.proxy, "proxy"))
-    and valid_role_relationships(pending)
+  if type(pending) ~= "table"
+    or pending.hostname ~= hostname()
+    or not valid_generation(pending.generation)
+    or not valid_boot_id(pending.boot_id)
+    or not valid_process_record(pending.backend, "backend")
+  then
+    return false
+  end
+  if pending.schema == 2 then
+    return (pending.proxy == nil or valid_process_record(pending.proxy, "proxy")) and valid_role_relationships(pending)
+  end
+  if pending.schema == 3 and (pending.transport == "tls-proxy" or pending.transport == "loopback-http") then
+    if pending.transport == "tls-proxy" then
+      return (pending.proxy == nil or valid_process_record(pending.proxy, "proxy")) and valid_role_relationships(pending)
+    end
+    return pending.proxy == nil
+      and is_integer(pending.port, 1, 65535)
+      and pending.backend.port == pending.port
+      and valid_role_relationships(pending)
+  end
+  return false
 end
 
 local function valid_complete_state(state)
   if type(state) ~= "table"
-    or state.schema ~= 2
+    or (state.schema ~= 2 and state.schema ~= 3)
     or state.hostname ~= hostname()
     or not valid_generation(state.generation)
     or state.host ~= host
     or not is_integer(state.port, 1, 65535)
-    or state.url ~= ("https://%s:%d"):format(host, state.port)
     or not vim.tbl_contains({ "explicit", "persisted", "preferred 4096", "fallback" }, state.port_source)
     or type(state.started_at) ~= "string"
     or not absolute_path(state.cwd)
     or not valid_boot_id(state.boot_id)
-    or state.ca_path ~= paths().ca
-    or type(state.certificate_identity) ~= "string"
-    or #state.certificate_identity ~= 64
-    or not state.certificate_identity:match("^[0-9a-f]+$")
-    or not valid_process_record(state.proxy, "proxy")
     or not valid_process_record(state.backend, "backend")
-    or state.proxy.port ~= state.port
   then
+    return false
+  end
+  local transport = state_transport(state)
+  if transport == "tls-proxy" then
+    if state.url ~= ("https://%s:%d"):format(host, state.port)
+      or state.ca_path ~= paths().ca
+      or type(state.certificate_identity) ~= "string"
+      or #state.certificate_identity ~= 64
+      or not state.certificate_identity:match("^[0-9a-f]+$")
+      or not valid_process_record(state.proxy, "proxy")
+      or state.proxy.port ~= state.port
+    then
+      return false
+    end
+  elseif transport == "loopback-http" then
+    if state.url ~= ("http://%s:%d"):format(host, state.port)
+      or state.proxy ~= nil
+      or state.ca_path ~= nil
+      or state.certificate_identity ~= nil
+      or state.backend.port ~= state.port
+    then
+      return false
+    end
+  else
     return false
   end
   local year, month, day, hour, minute, second = state.started_at:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)T(%d%d):(%d%d):(%d%d)Z$")
@@ -858,7 +916,7 @@ local function read_state()
       return nil, "malformed"
     end
     return state, "legacy"
-  elseif type(state.schema) == "number" and state.schema % 1 == 0 and state.schema > 2 then
+  elseif type(state.schema) == "number" and state.schema % 1 == 0 and state.schema > 3 then
     return nil, "unsupported schema"
   elseif not valid_complete_state(state) then
     return nil, "malformed"
@@ -928,7 +986,10 @@ local function curl_quote(value)
 end
 
 local function curl_ca_config(state)
-  if not state or state.schema ~= 2 or type(state.ca_path) ~= "string" then
+  if not state or state_transport(state) == "loopback-http" then
+    return ""
+  end
+  if state_transport(state) ~= "tls-proxy" or type(state.ca_path) ~= "string" then
     return nil
   end
   return 'cacert = "' .. curl_quote(state.ca_path) .. '"\n'
@@ -1440,6 +1501,12 @@ local function process_is_owned(state)
     or state.backend.argv[#state.backend.argv] ~= tostring(state.backend.port)
   then
     return false, "backend argv is not an exact opencode serve command"
+  end
+  if state_transport(state) == "loopback-http" then
+    if state.backend.port ~= state.port then
+      return false, "direct backend public port does not match state"
+    end
+    return true, "verified"
   end
   local proxy_ok, proxy_reason = process_identity_is_owned(state.proxy, state.boot_id)
   if not proxy_ok then
@@ -2472,6 +2539,15 @@ local function write_pending(pending)
   if not owned then
     return nil, ownership_err
   end
+  if vim.g.mkchad_opencode_test_api and vim.g.mkchad_opencode_test_fail_pending_write then
+    return nil, "injected pending write failure"
+  end
+  if vim.g.mkchad_opencode_test_api and is_integer(vim.g.mkchad_opencode_test_fail_pending_write_after, 1, 100) then
+    if vim.g.mkchad_opencode_test_fail_pending_write_after == 1 then
+      return nil, "injected pending write failure"
+    end
+    vim.g.mkchad_opencode_test_fail_pending_write_after = vim.g.mkchad_opencode_test_fail_pending_write_after - 1
+  end
   local temporary = paths().pending .. "." .. random_token() .. ".tmp"
   local wrote, write_err = write_private(temporary, vim.json.encode(pending), true)
   if not wrote then
@@ -2489,6 +2565,71 @@ local function write_pending(pending)
     return nil, rename_err
   end
   return true
+end
+
+local function valid_launch_intent(intent)
+  return type(intent) == "table"
+    and intent.schema == 1
+    and intent.hostname == hostname()
+    and valid_generation(intent.generation)
+    and valid_boot_id(intent.boot_id)
+    and (intent.role == "backend" or intent.role == "proxy")
+    and is_integer(intent.port, 1, 65535)
+    and (intent.pid == nil or is_integer(intent.pid, 1, 4194304))
+end
+
+local function read_launch_intent()
+  local content = read_file(paths().launch)
+  if not content then
+    return nil, "missing"
+  end
+  local ok, intent = pcall(vim.json.decode, content)
+  if not ok or not valid_launch_intent(intent) then
+    return nil, "malformed"
+  end
+  return intent, "valid"
+end
+
+local function write_launch_intent(intent)
+  if not valid_launch_intent(intent) then
+    return nil, "refusing to write malformed launch intent"
+  end
+  local owned, ownership_err = require_lock_ownership("launch intent " .. intent.generation .. " write")
+  if not owned then
+    return nil, ownership_err
+  end
+  local temporary = paths().launch .. "." .. random_token() .. ".tmp"
+  local wrote, write_err = write_private(temporary, vim.json.encode(intent), true)
+  if not wrote then
+    return nil, write_err
+  end
+  owned, ownership_err = require_lock_ownership("launch intent " .. intent.generation .. " publication")
+  if not owned then
+    uv.fs_unlink(temporary)
+    return nil, ownership_err
+  end
+  local renamed, rename_err = uv.fs_rename(temporary, paths().launch)
+  if not renamed then
+    uv.fs_unlink(temporary)
+    return nil, rename_err
+  end
+  return true
+end
+
+local function remove_matching_launch_intent(generation)
+  local owned, ownership_err = require_lock_ownership("launch intent " .. generation .. " removal")
+  if not owned then
+    return nil, ownership_err
+  end
+  local intent, status = read_launch_intent()
+  if not intent then
+    return nil, status == "malformed" and "malformed launch intent requires manual inspection" or "launch intent is missing"
+  end
+  if intent.generation ~= generation then
+    return nil, "launch intent generation changed; refusing stale removal"
+  end
+  local removed, remove_err = uv.fs_unlink(paths().launch)
+  return removed or nil, remove_err
 end
 
 local ensure_waiters = {}
@@ -2557,6 +2698,7 @@ local function ensure_local_tui(state, callback)
     and local_tui.url == state.url
     and local_tui.directory == cwd
     and local_tui.generation == state.generation
+    and local_tui.transport == state_transport(state)
     and local_tui.certificate_identity == state.certificate_identity
   then
     callback(true)
@@ -2564,10 +2706,11 @@ local function ensure_local_tui(state, callback)
   end
   close_local_tui()
   local command = { "opencode", "attach", state.url, "--dir", cwd }
-  local term, created = require("snacks.terminal").get(
-    command,
-    vim.tbl_deep_extend("force", terminal_opts(), { create = true, env = { NODE_EXTRA_CA_CERTS = state.ca_path } })
-  )
+  local environment = state_transport(state) == "tls-proxy" and { NODE_EXTRA_CA_CERTS = state.ca_path } or nil
+  local term, created = require("snacks.terminal").get(command, vim.tbl_deep_extend("force", terminal_opts(), {
+    create = true,
+    env = environment,
+  }))
   if not term then
     callback(false, "Unable to create the local OpenCode attached TUI")
     return
@@ -2587,6 +2730,7 @@ local function ensure_local_tui(state, callback)
     url = state.url,
     directory = cwd,
     generation = state.generation,
+    transport = state_transport(state),
     certificate_identity = state.certificate_identity,
     command = command,
   }
@@ -2621,27 +2765,42 @@ local function managed_state_if_healthy(state, requested, callback)
     callback(nil, { kind = "legacy", message = "schema 1 is legacy and is never probed" })
     return
   end
+  if state_transport(state) ~= requested_transport() then
+    callback(nil, {
+      kind = "mode-mismatch",
+      message = "Requested "
+        .. requested_transport()
+        .. " differs from active "
+        .. state_transport(state)
+        .. "; run :OpenCodeStop, restart Neovim, and start OpenCode again",
+    })
+    return
+  end
   local owned, ownership = process_is_owned(state)
   if not owned then
     local proxy_live = state.proxy and pid_is_live(state.proxy.pid)
     local backend_live = state.backend and pid_is_live(state.backend.pid)
-    if not proxy_live or not backend_live then
+    if state_transport(state) == "loopback-http" and not backend_live then
       callback(nil, { kind = "owned-unhealthy", message = ownership })
-    elseif proxy_live or backend_live then
+    elseif state_transport(state) == "tls-proxy" and (not proxy_live or not backend_live) then
+      callback(nil, { kind = "owned-unhealthy", message = ownership })
+    else
       callback(nil, { kind = "unverifiable-pid", message = ownership })
     end
     return
   end
-  if not process_listens_on_port(state.proxy.pid, state.port)
-    or not process_listens_on_port(state.backend.pid, state.backend.port)
+  if not process_listens_on_port(state.backend.pid, state.backend.port)
+    or (state_transport(state) == "tls-proxy" and not process_listens_on_port(state.proxy.pid, state.port))
   then
-    callback(nil, { kind = "owned-unhealthy", message = "proxy or backend listener ownership is missing" })
+    callback(nil, { kind = "owned-unhealthy", message = "managed listener ownership is missing" })
     return
   end
-  local identity = certificate_identity(paths())
-  if state.ca_path ~= paths().ca or not identity or identity ~= state.certificate_identity then
-    callback(nil, { kind = "owned-unhealthy", message = "certificate identity changed or is unavailable" })
-    return
+  if state_transport(state) == "tls-proxy" then
+    local identity = certificate_identity(paths())
+    if state.ca_path ~= paths().ca or not identity or identity ~= state.certificate_identity then
+      callback(nil, { kind = "owned-unhealthy", message = "certificate identity changed or is unavailable" })
+      return
+    end
   end
   probe_health(state, function(health, detail)
     if detail.kind == "unauthorized" then
@@ -2716,6 +2875,20 @@ local function read_pending()
     return nil, "malformed"
   end
   return pending, "valid"
+end
+
+local function launch_intent_is_covered(intent, pending)
+  if not intent
+    or not pending
+    or intent.generation ~= pending.generation
+    or intent.boot_id ~= pending.boot_id
+  then
+    return false
+  end
+  local process = intent.role == "backend" and pending.backend or pending.proxy
+  return process ~= nil
+    and process.port == intent.port
+    and (intent.pid == nil or process.pid == intent.pid)
 end
 
 local function matching_pending_while_locked(generation, action)
@@ -2801,7 +2974,222 @@ local function cleanup_failed_pair(state, deadline_ns, callback)
   end)
 end
 
+local function spawn_direct(previous, deadline_ns, callback, excluded_public)
+  local fenced, fence_err = require_fence("managed direct backend launch")
+  if not fenced then
+    callback(nil, fence_err)
+    return
+  end
+  local state_paths = paths()
+  resolve_executable(deadline_ns, function(executable, version, executable_err)
+    if not executable then
+      callback(nil, executable_err or "Unable to find OpenCode on PATH")
+      return
+    end
+    local backend_executable = file_identity(executable)
+    if not backend_executable then
+      callback(nil, "Unable to record backend executable identity before launch")
+      return
+    end
+    local public_port, source, public_err = select_port(previous, excluded_public)
+    if not public_port then
+      callback(nil, public_err .. "; see " .. state_paths.log)
+      return
+    end
+    local boot_id = current_boot_id()
+    if not boot_id then
+      callback(nil, "Unable to read the host boot identity")
+      return
+    end
+    local generation = random_token()
+    local launch_intent = {
+      schema = 1,
+      hostname = hostname(),
+      generation = generation,
+      boot_id = boot_id,
+      role = "backend",
+      port = public_port,
+    }
+    local intent_ok, intent_err = write_launch_intent(launch_intent)
+    if not intent_ok then
+      callback(nil, "Unable to record direct backend launch intent: " .. (intent_err or "unknown error"))
+      return
+    end
+    local backend_pid, backend_spawn_err = spawn_detached(
+      executable,
+      { "serve", "--hostname", host, "--port", tostring(public_port) },
+      state_paths.log
+    )
+    if not backend_pid then
+      local removed, remove_err = remove_matching_launch_intent(generation)
+      callback(
+        nil,
+        "Unable to launch OpenCode backend: "
+          .. backend_spawn_err
+          .. (remove_err and "; launch intent removal failed: " .. remove_err or "")
+          .. "; see "
+          .. state_paths.log,
+        removed and public_port or nil
+      )
+      return
+    end
+    launch_intent.pid = backend_pid
+    write_launch_intent(launch_intent)
+    vim.defer_fn(function()
+      local backend, capture_err = capture_process(backend_pid, {
+        port = public_port,
+        executable = executable,
+        executable_dev = backend_executable.dev,
+        executable_ino = backend_executable.ino,
+        local_version = version,
+        log = state_paths.log,
+      })
+      if not backend then
+        local live = pid_is_live(backend_pid)
+        local removed, remove_err
+        if not live then
+          removed, remove_err = remove_matching_launch_intent(generation)
+        end
+        callback(
+          nil,
+          "OpenCode backend "
+            .. capture_err
+            .. (live and "; spawned PID remains live and requires manual accounting" or "")
+            .. (remove_err and "; launch intent removal failed: " .. remove_err or "")
+            .. "; see "
+            .. state_paths.log,
+          removed and public_port or nil
+        )
+        return
+      end
+      local pending = {
+        schema = 3,
+        transport = "loopback-http",
+        hostname = hostname(),
+        generation = generation,
+        boot_id = boot_id,
+        port = public_port,
+        backend = backend,
+      }
+      local pending_ok, pending_err = write_pending(pending)
+      if not pending_ok then
+        terminate_process(backend, boot_id, deadline_ns, function(cleaned, cleanup_err)
+          local intent_removed, intent_remove_err
+          if cleaned then
+            intent_removed, intent_remove_err = remove_matching_launch_intent(generation)
+          end
+          callback(
+            nil,
+            "Unable to record pending backend identity: "
+              .. (pending_err or "unknown error")
+              .. (cleanup_err and "; backend cleanup refused: " .. cleanup_err or "")
+              .. (intent_remove_err and "; launch intent removal failed: " .. intent_remove_err or ""),
+            cleaned and intent_removed and public_port or nil
+          )
+        end)
+        return
+      end
+      local intent_removed, intent_remove_err = remove_matching_launch_intent(generation)
+      if not intent_removed then
+        cleanup_failed_pair(pending, deadline_ns, function(_, cleanup_err)
+          callback(
+            nil,
+            "Pending backend identity was recorded but launch intent removal failed: "
+              .. (intent_remove_err or "unknown error")
+              .. (cleanup_err and "; " .. cleanup_err or "")
+          )
+        end)
+        return
+      end
+      wait_for_listener(backend, boot_id, public_port, deadline_ns, function(backend_ready, backend_err)
+        if not backend_ready then
+          cleanup_failed_pair(pending, deadline_ns, function(cleaned, cleanup_err)
+            callback(
+              nil,
+              "OpenCode direct backend listener failed: "
+                .. backend_err
+                .. (cleanup_err and "; " .. cleanup_err or "")
+                .. "; see "
+                .. state_paths.log,
+              cleaned and public_port or nil
+            )
+          end)
+          return
+        end
+        local state = {
+          schema = 3,
+          transport = "loopback-http",
+          hostname = hostname(),
+          generation = generation,
+          host = host,
+          port = public_port,
+          url = ("http://%s:%d"):format(host, public_port),
+          port_source = source,
+          started_at = iso_now(),
+          cwd = vim.env.HOME or vim.fn.expand("~"),
+          boot_id = boot_id,
+          backend = backend,
+        }
+        local function wait_for_health()
+          local backend_owned = process_is_owned(state)
+          if not backend_owned or not process_listens_on_port(backend.pid, public_port) then
+            cleanup_failed_pair(state, deadline_ns, function(cleaned, cleanup_err)
+              callback(
+                nil,
+                "Managed direct backend identity was lost before readiness" .. (cleanup_err and "; " .. cleanup_err or ""),
+                cleaned and public_port or nil
+              )
+            end)
+            return
+          end
+          probe_health(state, function(health, detail)
+            if health then
+              state.backend.server_version = health.version
+              local wrote, state_err = write_state_while_locked(state, "complete schema-3 direct state publication")
+              if not wrote then
+                cleanup_failed_pair(state, deadline_ns, function(cleaned, cleanup_err)
+                  callback(nil, state_err .. (cleanup_err and "; " .. cleanup_err or ""), cleaned and public_port or nil)
+                end)
+                return
+              end
+              local removed, remove_err = remove_matching_pending_while_locked(
+                generation,
+                "successful direct pending generation removal"
+              )
+              if not removed then
+                callback(nil, "Complete direct state was published but pending metadata could not be removed: " .. remove_err)
+                return
+              end
+              callback(state)
+            elseif uv.hrtime() >= deadline_ns or detail.kind == "unauthorized" then
+              cleanup_failed_pair(state, deadline_ns, function(cleaned, cleanup_err)
+                callback(
+                  nil,
+                  "Direct HTTP health failed ("
+                    .. detail.kind
+                    .. (detail.message and ": " .. detail.message or "")
+                    .. (cleanup_err and "; " .. cleanup_err or "")
+                    .. "; see "
+                    .. state_paths.log,
+                  cleaned and public_port or nil
+                )
+              end)
+            else
+              vim.defer_fn(wait_for_health, health_interval_ms)
+            end
+          end, true)
+        end
+        wait_for_health()
+      end)
+    end, 50)
+  end)
+end
+
 local function spawn_pair(previous, deadline_ns, callback, excluded_public, excluded_internal)
+  if requested_transport() == "loopback-http" then
+    spawn_direct(previous, deadline_ns, callback, excluded_public)
+    return
+  end
   local fenced, fence_err = require_fence("managed pair launch")
   if not fenced then
     callback(nil, fence_err)
@@ -2853,15 +3241,40 @@ local function spawn_pair(previous, deadline_ns, callback, excluded_public, excl
     return
   end
   local generation = random_token()
+  local backend_intent = {
+    schema = 1,
+    hostname = hostname(),
+    generation = generation,
+    boot_id = boot_id,
+    role = "backend",
+    port = internal_port,
+  }
+  local intent_ok, intent_err = write_launch_intent(backend_intent)
+  if not intent_ok then
+    callback(nil, "Unable to record TLS backend launch intent: " .. (intent_err or "unknown error"))
+    return
+  end
   local backend_pid, backend_spawn_err = spawn_detached(
     executable,
     { "serve", "--hostname", host, "--port", tostring(internal_port) },
     state_paths.log
   )
   if not backend_pid then
-    callback(nil, "Unable to launch OpenCode backend: " .. backend_spawn_err .. "; see " .. state_paths.log, nil, internal_port)
+    local removed, remove_err = remove_matching_launch_intent(generation)
+    callback(
+      nil,
+      "Unable to launch OpenCode backend: "
+        .. backend_spawn_err
+        .. (remove_err and "; launch intent removal failed: " .. remove_err or "")
+        .. "; see "
+        .. state_paths.log,
+      nil,
+      removed and internal_port or nil
+    )
     return
   end
+  backend_intent.pid = backend_pid
+  write_launch_intent(backend_intent)
   vim.defer_fn(function()
     local backend, capture_err = capture_process(backend_pid, {
       port = internal_port,
@@ -2872,11 +3285,27 @@ local function spawn_pair(previous, deadline_ns, callback, excluded_public, excl
       log = state_paths.log,
     })
     if not backend then
-      callback(nil, "OpenCode backend " .. capture_err .. "; see " .. state_paths.log, nil, internal_port)
+      local live = pid_is_live(backend_pid)
+      local removed, remove_err
+      if not live then
+        removed, remove_err = remove_matching_launch_intent(generation)
+      end
+      callback(
+        nil,
+        "OpenCode backend "
+          .. capture_err
+          .. (live and "; spawned PID remains live and requires manual accounting" or "")
+          .. (remove_err and "; launch intent removal failed: " .. remove_err or "")
+          .. "; see "
+          .. state_paths.log,
+        nil,
+        removed and internal_port or nil
+      )
       return
     end
     local pending = {
-      schema = 2,
+        schema = 3,
+        transport = "tls-proxy",
       hostname = hostname(),
       generation = generation,
       boot_id = boot_id,
@@ -2884,24 +3313,43 @@ local function spawn_pair(previous, deadline_ns, callback, excluded_public, excl
     }
     local pending_ok, pending_err = write_pending(pending)
     if not pending_ok then
-      terminate_process(backend, boot_id, deadline_ns, function(_, cleanup_err)
+      terminate_process(backend, boot_id, deadline_ns, function(cleaned, cleanup_err)
+        local intent_removed, intent_remove_err
+        if cleaned then
+          intent_removed, intent_remove_err = remove_matching_launch_intent(generation)
+        end
         callback(
           nil,
           "Unable to record pending backend identity: "
             .. (pending_err or "unknown error")
             .. (cleanup_err and "; backend cleanup refused: " .. cleanup_err or "")
+            .. (intent_remove_err and "; launch intent removal failed: " .. intent_remove_err or ""),
+          nil,
+          cleaned and intent_removed and internal_port or nil
+        )
+      end)
+      return
+    end
+    local backend_intent_removed, backend_intent_remove_err = remove_matching_launch_intent(generation)
+    if not backend_intent_removed then
+      cleanup_failed_pair(pending, deadline_ns, function(_, cleanup_err)
+        callback(
+          nil,
+          "Pending backend identity was recorded but launch intent removal failed: "
+            .. (backend_intent_remove_err or "unknown error")
+            .. (cleanup_err and "; " .. cleanup_err or "")
         )
       end)
       return
     end
     wait_for_listener(backend, boot_id, internal_port, deadline_ns, function(backend_ready, backend_err)
       if not backend_ready then
-        cleanup_failed_pair(pending, deadline_ns, function(_, cleanup_err)
+        cleanup_failed_pair(pending, deadline_ns, function(cleaned, cleanup_err)
           callback(
             nil,
             "OpenCode backend listener failed: " .. backend_err .. (cleanup_err and "; " .. cleanup_err or "") .. "; see " .. state_paths.log,
             nil,
-            internal_port
+            cleaned and internal_port or nil
           )
         end)
         return
@@ -2927,17 +3375,45 @@ local function spawn_pair(previous, deadline_ns, callback, excluded_public, excl
         "--max-connections",
         tostring(proxy_max_connections),
       }
-      local proxy_pid, proxy_spawn_err = spawn_detached(java, proxy_arguments, state_paths.proxy_log)
-      if not proxy_pid then
+      local proxy_intent = {
+        schema = 1,
+        hostname = hostname(),
+        generation = generation,
+        boot_id = boot_id,
+        role = "proxy",
+        port = public_port,
+      }
+      local proxy_intent_ok, proxy_intent_err = write_launch_intent(proxy_intent)
+      if not proxy_intent_ok then
         cleanup_failed_pair(pending, deadline_ns, function(_, cleanup_err)
           callback(
             nil,
-            "Unable to launch TLS proxy: " .. proxy_spawn_err .. (cleanup_err and "; " .. cleanup_err or "") .. "; see " .. state_paths.proxy_log,
-            public_port
+            "Unable to record TLS proxy launch intent: "
+              .. (proxy_intent_err or "unknown error")
+              .. (cleanup_err and "; " .. cleanup_err or "")
           )
         end)
         return
       end
+      local proxy_pid, proxy_spawn_err = spawn_detached(java, proxy_arguments, state_paths.proxy_log)
+      if not proxy_pid then
+        local intent_removed, intent_remove_err = remove_matching_launch_intent(generation)
+        cleanup_failed_pair(pending, deadline_ns, function(cleaned, cleanup_err)
+          callback(
+            nil,
+            "Unable to launch TLS proxy: "
+              .. proxy_spawn_err
+              .. (intent_remove_err and "; launch intent removal failed: " .. intent_remove_err or "")
+              .. (cleanup_err and "; " .. cleanup_err or "")
+              .. "; see "
+              .. state_paths.proxy_log,
+            cleaned and intent_removed and public_port or nil
+          )
+        end)
+        return
+      end
+      proxy_intent.pid = proxy_pid
+      write_launch_intent(proxy_intent)
       vim.defer_fn(function()
         local proxy, proxy_capture_err = capture_process(proxy_pid, {
           port = public_port,
@@ -2950,40 +3426,92 @@ local function spawn_pair(previous, deadline_ns, callback, excluded_public, excl
           log = state_paths.proxy_log,
         })
         if not proxy then
-          cleanup_failed_pair(pending, deadline_ns, function(_, cleanup_err)
+          if pid_is_live(proxy_pid) then
             callback(
               nil,
-              "TLS proxy " .. proxy_capture_err .. (cleanup_err and "; " .. cleanup_err or "") .. "; see " .. state_paths.proxy_log,
-              public_port
+              "TLS proxy "
+                .. proxy_capture_err
+                .. "; spawned PID remains live and requires manual accounting; pending backend metadata was preserved; see "
+                .. state_paths.proxy_log
             )
-          end)
+          else
+            local intent_removed, intent_remove_err = remove_matching_launch_intent(generation)
+            cleanup_failed_pair(pending, deadline_ns, function(cleaned, cleanup_err)
+              callback(
+                nil,
+                "TLS proxy "
+                  .. proxy_capture_err
+                  .. (intent_remove_err and "; launch intent removal failed: " .. intent_remove_err or "")
+                  .. (cleanup_err and "; " .. cleanup_err or "")
+                  .. "; see "
+                  .. state_paths.proxy_log,
+                cleaned and intent_removed and public_port or nil
+              )
+            end)
+          end
           return
         end
         pending.proxy = proxy
         local updated, update_err = write_pending(pending)
         if not updated then
+          terminate_process(proxy, boot_id, deadline_ns, function(proxy_stopped, proxy_stop_err)
+            if not proxy_stopped then
+              callback(
+                nil,
+                "Unable to record pending proxy identity: "
+                  .. (update_err or "unknown error")
+                  .. "; proxy cleanup refused: "
+                  .. (proxy_stop_err or "unknown error")
+              )
+              return
+            end
+            local intent_removed, intent_remove_err = remove_matching_launch_intent(generation)
+            if not intent_removed then
+              callback(
+                nil,
+                "Unable to record pending proxy identity: "
+                  .. (update_err or "unknown error")
+                  .. "; launch intent removal failed: "
+                  .. (intent_remove_err or "unknown error")
+              )
+              return
+            end
+            cleanup_failed_pair(pending, deadline_ns, function(cleaned, cleanup_err)
+              callback(
+                nil,
+                "Unable to record pending proxy identity: " .. (update_err or "unknown error") .. (cleanup_err and "; " .. cleanup_err or ""),
+                cleaned and public_port or nil
+              )
+            end)
+          end)
+          return
+        end
+        local proxy_intent_removed, proxy_intent_remove_err = remove_matching_launch_intent(generation)
+        if not proxy_intent_removed then
           cleanup_failed_pair(pending, deadline_ns, function(_, cleanup_err)
             callback(
               nil,
-              "Unable to record pending proxy identity: " .. (update_err or "unknown error") .. (cleanup_err and "; " .. cleanup_err or ""),
-              public_port
+              "Pending proxy identity was recorded but launch intent removal failed: "
+                .. (proxy_intent_remove_err or "unknown error")
+                .. (cleanup_err and "; " .. cleanup_err or "")
             )
           end)
           return
         end
         wait_for_listener(proxy, boot_id, public_port, deadline_ns, function(proxy_ready, proxy_err)
           if not proxy_ready then
-            cleanup_failed_pair(pending, deadline_ns, function(_, cleanup_err)
+            cleanup_failed_pair(pending, deadline_ns, function(cleaned, cleanup_err)
               callback(
                 nil,
                 "TLS proxy listener failed: " .. proxy_err .. (cleanup_err and "; " .. cleanup_err or "") .. "; see " .. state_paths.proxy_log,
-                public_port
+                cleaned and public_port or nil
               )
             end)
             return
           end
           local state = {
-            schema = 2,
+            schema = 3,
+            transport = "tls-proxy",
             hostname = hostname(),
             generation = generation,
             host = host,
@@ -3012,7 +3540,7 @@ local function spawn_pair(previous, deadline_ns, callback, excluded_public, excl
             probe_health(state, function(health, detail)
               if health then
                 state.backend.server_version = health.version
-                local wrote, state_err = write_state_while_locked(state, "complete schema-2 state publication")
+                local wrote, state_err = write_state_while_locked(state, "complete schema-3 TLS state publication")
                 if not wrote then
                   cleanup_failed_pair(state, deadline_ns, function(_, cleanup_err)
                     callback(nil, state_err .. (cleanup_err and "; " .. cleanup_err or ""))
@@ -3082,12 +3610,42 @@ local function ensure_backend(callback)
       return detail.message
     elseif detail.kind == "unverifiable-pid" then
       return "Refusing to replace a live unverifiable managed process: " .. (detail.message or "ownership mismatch")
+    elseif detail.kind == "mode-mismatch" then
+      return detail.message
     end
   end
   local function start_while_locked(attempt, excluded_public, excluded_internal)
     if not require_lock_ownership("startup critical section") then
       release_lock()
       finish_ensure(false, "OpenCode startup lock ownership was lost before the critical section")
+      return
+    end
+    local unresolved_intent, unresolved_status = read_launch_intent()
+    if unresolved_status ~= "missing" then
+      local covered_pending = read_pending()
+      if launch_intent_is_covered(unresolved_intent, covered_pending) then
+        local removed, remove_err = remove_matching_launch_intent(unresolved_intent.generation)
+        if not removed then
+          release_lock()
+          finish_ensure(false, "Unable to reconcile covered launch intent: " .. (remove_err or "unknown error"))
+          return
+        end
+        unresolved_intent, unresolved_status = nil, "missing"
+      end
+    end
+    if unresolved_status ~= "missing" then
+      release_lock()
+      finish_ensure(
+        false,
+        unresolved_intent
+            and ("Refusing startup while unresolved "
+              .. unresolved_intent.role
+              .. " launch intent "
+              .. unresolved_intent.generation
+              .. (unresolved_intent.pid and (" records PID " .. unresolved_intent.pid) or "")
+              .. "; use trusted OS process accounting before retrying")
+          or ("Refusing startup because malformed launch intent requires manual inspection: " .. paths().launch)
+      )
       return
     end
     local locked_state, locked_status = read_state()
@@ -3280,9 +3838,45 @@ local function stop_shared_server()
     end
     local state, state_status = read_state()
     if not state then
+      local intent, intent_status = read_launch_intent()
+      local pending = read_pending()
+      if launch_intent_is_covered(intent, pending) then
+        local removed, remove_err = remove_matching_launch_intent(intent.generation)
+        if not removed then
+          release_lock()
+          notify("Unable to reconcile covered launch intent: " .. (remove_err or "unknown error"), vim.log.levels.ERROR)
+          return
+        end
+        cleanup_pending(uv.hrtime() + startup_timeout_ms * 1000000, function(cleaned, cleanup_err)
+          release_lock()
+          if not cleaned then
+            notify("Unable to stop covered pending generation: " .. (cleanup_err or "unknown error"), vim.log.levels.ERROR)
+            return
+          end
+          close_local_tui()
+          notify("Stopped pending OpenCode generation after launch-intent reconciliation", vim.log.levels.INFO)
+        end)
+        return
+      end
       release_lock()
       close_local_tui()
-      notify("No managed shared OpenCode server is active (state " .. state_status .. ")", vim.log.levels.INFO)
+      if intent_status ~= "missing" then
+        notify(
+          intent
+              and ("Refusing stop without signal authority for unresolved "
+                .. intent.role
+                .. " launch intent "
+                .. intent.generation
+                .. (intent.pid and (" recording PID " .. intent.pid) or "")
+                .. "; use trusted OS process accounting and remove "
+                .. paths().launch
+                .. " only after the role is confirmed dead")
+            or ("Malformed launch intent requires manual inspection: " .. paths().launch),
+          vim.log.levels.WARN
+        )
+      else
+        notify("No managed shared OpenCode server is active (state " .. state_status .. ")", vim.log.levels.INFO)
+      end
       return
     end
     if state.schema == 1 then
@@ -3304,8 +3898,18 @@ local function stop_shared_server()
       return
     end
     local owned, ownership = process_is_owned(state)
+    -- One dead TLS role must not prevent explicit cleanup of the separately
+    -- verified survivor. stop_pair signals only identities that are still live.
+    if not owned and state_transport(state) == "tls-proxy" then
+      if not pid_is_live(state.proxy.pid) then
+        owned, ownership = process_identity_is_owned(state.backend, state.boot_id)
+      elseif not pid_is_live(state.backend.pid) then
+        owned, ownership = process_identity_is_owned(state.proxy, state.boot_id)
+      end
+    end
     if not owned then
-      if not pid_is_live(state.proxy.pid) and not pid_is_live(state.backend.pid) then
+      local proxy_dead = state_transport(state) ~= "tls-proxy" or not pid_is_live(state.proxy.pid)
+      if proxy_dead and not pid_is_live(state.backend.pid) then
         local removed, remove_err = remove_matching_state_while_locked(state.generation, "stopped generation state removal")
         if not removed then
           release_lock()
@@ -3324,7 +3928,7 @@ local function stop_shared_server()
     stop_pair(state, uv.hrtime() + startup_timeout_ms * 1000000, function(stopped, stop_err)
       if not stopped then
         release_lock()
-        notify("Refusing to stop shared OpenCode pair: " .. (stop_err or "unknown error"), vim.log.levels.ERROR)
+        notify("Refusing to stop shared OpenCode server: " .. (stop_err or "unknown error"), vim.log.levels.ERROR)
         return
       end
       local removed, remove_err = remove_matching_state_while_locked(state.generation, "stopped generation state removal")
@@ -3334,7 +3938,10 @@ local function stop_shared_server()
         return
       end
       close_local_tui()
-      notify("Stopped shared OpenCode proxy and backend", vim.log.levels.INFO)
+      notify(
+        state_transport(state) == "tls-proxy" and "Stopped shared OpenCode proxy and backend" or "Stopped shared OpenCode direct backend",
+        vim.log.levels.INFO
+      )
     end)
   end)
 end
@@ -3436,7 +4043,8 @@ local function reload_current_directory(callback)
           fail("managed-state validation", recheck_detail and recheck_detail.kind)
           return
         end
-        if rechecked.proxy.pid ~= healthy_state.proxy.pid
+        if state_transport(rechecked) ~= state_transport(healthy_state)
+          or (state_transport(rechecked) == "tls-proxy" and rechecked.proxy.pid ~= healthy_state.proxy.pid)
           or rechecked.backend.pid ~= healthy_state.backend.pid
           or rechecked.generation ~= healthy_state.generation
           or rechecked.url ~= healthy_state.url
@@ -3520,7 +4128,8 @@ local function reload_current_directory(callback)
                                 end
                                 local final_state = read_state()
                                 if not final_state
-                                  or final_state.proxy.pid ~= rechecked.proxy.pid
+                                  or state_transport(final_state) ~= state_transport(rechecked)
+                                  or (state_transport(final_state) == "tls-proxy" and final_state.proxy.pid ~= rechecked.proxy.pid)
                                   or final_state.backend.pid ~= rechecked.backend.pid
                                   or final_state.generation ~= rechecked.generation
                                   or final_state.url ~= rechecked.url
@@ -3556,7 +4165,7 @@ local function reload_current_directory(callback)
   end)
 end
 
-local function render_info(state, state_status, configured, configured_err, url, executable, local_version)
+local function render_info(state, state_status, launch_intent, launch_status, configured, configured_err, url, executable, local_version)
   local port_source = server_setting_source("OPENCODE_PORT")
     or (state and state.port_source)
     or "preferred 4096 on first use"
@@ -3564,6 +4173,15 @@ local function render_info(state, state_status, configured, configured_err, url,
     "State directory: " .. paths().root,
     "Server config: " .. server_config_path,
     "State status: " .. state_status,
+    "Launch intent: "
+      .. (launch_intent
+          and (launch_intent.role
+            .. "; generation "
+            .. launch_intent.generation
+            .. (launch_intent.pid and ("; PID " .. launch_intent.pid) or "; PID unavailable"))
+        or launch_status),
+    "Requested transport: " .. requested_transport(),
+    "Active transport: " .. (state_transport(state) or "inactive"),
     "URL: " .. (url or "inactive"),
     "Port source: " .. port_source,
     "Local version: " .. (executable and local_version or "unavailable"),
@@ -3574,17 +4192,28 @@ local function render_info(state, state_status, configured, configured_err, url,
           and ("valid; " .. local_tui.url .. "; " .. local_tui.directory .. "; generation " .. local_tui.generation)
         or "absent"),
     "TUI API presence: unknown/unsupported",
-    "CA certificate: " .. (state and state.schema == 2 and state.ca_path or paths().ca),
-    "Backend log: " .. (state and state.schema == 2 and state.backend.log or paths().log),
-    "Proxy log: " .. paths().proxy_log,
+    "CA certificate: " .. (state_transport(state) == "tls-proxy" and state.ca_path or "inactive; retained material may exist at " .. paths().ca),
+    "Backend log: " .. (state and state.backend and state.backend.log or paths().log),
+    "Proxy log: " .. (state_transport(state) == "tls-proxy" and state.proxy.log or "inactive; retained log at " .. paths().proxy_log),
     "Client authentication: "
       .. ((vim.env.OPENCODE_SERVER_PASSWORD and vim.env.OPENCODE_SERVER_PASSWORD ~= "")
           and ("OpenCode Basic Auth password is configured by "
             .. (server_setting_source("OPENCODE_SERVER_PASSWORD") or "the process environment"))
-        or no_password_warning),
+          or no_password_warning()),
   }
   if configured_err then
     table.insert(lines, "Port error: " .. configured_err)
+  end
+  local active_transport = state_transport(state)
+  if active_transport and active_transport ~= requested_transport() then
+    table.insert(
+      lines,
+      "Mode mismatch: requested "
+        .. requested_transport()
+        .. ", active "
+        .. active_transport
+        .. "; run :OpenCodeStop, restart Neovim, and start OpenCode again"
+    )
   end
   if state then
     local owned, ownership = process_is_owned(state)
@@ -3596,12 +4225,12 @@ local function render_info(state, state_status, configured, configured_err, url,
       })
     else
       vim.list_extend(lines, {
-        "Proxy PID: " .. state.proxy.pid,
+        "Proxy PID: " .. (state_transport(state) == "tls-proxy" and state.proxy.pid or "inactive"),
         "Backend PID: " .. state.backend.pid,
-        "Backend internal port: " .. state.backend.port,
+        "Backend port: " .. state.backend.port,
         "Pair identity: " .. ownership,
         "Generation: " .. state.generation,
-        "Certificate identity: " .. state.certificate_identity,
+        "Certificate identity: " .. (state.certificate_identity or "inactive"),
         "Started: " .. state.started_at,
       })
     end
@@ -3609,23 +4238,30 @@ local function render_info(state, state_status, configured, configured_err, url,
       table.insert(lines, "PID warning: state must not be used to signal this process")
     end
   end
-  if not state or state.schema ~= 2 then
-    table.insert(lines, "HTTPS endpoint: " .. (state_status == "legacy" and "legacy state blocked" or "inactive/untrusted"))
+  if not state or (state.schema ~= 2 and state.schema ~= 3) then
+    table.insert(lines, "Managed endpoint: " .. (state_status == "legacy" and "legacy state blocked" or "inactive/untrusted"))
     notify(table.concat(lines, "\n"), vim.log.levels.INFO)
     return
   end
   local authenticated = state.url == url
     and process_is_owned(state)
-    and process_listens_on_port(state.proxy.pid, state.port)
     and process_listens_on_port(state.backend.pid, state.backend.port)
+    and (state_transport(state) ~= "tls-proxy" or process_listens_on_port(state.proxy.pid, state.port))
     or false
   if not authenticated then
-    table.insert(lines, "HTTPS endpoint: ownership or listener validation failed; no request sent")
+    table.insert(lines, "Managed endpoint: ownership or listener validation failed; no request sent")
+    notify(table.concat(lines, "\n"), vim.log.levels.WARN)
+    return
+  end
+  if state_transport(state) == "tls-proxy"
+    and (state.ca_path ~= paths().ca or certificate_identity(paths()) ~= state.certificate_identity)
+  then
+    table.insert(lines, "Managed endpoint: certificate identity validation failed; no request sent")
     notify(table.concat(lines, "\n"), vim.log.levels.WARN)
     return
   end
   probe_health(state, function(health, detail)
-    table.insert(lines, "HTTPS endpoint: " .. detail.kind)
+    table.insert(lines, (state_transport(state) == "tls-proxy" and "HTTPS" or "HTTP") .. " endpoint: " .. detail.kind)
     table.insert(lines, "Health latency: " .. detail.latency_ms .. "ms")
     if health then
       table.insert(lines, "Server version: " .. (health.version or "unknown"))
@@ -3639,10 +4275,12 @@ end
 
 local function show_info()
   local state, state_status = read_state()
+  local launch_intent, launch_status = read_launch_intent()
   local configured, configured_err = explicit_port()
-  local url = configured and ("https://%s:%d"):format(host, configured) or (state and state.url)
+  local scheme = requested_transport() == "tls-proxy" and "https" or "http"
+  local url = state and state.url or (configured and ("%s://%s:%d"):format(scheme, host, configured))
   resolve_executable(uv.hrtime() + subprocess_timeout_ms * 1000000, function(executable, local_version)
-    render_info(state, state_status, configured, configured_err, url, executable, local_version)
+    render_info(state, state_status, launch_intent, launch_status, configured, configured_err, url, executable, local_version)
   end)
 end
 
@@ -3701,7 +4339,7 @@ vim.g.opencode_opts = {
   server = {
     url = function(callback)
       local state = read_state()
-      callback(state and state.schema == 2 and state.url or nil)
+      callback(state and (state.schema == 2 or state.schema == 3) and state.url or nil)
     end,
     ensure = function(callback)
       ensure_backend(function(ok, err)
@@ -3710,7 +4348,7 @@ vim.g.opencode_opts = {
     end,
     ca_cert = function()
       local state = read_state()
-      return state and state.schema == 2 and state.ca_path or nil
+      return state and state_transport(state) == "tls-proxy" and state.ca_path or nil
     end,
     start = false,
   },
@@ -3762,6 +4400,8 @@ if vim.g.mkchad_opencode_test_api then
     load_server_config = load_server_config,
     server_config_path = server_config_path,
     server_setting_source = server_setting_source,
+    requested_transport = requested_transport,
+    state_transport = state_transport,
     terminate_process = terminate_process,
     stop_pair = stop_pair,
     stop_legacy = stop_legacy,
@@ -3778,7 +4418,10 @@ if vim.g.mkchad_opencode_test_api then
     process_identity_is_owned = process_identity_is_owned,
     read_state = read_state,
     read_pending = read_pending,
+    read_launch_intent = read_launch_intent,
     write_pending = write_pending,
+    write_launch_intent = write_launch_intent,
+    remove_matching_launch_intent = remove_matching_launch_intent,
     remove_matching_pending_while_locked = remove_matching_pending_while_locked,
     write_state = write_state_while_locked,
     remove_matching_state_while_locked = remove_matching_state_while_locked,

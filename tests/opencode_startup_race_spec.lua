@@ -1,5 +1,12 @@
 local config = assert(arg[1], "pass the MkChad config path")
 vim.g.mkchad_opencode_test_api = true
+local server_config = arg[2]
+if server_config then
+  assert(vim.fn.mkdir(vim.fs.dirname(server_config), "p", 448) ~= 0 or vim.uv.fs_stat(vim.fs.dirname(server_config)))
+  vim.fn.writefile({ vim.json.encode({ tls_proxy = false }) }, server_config)
+  assert(vim.uv.fs_chmod(server_config, 384))
+  vim.g.mkchad_opencode_test_server_config = server_config
+end
 dofile(config)
 local lifecycle = vim.g.mkchad_opencode_test_api
 
@@ -15,9 +22,8 @@ local function await(invoke)
   return unpack(values)
 end
 
--- A fake backend launches a separate listener on its assigned internal port.
--- Backend listener proof must fail before the TLS proxy or any credentialed
--- public request is launched.
+-- A fake backend launches a separate listener on its assigned port. Backend
+-- listener proof must fail before adoption or any credentialed request.
 local acquired = await(lifecycle.acquire_lock)
 assert(acquired, "could not acquire test lock")
 local fake = vim.fs.joinpath(lifecycle.paths().root, "opencode")
@@ -58,4 +64,7 @@ if responder_pid and vim.uv.fs_stat("/proc/" .. responder_pid) then
 end
 vim.env.OPENCODE_SERVER_PASSWORD = nil
 lifecycle.release_lock()
+if server_config then
+  vim.uv.fs_unlink(server_config)
+end
 vim.cmd("qa!")

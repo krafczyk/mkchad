@@ -1,5 +1,6 @@
 {
   "port": 4096,
   "username": "opencode",
-  "password": "replace-with-a-strong-existing-password"
+  "password": "replace-with-a-strong-existing-password",
+  "tls_proxy": true
 }

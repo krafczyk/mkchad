@@ -126,32 +126,82 @@ local cases = {
   { "wrong backend host role", function(s) s.backend.argv[4] = "0.0.0.0" end },
 }
 
-for _, test in ipairs(cases) do
-  local state = vim.deepcopy(complete)
-  test[2](state)
-  write_json(paths.state, state)
-  local decoded, status = lifecycle.read_state()
-  assert(decoded == nil and status == "malformed", test[1] .. " was accepted")
+local schema3_tls = vim.deepcopy(complete)
+schema3_tls.schema = 3
+schema3_tls.transport = "tls-proxy"
+for _, fixture in ipairs({
+  { "schema-2 TLS", complete },
+  { "schema-3 TLS", schema3_tls },
+}) do
+  write_json(paths.state, fixture[2])
+  assert(select(2, lifecycle.read_state()) == "valid", fixture[1] .. " state was rejected")
+  for _, test in ipairs(cases) do
+    local state = vim.deepcopy(fixture[2])
+    test[2](state)
+    write_json(paths.state, state)
+    local decoded, status = lifecycle.read_state()
+    assert(decoded == nil and status == "malformed", fixture[1] .. " " .. test[1] .. " was accepted")
 
-  local ok, err = pcall(lifecycle.show_info)
-  assert(ok, test[1] .. " crashed info: " .. tostring(err))
-  local reload_ok = await(lifecycle.reload_current_directory)
-  assert(not reload_ok, test[1] .. " reached reload requests")
+    local ok, err = pcall(lifecycle.show_info)
+    assert(ok, fixture[1] .. " " .. test[1] .. " crashed info: " .. tostring(err))
+    local reload_ok = await(lifecycle.reload_current_directory)
+    assert(not reload_ok, fixture[1] .. " " .. test[1] .. " reached reload requests")
 
-  local before = #notifications
-  lifecycle.stop_shared_server()
-  assert(vim.wait(3000, function()
-    return #notifications > before
-  end, 10), test[1] .. " stop did not finish")
+    local before = #notifications
+    lifecycle.stop_shared_server()
+    assert(vim.wait(3000, function()
+      return #notifications > before
+    end, 10), fixture[1] .. " " .. test[1] .. " stop did not finish")
 
-  vim.env.OPENCODE_PORT = "invalid"
-  local ensure_ok, ensure_err = await(vim.g.opencode_opts.server.ensure)
-  vim.env.OPENCODE_PORT = nil
-  assert(not ensure_ok and ensure_err:find("must be an integer", 1, true), test[1] .. " ensure was not bounded")
-  assert(vim.uv.fs_stat("/proc/" .. vim.fn.getpid()), test[1] .. " affected the test process")
+    vim.env.OPENCODE_PORT = "invalid"
+    local ensure_ok, ensure_err = await(vim.g.opencode_opts.server.ensure)
+    vim.env.OPENCODE_PORT = nil
+    assert(
+      not ensure_ok and ensure_err:find("must be an integer", 1, true),
+      fixture[1] .. " " .. test[1] .. " ensure was not bounded"
+    )
+    assert(vim.uv.fs_stat("/proc/" .. vim.fn.getpid()), fixture[1] .. " " .. test[1] .. " affected the test process")
+  end
 end
 
-local future = { schema = 3, sentinel = "preserve" }
+for _, invalid in ipairs({
+  { "missing" },
+  { "Boolean", false },
+  { "number", 1 },
+  { "array", {} },
+  { "object", { value = "tls-proxy" } },
+  { "unknown string", "unknown" },
+}) do
+  local malformed = vim.deepcopy(schema3_tls)
+  malformed.transport = invalid[2]
+  write_json(paths.state, malformed)
+  assert(select(2, lifecycle.read_state()) == "malformed", "schema-3 TLS " .. invalid[1] .. " transport was accepted")
+end
+
+local direct = vim.deepcopy(complete)
+direct.schema = 3
+direct.transport = "loopback-http"
+direct.port = direct.backend.port
+direct.url = "http://127.0.0.1:" .. direct.port
+direct.ca_path = nil
+direct.certificate_identity = nil
+direct.proxy = nil
+write_json(paths.state, direct)
+assert(select(2, lifecycle.read_state()) == "valid", "schema-3 direct state was rejected")
+for _, test in ipairs({
+  { "direct proxy", function(s) s.proxy = vim.deepcopy(proxy) end },
+  { "direct CA", function(s) s.ca_path = paths.ca end },
+  { "direct certificate", function(s) s.certificate_identity = string.rep("a", 64) end },
+  { "direct HTTPS URL", function(s) s.url = "https://127.0.0.1:" .. s.port end },
+  { "direct backend port", function(s) s.backend.port = s.port + 1 end },
+}) do
+  local malformed = vim.deepcopy(direct)
+  test[2](malformed)
+  write_json(paths.state, malformed)
+  assert(select(2, lifecycle.read_state()) == "malformed", test[1] .. " was accepted")
+end
+
+local future = { schema = 4, sentinel = "preserve" }
 write_json(paths.state, future)
 assert(select(2, lifecycle.read_state()) == "unsupported schema")
 assert(pcall(lifecycle.show_info))
@@ -175,29 +225,76 @@ local pending_cases = {
   { "bad argv element", function(p) p.backend.argv[1] = {} end },
   { "missing runtime inode", function(p) p.backend.process_executable_ino = nil end },
   { "bad role port", function(p) p.proxy.argv[8] = "1" end },
-  { "future schema", function(p) p.schema = 3 end },
+  { "future schema", function(p) p.schema = 4 end },
 }
-for _, test in ipairs(pending_cases) do
-  local pending = {
-    schema = 2,
+local function tls_pending(schema)
+  return {
+    schema = schema,
     hostname = complete.hostname,
     generation = complete.generation,
     boot_id = boot_id,
     backend = vim.deepcopy(backend),
     proxy = vim.deepcopy(proxy),
   }
-  test[2](pending)
-  write_json(paths.pending, pending)
-  local decoded, status = lifecycle.read_pending()
-  assert(decoded == nil and status == "malformed", "pending " .. test[1] .. " was accepted")
-  local cleaned, cleanup_err = await(function(done)
-    lifecycle.cleanup_pending(vim.uv.hrtime() + 1000000000, done)
-  end)
-  assert(not cleaned and cleanup_err:find("malformed pending", 1, true), "pending " .. test[1] .. " cleanup was unsafe")
-  assert(vim.uv.fs_stat(paths.pending), "malformed pending metadata was removed")
-  assert(vim.uv.fs_stat("/proc/" .. vim.fn.getpid()), "pending " .. test[1] .. " signaled the test process")
-  vim.uv.fs_unlink(paths.pending)
 end
+for _, fixture in ipairs({
+  { "schema-2 TLS", tls_pending(2) },
+  { "schema-3 TLS", vim.tbl_extend("force", tls_pending(3), { schema = 3, transport = "tls-proxy" }) },
+}) do
+  write_json(paths.pending, fixture[2])
+  assert(select(2, lifecycle.read_pending()) == "valid", fixture[1] .. " pending metadata was rejected")
+  for _, test in ipairs(pending_cases) do
+    local pending = vim.deepcopy(fixture[2])
+    test[2](pending)
+    write_json(paths.pending, pending)
+    local decoded, status = lifecycle.read_pending()
+    assert(decoded == nil and status == "malformed", fixture[1] .. " pending " .. test[1] .. " was accepted")
+    local cleaned, cleanup_err = await(function(done)
+      lifecycle.cleanup_pending(vim.uv.hrtime() + 1000000000, done)
+    end)
+    assert(not cleaned and cleanup_err:find("malformed pending", 1, true), fixture[1] .. " pending cleanup was unsafe")
+    assert(vim.uv.fs_stat(paths.pending), "malformed pending metadata was removed")
+    assert(vim.uv.fs_stat("/proc/" .. vim.fn.getpid()), "malformed pending signaled the test process")
+    vim.uv.fs_unlink(paths.pending)
+  end
+end
+local direct_pending = {
+  schema = 3,
+  transport = "loopback-http",
+  hostname = complete.hostname,
+  generation = complete.generation,
+  boot_id = boot_id,
+  port = backend.port,
+  backend = vim.deepcopy(backend),
+}
+write_json(paths.pending, direct_pending)
+assert(select(2, lifecycle.read_pending()) == "valid", "schema-3 direct pending metadata was rejected")
+for _, test in ipairs({
+  { "proxy", function(p) p.proxy = vim.deepcopy(proxy) end },
+  { "missing port", function(p) p.port = nil end },
+  { "mismatched port", function(p) p.port = p.backend.port + 1 end },
+  { "missing transport", function(p) p.transport = nil end },
+  { "unknown transport", function(p) p.transport = "unknown" end },
+}) do
+  local malformed = vim.deepcopy(direct_pending)
+  test[2](malformed)
+  write_json(paths.pending, malformed)
+  assert(select(2, lifecycle.read_pending()) == "malformed", "direct pending metadata accepted " .. test[1])
+end
+for _, invalid in ipairs({
+  { "missing" },
+  { "Boolean", false },
+  { "number", 1 },
+  { "array", {} },
+  { "object", { value = "tls-proxy" } },
+  { "unknown string", "unknown" },
+}) do
+  local malformed = tls_pending(3)
+  malformed.transport = invalid[2]
+  write_json(paths.pending, malformed)
+  assert(select(2, lifecycle.read_pending()) == "malformed", "schema-3 TLS pending " .. invalid[1] .. " transport was accepted")
+end
+vim.uv.fs_unlink(paths.pending)
 lifecycle.release_lock()
 
 vim.cmd("qa!")

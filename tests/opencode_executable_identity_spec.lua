@@ -5,6 +5,7 @@ local isolated_proxy_source = vim.fs.joinpath(vim.fn.stdpath("config"), "java", 
 assert(vim.fn.mkdir(vim.fs.dirname(isolated_proxy_source), "p", 448) ~= 0 or vim.uv.fs_stat(vim.fs.dirname(isolated_proxy_source)))
 vim.fn.writefile({ "final class MkChadTlsProxy {}" }, isolated_proxy_source)
 vim.g.mkchad_opencode_test_api = true
+vim.g.mkchad_opencode_test_proxy_source = isolated_proxy_source
 dofile(config)
 local lifecycle = vim.g.mkchad_opencode_test_api
 local paths = lifecycle.paths()

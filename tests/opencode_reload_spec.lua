@@ -1,5 +1,12 @@
 local config = assert(arg[1], "pass the MkChad config path")
 vim.g.mkchad_opencode_test_api = true
+local server_config = arg[2]
+if server_config then
+  assert(vim.fn.mkdir(vim.fs.dirname(server_config), "p", 448) ~= 0 or vim.uv.fs_stat(vim.fs.dirname(server_config)))
+  vim.fn.writefile({ vim.json.encode({ tls_proxy = false }) }, server_config)
+  assert(vim.uv.fs_chmod(server_config, 384))
+  vim.g.mkchad_opencode_test_server_config = server_config
+end
 dofile(config)
 local lifecycle = vim.g.mkchad_opencode_test_api
 local root = lifecycle.paths().root
@@ -57,7 +64,11 @@ vim.env.PATH = root .. ":" .. vim.env.PATH
 local tui_creations, tui_jobs = 0, {}
 package.loaded["snacks.terminal"] = {
   get = function(_, opts)
-    assert(opts.env.NODE_EXTRA_CA_CERTS)
+    if lifecycle.requested_transport() == "tls-proxy" then
+      assert(opts.env.NODE_EXTRA_CA_CERTS)
+    else
+      assert(not opts.env or not opts.env.NODE_EXTRA_CA_CERTS)
+    end
     tui_creations = tui_creations + 1
     local job = vim.fn.jobstart({ "python3", "-c", "import time; time.sleep(60)" })
     table.insert(tui_jobs, job)
@@ -95,13 +106,14 @@ assert(ok, message)
 assert(disconnected, "reload did not clear stale plugin connection")
 assert(tui_creations == 2, "reload did not recreate the local TUI")
 local final = assert(lifecycle.read_state())
-assert(final.proxy.pid == state.proxy.pid and final.backend.pid == state.backend.pid)
+assert(final.backend.pid == state.backend.pid)
+assert((not final.proxy and not state.proxy) or final.proxy.pid == state.proxy.pid)
 assert(final.generation == state.generation and final.url == state.url and final.port == state.port)
 assert(final.certificate_identity == state.certificate_identity)
 local seen = table.concat(vim.fn.readfile(requests), "\n")
-assert(seen:find("GET /session/status HTTP/1.1|x%-opencode%-directory: " .. directory, 1))
-assert(seen:find("POST /instance/dispose HTTP/1.1|x%-opencode%-directory: " .. directory, 1))
-assert(seen:find("GET /path HTTP/1.1|x%-opencode%-directory: " .. directory, 1))
+assert(seen:find("GET /session/status HTTP/1.1|x-opencode-directory: " .. directory, 1, true))
+assert(seen:find("POST /instance/dispose HTTP/1.1|x-opencode-directory: " .. directory, 1, true))
+assert(seen:find("GET /path HTTP/1.1|x-opencode-directory: " .. directory, 1, true))
 local dispose_count = select(2, seen:gsub("POST /instance/dispose", ""))
 
 package.loaded["opencode.server.discovery"].get = function()
@@ -140,5 +152,8 @@ for _, job in ipairs(tui_jobs) do
   if vim.fn.jobwait({ job }, 0)[1] == -1 then
     vim.fn.jobstop(job)
   end
+end
+if server_config then
+  vim.uv.fs_unlink(server_config)
 end
 vim.cmd("qa!")

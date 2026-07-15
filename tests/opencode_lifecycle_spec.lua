@@ -113,7 +113,7 @@ for _, message in ipairs(startup_notifications) do
 end
 assert(password_warning, "no-password startup warning was not shown")
 local state, state_status = lifecycle.read_state()
-assert(state and state_status == "valid" and state.schema == 2)
+assert(state and state_status == "valid" and state.schema == 3 and state.transport == "tls-proxy")
 assert(state.url == ("https://127.0.0.1:%d"):format(state.port))
 assert(state.backend.port ~= state.port and state.backend.port >= 49152)
 for _, process in ipairs({ state.proxy, state.backend }) do
@@ -143,6 +143,63 @@ local without_ca = vim.fn.system({ "curl", "--silent", "--show-error", "--max-ti
 assert(vim.v.shell_error ~= 0, "curl unexpectedly trusted the private CA")
 local with_ca = vim.fn.system({ "curl", "--silent", "--show-error", "--cacert", state.ca_path, "--max-time", "3", state.url .. "/global/health" })
 assert(vim.v.shell_error == 0 and with_ca:find("healthy", 1, true), with_ca)
+
+local schema2 = vim.deepcopy(state)
+schema2.schema = 2
+schema2.transport = nil
+local schema2_lock_ok, schema2_lock_err = wait_for(lifecycle.acquire_lock, 3000)
+assert(schema2_lock_ok, schema2_lock_err)
+assert(lifecycle.write_state(schema2))
+lifecycle.release_lock()
+local reused_schema2, reuse_schema2_err = wait_for(vim.g.opencode_opts.server.ensure)
+assert(reused_schema2, reuse_schema2_err)
+state = assert(lifecycle.read_state())
+assert(state.schema == 2 and state.transport == nil and state.generation == schema2.generation)
+assert(state.proxy.pid == schema2.proxy.pid and state.backend.pid == schema2.backend.pid, "schema-2 reuse changed the pair")
+
+local ca_contents = vim.fn.readfile(state_paths.ca, "b")
+vim.fn.writefile({ "invalidated CA fixture" }, state_paths.ca, "b")
+assert(vim.uv.fs_chmod(state_paths.ca, 384))
+local certificate_info
+local certificate_notify = vim.notify
+vim.notify = function(message)
+  certificate_info = tostring(message)
+end
+lifecycle.show_info()
+assert(vim.wait(3000, function()
+  return certificate_info ~= nil
+end, 10), "certificate-mismatch info timed out")
+vim.notify = certificate_notify
+assert(certificate_info:find("certificate identity validation failed; no request sent", 1, true), certificate_info)
+assert(not certificate_info:find("HTTPS endpoint:", 1, true), certificate_info)
+vim.fn.writefile(ca_contents, state_paths.ca, "b")
+assert(vim.uv.fs_chmod(state_paths.ca, 384))
+assert(lifecycle.certificate_identity(state_paths) == state.certificate_identity)
+
+-- Diagnostics use active state during a requested/active mode mismatch and
+-- explain the explicit transition sequence without mutating the generation.
+vim.fn.writefile({ vim.json.encode({ tls_proxy = false }) }, lifecycle.server_config_path)
+assert(vim.uv.fs_chmod(lifecycle.server_config_path, 384))
+assert(lifecycle.load_server_config())
+local mismatch_info
+local mismatch_notify = vim.notify
+vim.notify = function(message)
+  mismatch_info = tostring(message)
+end
+lifecycle.show_info()
+assert(vim.wait(3000, function()
+  return mismatch_info and mismatch_info:find("HTTPS endpoint: healthy", 1, true)
+end, 10), mismatch_info or "mode-mismatch info timed out")
+vim.notify = mismatch_notify
+assert(mismatch_info:find("URL: " .. state.url, 1, true), mismatch_info)
+assert(mismatch_info:find("Mode mismatch: requested loopback-http, active tls-proxy", 1, true), mismatch_info)
+assert(mismatch_info:find(":OpenCodeStop, restart Neovim", 1, true), mismatch_info)
+local mismatch_ok, mismatch_err = wait_for(vim.g.opencode_opts.server.ensure, 3000)
+assert(not mismatch_ok and mismatch_err:find("differs from active", 1, true), mismatch_err)
+assert(lifecycle.read_state().generation == state.generation, "mode mismatch changed the active generation")
+vim.fn.writefile({ vim.json.encode({ tls_proxy = true }) }, lifecycle.server_config_path)
+assert(vim.uv.fs_chmod(lifecycle.server_config_path, 384))
+assert(lifecycle.load_server_config())
 
 vim.env.OPENCODE_SERVER_PASSWORD = "wrong-for-fixture"
 local public_401 = vim.fn.system({
@@ -183,6 +240,49 @@ end, 20))
 assert(wait_for(vim.g.opencode_opts.server.ensure))
 assert(tui_count == 2, "dead local TUI was not recreated")
 
+-- Explicit stop cleans either separately verified TLS survivor without
+-- launching a replacement.
+local backend_dead_state = assert(lifecycle.read_state())
+assert(vim.uv.kill(backend_dead_state.backend.pid, "sigkill"))
+assert(vim.wait(2000, function()
+  return process_dead(backend_dead_state.backend.pid)
+end, 20))
+local stop_notice
+local original_notify = vim.notify
+vim.notify = function(message)
+  stop_notice = tostring(message)
+end
+lifecycle.stop_shared_server()
+assert(vim.wait(10000, function()
+  return stop_notice ~= nil
+end, 20), "backend-death explicit stop timed out")
+vim.notify = original_notify
+assert(stop_notice:find("Stopped shared OpenCode proxy and backend", 1, true), stop_notice)
+assert(process_dead(backend_dead_state.proxy.pid), "backend-death explicit stop left the proxy alive")
+assert(lifecycle.read_state() == nil, "backend-death explicit stop retained state")
+assert(wait_for(vim.g.opencode_opts.server.ensure))
+
+local proxy_dead_state = assert(lifecycle.read_state())
+assert(vim.uv.kill(proxy_dead_state.proxy.pid, "sigkill"))
+assert(vim.wait(2000, function()
+  return process_dead(proxy_dead_state.proxy.pid)
+end, 20))
+stop_notice = nil
+original_notify = vim.notify
+vim.notify = function(message)
+  stop_notice = tostring(message)
+end
+lifecycle.stop_shared_server()
+assert(vim.wait(10000, function()
+  return stop_notice ~= nil
+end, 20), "proxy-death explicit stop timed out")
+vim.notify = original_notify
+assert(stop_notice:find("Stopped shared OpenCode proxy and backend", 1, true), stop_notice)
+assert(process_dead(proxy_dead_state.backend.pid), "proxy-death explicit stop left the backend alive")
+assert(lifecycle.read_state() == nil, "proxy-death explicit stop retained state")
+assert(wait_for(vim.g.opencode_opts.server.ensure))
+state = assert(lifecycle.read_state())
+
 local first_generation = state.generation
 local first_ca = state.certificate_identity
 local old_backend = state.backend.pid
@@ -215,6 +315,111 @@ assert(stopped, stop_err)
 vim.uv.fs_unlink(state_paths.state)
 lifecycle.release_lock()
 
+-- Explicit TLS/direct transitions preserve retained certificates, refuse stale
+-- opposite-mode ensures, and do not touch Java or keytool in direct mode.
+local retained_ca = table.concat(vim.fn.readfile(state_paths.ca), "\n")
+local dependency_marker = vim.fs.joinpath(root, "direct-dependency-invoked")
+local failing_dependency = {
+  "#!/bin/sh",
+  "touch " .. vim.fn.shellescape(dependency_marker),
+  "exit 97",
+}
+local fake_java = vim.fs.joinpath(root, "java")
+local fake_keytool = vim.fs.joinpath(root, "keytool")
+vim.fn.writefile(failing_dependency, fake_java)
+vim.fn.writefile(failing_dependency, fake_keytool)
+assert(vim.uv.fs_chmod(fake_java, 493) and vim.uv.fs_chmod(fake_keytool, 493))
+vim.g.mkchad_opencode_test_proxy_source = vim.fs.joinpath(root, "missing-direct-proxy-source.java")
+vim.fn.writefile({ vim.json.encode({ tls_proxy = false }) }, lifecycle.server_config_path)
+assert(vim.uv.fs_chmod(lifecycle.server_config_path, 384))
+assert(lifecycle.load_server_config())
+local direct_started, direct_start_err = wait_for(vim.g.opencode_opts.server.ensure)
+assert(direct_started, direct_start_err)
+local direct_state = assert(lifecycle.read_state())
+assert(direct_state.transport == "loopback-http" and not direct_state.proxy and not direct_state.ca_path)
+assert(not vim.uv.fs_stat(dependency_marker), "direct startup invoked Java or keytool")
+assert(table.concat(vim.fn.readfile(state_paths.ca), "\n") == retained_ca, "direct mode changed retained CA material")
+
+vim.fn.writefile({ vim.json.encode({ tls_proxy = true }) }, lifecycle.server_config_path)
+assert(vim.uv.fs_chmod(lifecycle.server_config_path, 384))
+assert(lifecycle.load_server_config())
+local stale_tls_ok, stale_tls_err = wait_for(vim.g.opencode_opts.server.ensure, 3000)
+assert(not stale_tls_ok and stale_tls_err:find("differs from active", 1, true), stale_tls_err)
+assert(lifecycle.read_state().generation == direct_state.generation, "opposite-mode ensure replaced the direct generation")
+
+stop_notice = nil
+original_notify = vim.notify
+vim.notify = function(message)
+  stop_notice = tostring(message)
+end
+lifecycle.stop_shared_server()
+assert(vim.wait(10000, function()
+  return stop_notice ~= nil
+end, 20), "direct transition stop timed out")
+vim.notify = original_notify
+assert(stop_notice:find("Stopped shared OpenCode direct backend", 1, true), stop_notice)
+assert(lifecycle.read_state() == nil)
+assert(vim.uv.fs_unlink(fake_java) and vim.uv.fs_unlink(fake_keytool))
+vim.g.mkchad_opencode_test_proxy_source = nil
+local tls_restarted, tls_restart_err = wait_for(vim.g.opencode_opts.server.ensure)
+assert(tls_restarted, tls_restart_err)
+state = assert(lifecycle.read_state())
+assert(state.transport == "tls-proxy" and state.certificate_identity == first_ca)
+assert(table.concat(vim.fn.readfile(state_paths.ca), "\n") == retained_ca, "TLS re-enable changed valid retained CA material")
+lock_ok, lock_err = wait_for(lifecycle.acquire_lock, 3000)
+assert(lock_ok, lock_err)
+stopped, stop_err = wait_for(function(done)
+  lifecycle.stop_pair(state, vim.uv.hrtime() + 8000 * 1000000, done)
+end, 10000)
+assert(stopped, stop_err)
+vim.uv.fs_unlink(state_paths.state)
+lifecycle.release_lock()
+
+vim.g.mkchad_opencode_test_fail_pending_write_after = 2
+vim.g.mkchad_opencode_test_pidfd_helper = vim.fs.joinpath(root, "missing-pidfd-helper.py")
+local proxy_pending_ok, proxy_pending_err = wait_for(vim.g.opencode_opts.server.ensure, 10000)
+assert(not proxy_pending_ok and proxy_pending_err:find("pending proxy identity", 1, true), proxy_pending_err)
+assert(proxy_pending_err:find("pidfd signal helper is unavailable", 1, true), proxy_pending_err)
+local proxy_intent = assert(lifecycle.read_launch_intent())
+local failed_pending = assert(lifecycle.read_pending())
+assert(proxy_intent.role == "proxy" and proxy_intent.pid and failed_pending.backend)
+assert(not process_dead(proxy_intent.pid) and not process_dead(failed_pending.backend.pid))
+local proxy_blocked_ok, proxy_blocked_err = wait_for(vim.g.opencode_opts.server.ensure, 3000)
+assert(not proxy_blocked_ok and proxy_blocked_err:find("unresolved proxy launch intent", 1, true), proxy_blocked_err)
+assert(lifecycle.read_launch_intent().generation == proxy_intent.generation)
+assert(vim.uv.kill(proxy_intent.pid, "sigkill"))
+assert(vim.wait(2000, function()
+  return process_dead(proxy_intent.pid)
+end, 20), "cleanup-refused proxy fixture did not stop")
+vim.g.mkchad_opencode_test_fail_pending_write_after = nil
+vim.g.mkchad_opencode_test_pidfd_helper = nil
+lock_ok, lock_err = wait_for(lifecycle.acquire_lock, 3000)
+assert(lock_ok, lock_err)
+assert(lifecycle.remove_matching_launch_intent(proxy_intent.generation))
+assert(lifecycle.write_launch_intent({
+  schema = 1,
+  hostname = failed_pending.hostname,
+  generation = failed_pending.generation,
+  boot_id = failed_pending.boot_id,
+  role = "backend",
+  port = failed_pending.backend.port,
+  pid = failed_pending.backend.pid,
+}))
+lifecycle.release_lock()
+local reconciliation_notice
+original_notify = vim.notify
+vim.notify = function(message)
+  reconciliation_notice = tostring(message)
+end
+lifecycle.stop_shared_server()
+assert(vim.wait(10000, function()
+  return reconciliation_notice ~= nil
+end, 20), "covered launch-intent stop timed out")
+vim.notify = original_notify
+assert(reconciliation_notice:find("launch-intent reconciliation", 1, true), reconciliation_notice)
+assert(process_dead(failed_pending.backend.pid))
+assert(lifecycle.read_pending() == nil and lifecycle.read_launch_intent() == nil)
+
 -- Explicit public conflicts fail without launching a pair or selecting fallback.
 local conflict = assert(vim.uv.new_tcp())
 assert(conflict:bind("127.0.0.1", 0) == 0 and conflict:listen(1, function() end) == 0)
@@ -225,7 +430,7 @@ assert(lifecycle.read_state() == nil)
 vim.env.OPENCODE_PORT = nil
 conflict:close()
 
-local future = vim.json.encode({ schema = 3, sentinel = "preserve-future-state" })
+local future = vim.json.encode({ schema = 4, sentinel = "preserve-future-state" })
 vim.fn.writefile({ future }, state_paths.state)
 local future_ok, future_err = wait_for(vim.g.opencode_opts.server.ensure, 5000)
 assert(not future_ok and future_err:find("unsupported future", 1, true), future_err)
@@ -234,7 +439,7 @@ assert(table.concat(vim.fn.readfile(state_paths.state), "\n") == future, "future
 vim.fn.writefile({ "{" }, state_paths.state)
 package.loaded["opencode.server"] = package.loaded["opencode.server"] or {}
 local malformed_info
-local original_notify = vim.notify
+original_notify = vim.notify
 vim.notify = function(message)
   malformed_info = message
 end
@@ -323,7 +528,7 @@ end, 20), "legacy fixture did not die")
 local dead_migrated, dead_migrate_err = wait_for(vim.g.opencode_opts.server.ensure)
 assert(dead_migrated, dead_migrate_err)
 state = assert(lifecycle.read_state())
-assert(state.schema == 2 and state.generation ~= legacy.generation)
+assert(state.schema == 3 and state.transport == "tls-proxy" and state.generation ~= legacy.generation)
 
 lock_ok, lock_err = wait_for(lifecycle.acquire_lock, 3000)
 assert(lock_ok, lock_err)
