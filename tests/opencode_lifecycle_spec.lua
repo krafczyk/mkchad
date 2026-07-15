@@ -32,9 +32,10 @@ local function process_dead(pid)
 end
 
 local fake = vim.fs.joinpath(root, "opencode")
+local request_log = vim.fs.joinpath(root, "requests.log")
 vim.fn.writefile({
   "#!/usr/bin/env python3",
-  "import os, socket, sys, threading",
+  "import os, socket, sys, threading, time",
   "if len(sys.argv) > 1 and sys.argv[1] == '--version': print('fake-2'); raise SystemExit(0)",
   "sock = socket.socket(); sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)",
   "sock.bind(('127.0.0.1', int(sys.argv[-1]))); sock.listen(64)",
@@ -49,8 +50,13 @@ vim.fn.writefile({
   "        if not part: return",
   "        raw += part",
   "      head = raw.split(b'\\r\\n\\r\\n', 1)[0]",
+  "      target = head.split()[1]",
+  "      with open(" .. vim.json.encode(request_log) .. ", 'a') as out: out.write(target.decode('latin1') + '\\n')",
   "      if b'authorization: basic' in head.lower():",
   "        client.sendall(b'HTTP/1.1 401 Unauthorized\\r\\nContent-Length: 0\\r\\nConnection: keep-alive\\r\\n\\r\\n'); continue",
+  "      if target == b'/event':",
+  "        client.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Type: text/event-stream\\r\\nConnection: keep-alive\\r\\n\\r\\ndata: {\\\"type\\\":\\\"server.connected\\\"}\\n\\n')",
+  "        while True: time.sleep(1)",
   "      body = b'{\\\"healthy\\\":true,\\\"version\\\":\\\"fake-2\\\"}'",
   "      client.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nContent-Length: ' + str(len(body)).encode() + b'\\r\\nConnection: keep-alive\\r\\n\\r\\n' + body)",
   "while True:",
@@ -267,6 +273,41 @@ assert(vim.uv.kill(proxy_dead_state.proxy.pid, "sigkill"))
 assert(vim.wait(2000, function()
   return process_dead(proxy_dead_state.proxy.pid)
 end, 20))
+local proxy_dead_encoded = table.concat(vim.fn.readfile(state_paths.state), "\n")
+local failed_stop_notice
+original_notify = vim.notify
+vim.notify = function(message)
+  failed_stop_notice = tostring(message)
+end
+vim.g.mkchad_opencode_test_pidfd_helper = vim.fs.joinpath(root, "missing-partial-stop-helper.py")
+lifecycle.stop_shared_server()
+assert(vim.wait(5000, function()
+  return failed_stop_notice ~= nil
+end, 20), "helper-failure partial stop timed out")
+vim.g.mkchad_opencode_test_pidfd_helper = nil
+vim.notify = original_notify
+assert(failed_stop_notice:find("pidfd signal helper is unavailable", 1, true), failed_stop_notice)
+assert(table.concat(vim.fn.readfile(state_paths.state), "\n") == proxy_dead_encoded)
+assert(not process_dead(proxy_dead_state.backend.pid), "helper failure signaled the surviving backend")
+
+local mismatched_state = vim.json.decode(proxy_dead_encoded)
+mismatched_state.backend.executable_ino = "1"
+vim.fn.writefile({ vim.json.encode(mismatched_state) }, state_paths.state)
+local mismatched_encoded = table.concat(vim.fn.readfile(state_paths.state), "\n")
+failed_stop_notice = nil
+original_notify = vim.notify
+vim.notify = function(message)
+  failed_stop_notice = tostring(message)
+end
+lifecycle.stop_shared_server()
+assert(vim.wait(5000, function()
+  return failed_stop_notice ~= nil
+end, 20), "identity-mismatch partial stop timed out")
+vim.notify = original_notify
+assert(failed_stop_notice:find("identity", 1, true), failed_stop_notice)
+assert(table.concat(vim.fn.readfile(state_paths.state), "\n") == mismatched_encoded)
+assert(not process_dead(proxy_dead_state.backend.pid), "identity mismatch signaled the surviving backend")
+vim.fn.writefile({ proxy_dead_encoded }, state_paths.state)
 stop_notice = nil
 original_notify = vim.notify
 vim.notify = function(message)
@@ -285,16 +326,94 @@ state = assert(lifecycle.read_state())
 
 local first_generation = state.generation
 local first_ca = state.certificate_identity
+local first_port = state.port
 local old_backend = state.backend.pid
+local stream_output = {}
+local stream_job = vim.fn.jobstart({
+  "curl",
+  "--silent",
+  "--show-error",
+  "--no-buffer",
+  "--cacert",
+  state.ca_path,
+  "--max-time",
+  "30",
+  state.url .. "/event",
+}, {
+  on_stdout = function(_, data)
+    if data then
+      vim.list_extend(stream_output, data)
+    end
+  end,
+})
+assert(stream_job > 0)
+assert(vim.wait(5000, function()
+  return table.concat(stream_output, "\n"):find("server.connected", 1, true) ~= nil
+end, 20), "TLS client stream did not connect")
+local requests_before_death = #vim.fn.readfile(request_log)
 assert(vim.uv.kill(state.proxy.pid, "sigkill"))
 assert(vim.wait(2000, function()
   return process_dead(state.proxy.pid)
 end, 20))
+assert(vim.wait(3000, function()
+  return vim.fn.jobwait({ stream_job }, 0)[1] ~= -1
+end, 20), "proxy death did not disconnect the existing client stream")
+local dead_proxy_state = table.concat(vim.fn.readfile(state_paths.state), "\n")
+vim.wait(700, function()
+  return false
+end, 20)
+assert(table.concat(vim.fn.readfile(state_paths.state), "\n") == dead_proxy_state, "watchdog changed dead-proxy state")
+assert(not process_dead(old_backend), "watchdog stopped the surviving backend")
+
+local dead_proxy_info
+original_notify = vim.notify
+vim.notify = function(message)
+  dead_proxy_info = tostring(message)
+end
+lifecycle.show_info()
+assert(vim.wait(5000, function()
+  return dead_proxy_info ~= nil
+end, 20), "dead-proxy info timed out")
+vim.notify = original_notify
+assert(dead_proxy_info:find("no request sent", 1, true), dead_proxy_info)
+local dead_reload_ok = wait_for(lifecycle.reload_current_directory, 5000)
+assert(not dead_reload_ok, "reload accepted a dead proxy")
+assert(table.concat(vim.fn.readfile(state_paths.state), "\n") == dead_proxy_state, "info or reload changed dead-proxy state")
+assert(not process_dead(old_backend), "info or reload stopped the surviving backend")
+assert(#vim.fn.readfile(request_log) == requests_before_death, "info or reload sent a request after proxy death")
 local recovered, recover_err = wait_for(vim.g.opencode_opts.server.ensure)
 assert(recovered, recover_err)
 state = assert(lifecycle.read_state())
 assert(state.generation ~= first_generation and state.certificate_identity == first_ca)
+assert(state.port == first_port, "proxy-only recovery did not reuse the free public port")
 assert(process_dead(old_backend), "proxy-only recovery did not stop the old backend")
+
+local captured_port = state.port
+local captured_generation = state.generation
+local captured_backend = state.backend.pid
+assert(vim.uv.kill(state.proxy.pid, "sigkill"))
+assert(vim.wait(2000, function()
+  return process_dead(state.proxy.pid)
+end, 20))
+assert(vim.wait(5000, function()
+  return lifecycle.port_is_available(captured_port)
+end, 20), "captured public port did not become reusable")
+local replacement_requested = false
+local replacement = assert(vim.uv.new_tcp())
+assert(replacement:bind("127.0.0.1", captured_port) == 0)
+local replacement_listened, replacement_listen_err = replacement:listen(8, function(err)
+  assert(not err, err)
+  replacement_requested = true
+end)
+assert(replacement_listened == 0 or replacement_listened == true, replacement_listen_err)
+local recaptured, recapture_err = wait_for(vim.g.opencode_opts.server.ensure)
+assert(recaptured, recapture_err)
+state = assert(lifecycle.read_state())
+assert(state.generation ~= captured_generation and state.port ~= captured_port)
+assert(state.certificate_identity == first_ca, "occupied-port recovery rotated the CA")
+assert(process_dead(captured_backend), "occupied-port recovery left the old backend alive")
+assert(not replacement_requested, "recovery sent a request to the replacement listener")
+replacement:close()
 
 local proxy_before_backend_death = state.proxy.pid
 assert(vim.uv.kill(state.backend.pid, "sigkill"))

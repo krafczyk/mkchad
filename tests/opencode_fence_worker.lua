@@ -118,7 +118,7 @@ elseif action == "state_remove" then
   ok, err = lifecycle.remove_matching_state_while_locked(data.state.generation, "fence test state removal")
 elseif action == "signal" then
   ok, err = await(function(done)
-    lifecycle.signal_process(data.process, data.boot_id, "sigterm", done)
+    lifecycle.signal_process(data.process, data.boot_id, "sigterm", vim.uv.hrtime() + 3000 * 1000000, done)
   end, 65000)
 else
   error("unknown fence action " .. action)

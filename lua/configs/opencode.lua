@@ -1530,7 +1530,7 @@ end
 
 local renew_lock
 
-local function signal_process(process, boot_id, requested_signal, callback)
+local function signal_process(process, boot_id, requested_signal, deadline_ns, callback)
   local fenced, fence_err = require_fence("managed process signal")
   if not fenced then
     callback(false, fence_err)
@@ -1567,6 +1567,7 @@ local function signal_process(process, boot_id, requested_signal, callback)
   run_subprocess({ python, helper }, {
     stdin = vim.json.encode(request),
     timeout_ms = hook and 60000 or pidfd_helper_timeout_ms,
+    deadline_ns = deadline_ns,
     env = hook and { MKCHAD_OPENCODE_PIDFD_TEST = "1" } or nil,
   }, function(result, subprocess_err)
     if not subprocess_err then
@@ -1588,22 +1589,24 @@ local function terminate_process(process, boot_id, deadline_ns, callback)
     callback(not process or not pid_is_live(process.pid), reason)
     return
   end
-  signal_process(process, boot_id, "sigterm", function(sent, signal_err)
+  signal_process(process, boot_id, "sigterm", deadline_ns, function(sent, signal_err)
     if not sent then
       callback(false, signal_err)
       return
     end
     local escalated = false
     local escalating = false
+    local kill_at_ns = math.min(uv.hrtime() + subprocess_term_grace_ms * 1000000, deadline_ns)
     local function wait_for_exit()
       if not pid_is_live(process.pid) then
         callback(true)
         return
       end
-      if uv.hrtime() >= deadline_ns then
-        if not escalated and not escalating then
+      local now = uv.hrtime()
+      if now >= kill_at_ns and not escalated then
+        if not escalating then
           escalating = true
-          signal_process(process, boot_id, "sigkill", function(killed, kill_err)
+          signal_process(process, boot_id, "sigkill", deadline_ns, function(killed, kill_err)
             escalating = false
             if not killed then
               callback(not pid_is_live(process.pid), kill_err)
@@ -1613,10 +1616,13 @@ local function terminate_process(process, boot_id, deadline_ns, callback)
             vim.defer_fn(wait_for_exit, health_interval_ms)
           end)
           return
-        elseif escalated then
-          callback(false, "managed process did not exit after SIGKILL")
-          return
         end
+      elseif now >= deadline_ns and escalated then
+        callback(false, "managed process did not exit after SIGKILL")
+        return
+      elseif now >= deadline_ns then
+        callback(false, "managed process did not exit before the stop deadline")
+        return
       end
       vim.defer_fn(wait_for_exit, health_interval_ms)
     end
@@ -3831,6 +3837,12 @@ local function show_local_tui(toggle)
 end
 
 local function stop_shared_server()
+  local stop_timeout_ms = startup_timeout_ms
+  if vim.g.mkchad_opencode_test_api
+    and is_integer(vim.g.mkchad_opencode_test_stop_timeout_ms, 100, startup_timeout_ms)
+  then
+    stop_timeout_ms = vim.g.mkchad_opencode_test_stop_timeout_ms
+  end
   acquire_lock(function(locked, lock_err)
     if not locked then
       notify(lock_err, vim.log.levels.ERROR)
@@ -3880,7 +3892,7 @@ local function stop_shared_server()
       return
     end
     if state.schema == 1 then
-      stop_legacy(state, uv.hrtime() + startup_timeout_ms * 1000000, function(stopped, stop_err)
+      stop_legacy(state, uv.hrtime() + stop_timeout_ms * 1000000, function(stopped, stop_err)
         if stopped then
           local removed, remove_err = remove_matching_state_while_locked(state.generation, "explicit legacy stop")
           release_lock()
@@ -3925,7 +3937,7 @@ local function stop_shared_server()
       notify("Refusing to stop shared OpenCode server: " .. ownership, vim.log.levels.ERROR)
       return
     end
-    stop_pair(state, uv.hrtime() + startup_timeout_ms * 1000000, function(stopped, stop_err)
+    stop_pair(state, uv.hrtime() + stop_timeout_ms * 1000000, function(stopped, stop_err)
       if not stopped then
         release_lock()
         notify("Refusing to stop shared OpenCode server: " .. (stop_err or "unknown error"), vim.log.levels.ERROR)
