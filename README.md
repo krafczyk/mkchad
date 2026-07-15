@@ -15,11 +15,12 @@ pinned health without changing lifecycle state.
 
 > **Multi-user host warning:** TLS authenticates the server to clients; it does
 > not authenticate clients and possession of `ca.pem` does not control access.
-> Without a user-supplied `OPENCODE_SERVER_PASSWORD`, both the public TLS proxy
-> and the discoverable internal loopback HTTP backend accept requests from other
-> local users. Set a strong existing environment password before first use. If
-> the pair is already running, set the password, run `:OpenCodeStop`, and start
-> OpenCode again so both endpoints enforce it.
+> Without a user-supplied password in protected `opencode-server.json` or
+> `OPENCODE_SERVER_PASSWORD`, both the public TLS proxy and the discoverable
+> internal loopback HTTP backend accept requests from other local users. Set a
+> strong existing password before first use. If the pair is already running,
+> set the password, run `:OpenCodeStop`, restart Neovim when the file changed,
+> and start OpenCode again so both endpoints enforce it.
 
 State lives in `${XDG_STATE_HOME:-$HOME/.local/state}/mkchad/opencode/<host>/`:
 `state.json`, `server.log`, `proxy.log`, a startup lock, and `tls/`. The
@@ -38,13 +39,37 @@ forwarding client HTTP bytes. It never reconnects a client stream. Loss of the
 proxy, backend, listener, process identity, certificate identity, or pinned
 health replaces both processes under the renewable lifecycle lock.
 
-Without `OPENCODE_PORT`, the server prefers port `4096` and persists a high
-fallback port when `4096` is occupied. An explicit `OPENCODE_PORT` is used
-exactly or fails; it never falls back. Use `:OpenCodeStop` (or `:Opencode stop`)
-to stop the **shared** server, which affects other MkChad and web clients.
+MkChad reads optional server settings from
+`${XDG_CONFIG_HOME:-$HOME/.config}/mkchad/opencode-server.json` when the
+OpenCode plugin first loads. The file is ignored by Git because it may contain
+a password, and MkChad refuses it unless it is a current-user-owned regular
+file with mode `0600`. The supported keys are:
 
-Both ports bind to loopback. Set the existing `OPENCODE_SERVER_PASSWORD` (and
-optional `OPENCODE_SERVER_USERNAME`) to enable OpenCode Basic Auth on both.
+```json
+{
+  "port": 4096,
+  "username": "opencode",
+  "password": "a-strong-existing-password"
+}
+```
+
+See `opencode-server.example.json` for a template. Non-empty
+`OPENCODE_PORT`, `OPENCODE_SERVER_USERNAME`, and `OPENCODE_SERVER_PASSWORD`
+environment variables override the corresponding file values. Restart Neovim
+after changing the file. If a shared pair is already running, use
+`:OpenCodeStop` before starting it again so port and authentication changes
+take effect.
+
+Without a configured port, the server prefers port `4096` and persists a high
+fallback port when `4096` is occupied. A port set by the config file or
+`OPENCODE_PORT` is used exactly. `:OpenCodeStart` refuses to launch when that
+port is occupied and never selects a fallback. Use `:OpenCodeStop` (or
+`:Opencode stop`) to stop the **shared** server, which affects other MkChad and
+web clients.
+
+Both ports bind to loopback. Set the config-file password (and optional
+username), or the corresponding environment variables, to enable OpenCode
+Basic Auth on both.
 Credentials sent by managed clients travel only inside CA-pinned TLS on the
 public endpoint; the internal HTTP endpoint receives no managed client bytes
 until the proxy proves ownership of that same established connection. This

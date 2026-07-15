@@ -15,6 +15,12 @@ local pidfd_helper_timeout_ms = 3000
 local subprocess_timeout_ms = 5000
 local subprocess_term_grace_ms = 250
 local subprocess_output_limit = 64 * 1024
+local server_config_path = vim.g.mkchad_opencode_test_api
+    and (vim.g.mkchad_opencode_test_server_config
+      or vim.fs.joinpath("/tmp/opencode", "mkchad-server-config-test-" .. vim.fn.getpid() .. ".json"))
+  or vim.fs.joinpath(vim.fn.stdpath("config"), "opencode-server.json")
+local server_config_error
+local server_config_applied = {}
 
 local ffi_ok, ffi = pcall(require, "ffi")
 if ffi_ok then
@@ -24,7 +30,7 @@ local flock_exclusive = 2
 local flock_nonblocking = 4
 local flock_unlock = 8
 
-local no_password_warning = "WARNING: OPENCODE_SERVER_PASSWORD is not set. TLS authenticates the OpenCode server, not clients; both the public proxy and discoverable internal loopback backend are accessible to other local users. Set a strong existing environment password, then stop and restart the shared server."
+local no_password_warning = "WARNING: OPENCODE_SERVER_PASSWORD is not set. TLS authenticates the OpenCode server, not clients; both the public proxy and discoverable internal loopback backend are accessible to other local users. Set a strong existing password in opencode-server.json or the process environment, then stop and restart the shared server."
 
 local function notify(message, level)
   vim.notify(message, level, { title = "OpenCode" })
@@ -539,6 +545,115 @@ local function safe_string(value, maximum)
     and not value:find("[%z\1-\31\127]")
 end
 
+local function load_server_config()
+  for name, value in pairs(server_config_applied) do
+    if vim.env[name] == value then
+      vim.env[name] = nil
+    end
+  end
+  server_config_applied = {}
+  server_config_error = nil
+
+  local config = {}
+  local metadata, metadata_err = uv.fs_lstat(server_config_path)
+  if not metadata and metadata_err and not tostring(metadata_err):find("ENOENT", 1, true) then
+    server_config_error = "cannot be inspected: " .. tostring(metadata_err)
+    return nil, server_config_error
+  end
+  if metadata then
+    if metadata.type ~= "file" then
+      server_config_error = "must be a regular file"
+      return nil, server_config_error
+    end
+    local fd, open_err = uv.fs_open(server_config_path, "r", 0)
+    if not fd then
+      server_config_error = "cannot be opened: " .. (open_err or "unknown error")
+      return nil, server_config_error
+    end
+    local stat = uv.fs_fstat(fd)
+    if not stat or stat.type ~= "file" then
+      uv.fs_close(fd)
+      server_config_error = "changed while being opened"
+      return nil, server_config_error
+    end
+    if metadata.dev ~= stat.dev or metadata.ino ~= stat.ino then
+      uv.fs_close(fd)
+      server_config_error = "changed while being opened"
+      return nil, server_config_error
+    end
+    if stat.mode % 512 ~= 384 then
+      uv.fs_close(fd)
+      server_config_error = "must have mode 0600"
+      return nil, server_config_error
+    end
+    if uv.getuid and stat.uid ~= uv.getuid() then
+      uv.fs_close(fd)
+      server_config_error = "must be owned by the current user"
+      return nil, server_config_error
+    end
+    if stat.size < 1 or stat.size > 64 * 1024 then
+      uv.fs_close(fd)
+      server_config_error = "must contain between 1 byte and 64 KiB"
+      return nil, server_config_error
+    end
+    local content, read_err = uv.fs_read(fd, stat.size, 0)
+    uv.fs_close(fd)
+    if not content or #content ~= stat.size then
+      server_config_error = "cannot be read completely: " .. (read_err or "short read")
+      return nil, server_config_error
+    end
+    local decoded, parsed = pcall(vim.json.decode, content)
+    if not decoded or type(parsed) ~= "table" or vim.islist(parsed) then
+      server_config_error = "must contain one JSON object"
+      return nil, server_config_error
+    end
+    local allowed = { port = true, username = true, password = true }
+    for key in pairs(parsed) do
+      if not allowed[key] then
+        server_config_error = "contains an unsupported key"
+        return nil, server_config_error
+      end
+    end
+    if parsed.port ~= nil and not is_integer(parsed.port, 1, 65535) then
+      server_config_error = "port must be an integer from 1 through 65535"
+      return nil, server_config_error
+    end
+    if parsed.username ~= nil and (not safe_string(parsed.username, 128) or parsed.username:find(":", 1, true)) then
+      server_config_error = "username must be a non-empty control-free string without ':'"
+      return nil, server_config_error
+    end
+    if parsed.password ~= nil and not safe_string(parsed.password, 4096) then
+      server_config_error = "password must be a non-empty control-free string"
+      return nil, server_config_error
+    end
+    config = parsed
+  end
+
+  local settings = {
+    { name = "OPENCODE_PORT", value = config.port and tostring(config.port) or nil },
+    { name = "OPENCODE_SERVER_USERNAME", value = config.username },
+    { name = "OPENCODE_SERVER_PASSWORD", value = config.password },
+  }
+  for _, setting in ipairs(settings) do
+    local name, value = setting.name, setting.value
+    if (not vim.env[name] or vim.env[name] == "") and value then
+      vim.env[name] = value
+      server_config_applied[name] = value
+    end
+  end
+  return true
+end
+
+load_server_config()
+
+local function server_setting_source(name)
+  local value = vim.env[name]
+  if not value or value == "" then
+    return nil
+  end
+  return server_config_applied[name] == value and "config file" or "environment"
+end
+
 local function absolute_path(value)
   return safe_string(value, 4096) and value:sub(1, 1) == "/"
 end
@@ -956,6 +1071,9 @@ local function port_is_available(port)
 end
 
 local function explicit_port()
+  if server_config_error then
+    return nil, "OpenCode server config " .. server_config_path .. " " .. server_config_error
+  end
   local value = vim.env.OPENCODE_PORT
   if not value or value == "" then
     return nil
@@ -1935,7 +2053,9 @@ local function select_port(state, excluded_ports)
   end
   if requested then
     if not port_is_available(requested) then
-      return nil, nil, "Explicit OPENCODE_PORT " .. requested .. " is occupied by an unknown or incompatible service"
+      local label = server_setting_source("OPENCODE_PORT") == "config file" and "Configured OpenCode port "
+        or "Explicit OPENCODE_PORT "
+      return nil, nil, label .. requested .. " is occupied by an unknown or incompatible service"
     end
     return requested, "explicit"
   end
@@ -2530,7 +2650,7 @@ local function managed_state_if_healthy(state, requested, callback)
       if requested and state.port ~= requested then
         callback(nil, {
           kind = "explicit-port-conflict",
-          message = "A managed OpenCode server uses " .. state.url .. "; stop the shared server before changing OPENCODE_PORT",
+          message = "A managed OpenCode server uses " .. state.url .. "; stop the shared server before changing the configured port",
         })
       else
         callback(state, detail)
@@ -3437,11 +3557,15 @@ local function reload_current_directory(callback)
 end
 
 local function render_info(state, state_status, configured, configured_err, url, executable, local_version)
+  local port_source = server_setting_source("OPENCODE_PORT")
+    or (state and state.port_source)
+    or "preferred 4096 on first use"
   local lines = {
     "State directory: " .. paths().root,
+    "Server config: " .. server_config_path,
     "State status: " .. state_status,
     "URL: " .. (url or "inactive"),
-    "Port source: " .. (configured and "explicit environment" or (state and state.port_source or "preferred 4096 on first use")),
+    "Port source: " .. port_source,
     "Local version: " .. (executable and local_version or "unavailable"),
     "Neovim cwd: " .. vim.fn.getcwd(),
     "Plugin SSE: " .. (require("opencode.server").connected and "connected" or "disconnected"),
@@ -3455,7 +3579,8 @@ local function render_info(state, state_status, configured, configured_err, url,
     "Proxy log: " .. paths().proxy_log,
     "Client authentication: "
       .. ((vim.env.OPENCODE_SERVER_PASSWORD and vim.env.OPENCODE_SERVER_PASSWORD ~= "")
-          and "OpenCode Basic Auth password is configured in this process environment"
+          and ("OpenCode Basic Auth password is configured by "
+            .. (server_setting_source("OPENCODE_SERVER_PASSWORD") or "the process environment"))
         or no_password_warning),
   }
   if configured_err then
@@ -3634,6 +3759,9 @@ if vim.g.mkchad_opencode_test_api then
     release_lock = release_lock,
     spawn_pair = spawn_pair,
     select_port = select_port,
+    load_server_config = load_server_config,
+    server_config_path = server_config_path,
+    server_setting_source = server_setting_source,
     terminate_process = terminate_process,
     stop_pair = stop_pair,
     stop_legacy = stop_legacy,
