@@ -6,6 +6,42 @@
 
 ## OpenCode shared server
 
+### Standalone lifecycle command
+
+After installing the Neovim container tools, use the active `neovim.sif` from
+an ordinary shell to manage the shared detached service without opening MkChad:
+
+```text
+mkchad-opencode-server start [--json]
+mkchad-opencode-server status [--json]
+mkchad-opencode-server stop [--json]
+```
+
+The command is installed as `~/.local/bin/mkchad-opencode-server` by
+`msk_containers/bin/install_nvim.sh`. It requires the installed MkChad lifecycle
+assets, the active `${NVIM_CONTAINER_DIR:-$HOME/containers}/neovim.sif` (or the
+supported `NVIM_CONT_LOCATION` override), and SingularityCE or Apptainer when
+run from the host. It uses minimal `nvim -u NONE` execution inside that image;
+it does not load `init.lua`, plugins, an attached OpenCode TUI, or a MkChad UI.
+There is no host-native OpenCode fallback.
+
+`start` reuses a fully validated generation or performs the bounded reviewed
+recovery flow. `status` is observational: it reports `healthy`, `inactive`,
+`unhealthy`, or `blocked` without starting, stopping, repairing, or creating
+lifecycle state. `stop` follows validated active state rather than the current
+transport setting and is an idempotent success when no managed service is
+active. Usage errors exit `2`; refused or failed start/stop operations exit `1`;
+completed operations, including observational unhealthy or blocked status, exit
+`0`.
+
+With `--json`, stdout contains exactly one versioned JSON result and newline.
+Successful healthy results contain only `url`, `transport`, `generation`, and
+the active `ca_cert` (or JSON `null` in direct mode); they never contain
+credentials or config contents. Keep wrapper/runtime diagnostics on stderr.
+If the runtime, active image, or lifecycle asset is missing, correct that
+installation issue before retrying; do not bypass the managed state with a
+host-native server.
+
 OpenCode starts lazily: ordinary MkChad startup and `:OpenCodeInfo` do not
 create a server. The first OpenCode action starts one detached loopback-only
 server and attaches a local TUI for the current Neovim directory. The default

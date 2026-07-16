@@ -9,16 +9,20 @@ local local_tui_bootstrap_ms = 200
 local lock_renew_interval_ms = 3000
 local proxy_max_connections = 128
 local password_warning_shown = false
+local lifecycle_reporter
 local fence_poll_interval_ms = 20
 local fence_acquire_timeout_ms = 1000
 local pidfd_helper_timeout_ms = 3000
 local subprocess_timeout_ms = 5000
 local subprocess_term_grace_ms = 250
 local subprocess_output_limit = 64 * 1024
+local lifecycle_only = vim.g.mkchad_opencode_lifecycle_only == true
+local config_home = vim.env.XDG_CONFIG_HOME or vim.fs.joinpath(vim.env.HOME or "", ".config")
+local state_home = vim.env.XDG_STATE_HOME or vim.fs.joinpath(vim.env.HOME or "", ".local", "state")
 local server_config_path = vim.g.mkchad_opencode_test_api
     and (vim.g.mkchad_opencode_test_server_config
       or vim.fs.joinpath("/tmp/opencode", "mkchad-server-config-test-" .. vim.fn.getpid() .. ".json"))
-  or vim.fs.joinpath(vim.fn.stdpath("config"), "opencode-server.json")
+  or vim.fs.joinpath(config_home, "mkchad", "opencode-server.json")
 local server_config_error
 local server_config_applied = {}
 local server_config_tls_proxy = true
@@ -40,6 +44,12 @@ local function no_password_warning()
 end
 
 local function notify(message, level)
+  if lifecycle_reporter then
+    local reporter = lifecycle_reporter
+    lifecycle_reporter = nil
+    reporter(message, level)
+    return
+  end
   vim.notify(message, level, { title = "OpenCode" })
 end
 
@@ -55,7 +65,7 @@ local function hostname()
 end
 
 local function paths()
-  local root = vim.fs.joinpath(vim.fn.stdpath("state"), "opencode", hostname())
+  local root = vim.fs.joinpath(state_home, "mkchad", "opencode", hostname())
   return {
     root = root,
     state = vim.fs.joinpath(root, "state.json"),
@@ -2646,7 +2656,7 @@ local function finish_ensure(ok, err, state)
   local callbacks = ensure_waiters
   ensure_waiters = {}
   ensure_active = false
-  if ok then
+  if ok and not lifecycle_only then
     warn_no_password()
   end
   for _, callback in ipairs(callbacks) do
@@ -3590,7 +3600,8 @@ local function spawn_pair(previous, deadline_ns, callback, excluded_public, excl
   end)
 end
 
-local function ensure_backend(callback)
+local function ensure_backend(callback, attach_tui)
+  attach_tui = attach_tui ~= false
   table.insert(ensure_waiters, callback)
   if ensure_active then
     return
@@ -3603,6 +3614,15 @@ local function ensure_backend(callback)
     operation_timeout_ms = vim.g.mkchad_opencode_test_timeout_ms
   end
   local deadline_ns = uv.hrtime() + operation_timeout_ms * 1000000
+  local function finish_started(state)
+    if not attach_tui then
+      finish_ensure(true, nil, state)
+      return
+    end
+    ensure_local_tui(state, function(ok, err)
+      finish_ensure(ok, err, state)
+    end)
+  end
   local state, initial_status = read_state()
   local requested, request_err = explicit_port()
   if request_err then
@@ -3658,9 +3678,7 @@ local function ensure_backend(callback)
     managed_state_if_healthy(locked_state, requested, function(rechecked, detail)
       if rechecked then
         release_lock()
-        ensure_local_tui(rechecked, function(ok, err)
-          finish_ensure(ok, err, rechecked)
-        end)
+        finish_started(rechecked)
         return
       end
       local hard_error = detail_error(detail, locked_state)
@@ -3703,9 +3721,7 @@ local function ensure_backend(callback)
             finish_ensure(false, start_err)
             return
           end
-          ensure_local_tui(started, function(ok, err)
-            finish_ensure(ok, err, started)
-          end)
+          finish_started(started)
         end)
       end
       local function after_pending_cleanup()
@@ -3777,9 +3793,7 @@ local function ensure_backend(callback)
   end
   managed_state_if_healthy(state, requested, function(healthy_state, detail)
     if healthy_state then
-      ensure_local_tui(healthy_state, function(ok, err)
-        finish_ensure(ok, err, healthy_state)
-      end)
+      finish_started(healthy_state)
       return
     end
     local hard_error = detail_error(detail, state)
@@ -3793,9 +3807,7 @@ local function ensure_backend(callback)
           local waiting_state = read_state()
           managed_state_if_healthy(waiting_state, requested, function(winner, winner_detail)
             if winner then
-              ensure_local_tui(winner, function(ok, err)
-                finish_ensure(ok, err, winner)
-              end)
+              finish_started(winner)
               return
             end
             local winner_error = detail_error(winner_detail, waiting_state)
@@ -4296,6 +4308,55 @@ local function show_info()
   end)
 end
 
+-- These lifecycle-only operations are deliberately independent of the editor
+-- presentation layer.  The standalone entrypoint uses them from a fresh
+-- headless Neovim process; the normal adapter continues to own notifications
+-- and the attached terminal.
+local function ensure_server(callback)
+  local loaded, config_err = load_server_config()
+  if not loaded then
+    callback(false, "OpenCode server configuration " .. (config_err or "is invalid"))
+    return
+  end
+  ensure_backend(callback, false)
+end
+
+local function observe_server(callback)
+  local loaded, config_err = load_server_config()
+  if not loaded then
+    callback("blocked", nil, "OpenCode server configuration " .. (config_err or "is invalid"))
+    return
+  end
+  local state, state_status = read_state()
+  if not state then
+    callback(state_status == "missing" and "inactive" or "blocked", nil, state_status)
+    return
+  end
+  if state.schema == 1 then
+    callback("blocked", nil, "schema 1 state is legacy and is never probed")
+    return
+  end
+  managed_state_if_healthy(state, nil, function(healthy, detail)
+    if healthy then
+      callback("healthy", healthy)
+      return
+    end
+    local message = detail and (detail.message or detail.kind) or "unknown state validation failure"
+    callback(detail and detail.kind == "owned-unhealthy" and "unhealthy" or "blocked", nil, message)
+  end)
+end
+
+local function stop_server(callback)
+  if lifecycle_reporter then
+    callback(false, "another lifecycle result is pending")
+    return
+  end
+  lifecycle_reporter = function(message, level)
+    callback(level ~= vim.log.levels.ERROR and level ~= vim.log.levels.WARN, message)
+  end
+  stop_shared_server()
+end
+
 local function move_terminal(position)
   if position ~= "default" and not terminal_sizes[position] then
     notify("Usage: :Opencode move " .. table.concat(terminal_positions, "|"), vim.log.levels.ERROR)
@@ -4347,6 +4408,7 @@ local function run_opencode_command(opts)
   end
 end
 
+if not lifecycle_only then
 vim.g.opencode_opts = {
   server = {
     url = function(callback)
@@ -4391,6 +4453,7 @@ end, {
   desc = "Reload the current OpenCode directory instance without restarting the shared server",
   force = true,
 })
+end
 
 -- Narrow test seam for the headless lifecycle regression script. It is only
 -- installed when explicitly requested before this configuration is sourced.
@@ -4448,6 +4511,16 @@ if vim.g.mkchad_opencode_test_api then
     reload_current_directory = reload_current_directory,
     show_info = show_info,
     stop_shared_server = stop_shared_server,
+    ensure_server = ensure_server,
+    observe_server = observe_server,
+    stop_server = stop_server,
     tui_valid = tui_valid,
   }
 end
+
+return {
+  ensure = ensure_server,
+  status = observe_server,
+  stop = stop_server,
+  paths = paths,
+}
