@@ -25,6 +25,16 @@ run from the host. It uses minimal `nvim -u NONE` execution inside that image;
 it does not load `init.lua`, plugins, an attached OpenCode TUI, or a MkChad UI.
 There is no host-native OpenCode fallback.
 
+MkChad uses this same command asynchronously before it connects opencode.nvim.
+It accepts only the current validated command result for its URL and TLS CA;
+command failure leaves no plugin terminal-start fallback. `:OpenCodeStop` uses
+the command and closes only that editor's local TUI after successful or inactive
+stop. `:OpenCodeInfo` obtains its server status through the command while
+reporting editor-local TUI and SSE presentation separately. When invoked from a
+MkChad Neovim image, the wrapper recognizes the image/runtime marker and runs
+that image's Neovim directly without nesting SingularityCE or Apptainer; its
+MkChad XDG, npm, and `OPENCODE_CONFIG` environment remain in effect.
+
 `start` reuses a fully validated generation or performs the bounded reviewed
 recovery flow. `status` is observational: it reports `healthy`, `inactive`,
 `unhealthy`, or `blocked` without starting, stopping, repairing, or creating

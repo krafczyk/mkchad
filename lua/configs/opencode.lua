@@ -3834,17 +3834,210 @@ local function ensure_backend(callback, attach_tui)
   end)
 end
 
+-- The editor never owns a detached server generation.  It consumes the
+-- versioned result from the installed command instead, retaining only the
+-- endpoint data needed for its local client and attached TUI.
+local command_adapter = {
+  timeout_ms = startup_timeout_ms + 10000,
+  endpoint_cache = nil,
+  endpoint_epoch = 0,
+}
+
+function command_adapter.safe_string(value, maximum)
+  return type(value) == "string"
+    and value ~= ""
+    and #value <= maximum
+    and not value:find("[%z\1-\31\127]")
+end
+
+function command_adapter.complete_json_object(value)
+  if type(value) ~= "string" or value:sub(1, 1) ~= "{" or value:sub(-1) == "\n" then
+    return false
+  end
+  local depth = 0
+  local quoted = false
+  local escaped = false
+  for index = 1, #value do
+    local byte = value:byte(index)
+    if quoted then
+      if escaped then
+        escaped = false
+      elseif byte == 92 then
+        escaped = true
+      elseif byte == 34 then
+        quoted = false
+      end
+    elseif byte == 34 then
+      quoted = true
+    elseif byte == 123 then
+      depth = depth + 1
+    elseif byte == 125 then
+      depth = depth - 1
+      if depth == 0 then
+        return index == #value
+      elseif depth < 0 then
+        return false
+      end
+    end
+  end
+  return false
+end
+
+function command_adapter.endpoint_state(value)
+  if type(value) ~= "table" then
+    return nil
+  end
+  local url = value.url
+  local transport = value.transport
+  local generation = value.generation
+  local ca_cert = value.ca_cert
+  local port = type(url) == "string" and tonumber(url:match("^https?://127%.0%.0%.1:(%d+)$")) or nil
+  if not port or port < 1 or port > 65535 or not command_adapter.safe_string(generation, 256) then
+    return nil
+  end
+  if transport == "tls-proxy" then
+    if not url:match("^https://127%.0%.0%.1:%d+$") or not command_adapter.safe_string(ca_cert, 4096) or ca_cert:sub(1, 1) ~= "/" then
+      return nil
+    end
+  elseif transport == "loopback-http" then
+    if not url:match("^http://127%.0%.0%.1:%d+$") or ca_cert ~= vim.NIL then
+      return nil
+    end
+  else
+    return nil
+  end
+  return { url = url, transport = transport, generation = generation, ca_cert = ca_cert }
+end
+
+function command_adapter.decode(action, stdout)
+  if type(stdout) ~= "string" or #stdout == 0 or #stdout > subprocess_output_limit or stdout:sub(-1) ~= "\n" then
+    return nil, "mkchad-opencode-server returned empty or oversized machine output"
+  end
+  local json = stdout:sub(1, -2)
+  if not command_adapter.complete_json_object(json) then
+    return nil, "mkchad-opencode-server returned malformed or trailing machine output"
+  end
+  local decoded_ok, result = pcall(vim.json.decode, json)
+  if not decoded_ok or type(result) ~= "table" then
+    return nil, "mkchad-opencode-server returned malformed machine output"
+  end
+  if result.schema ~= 1 or type(result.ok) ~= "boolean" or result.command ~= action or type(result.status) ~= "string" then
+    return nil, "mkchad-opencode-server returned an unsupported machine result"
+  end
+  if result.ok then
+    if result.status == "healthy" then
+      result.state = command_adapter.endpoint_state(result.state)
+      if not result.state then
+        return nil, "mkchad-opencode-server returned an inconsistent endpoint"
+      end
+    elseif (result.status == "inactive" or result.status == "unhealthy" or result.status == "blocked") and result.state == vim.NIL then
+      -- An observational result has no endpoint unless it is healthy.
+    else
+      return nil, "mkchad-opencode-server returned an inconsistent status result"
+    end
+    if action == "start" and (result.status ~= "healthy" or not result.state) then
+      return nil, "mkchad-opencode-server did not start a healthy endpoint"
+    end
+    if action == "stop" and result.status ~= "inactive" then
+      return nil, "mkchad-opencode-server returned an inconsistent stop result"
+    end
+    return result
+  end
+  if result.status ~= "blocked"
+    or type(result.error) ~= "table"
+    or type(result.error.code) ~= "string"
+    or not result.error.code:match("^[a-z0-9_]+$")
+    or not command_adapter.safe_string(result.error.message, 1024)
+  then
+    return nil, "mkchad-opencode-server returned an invalid failure result"
+  end
+  return nil, "mkchad-opencode-server: " .. result.error.message
+end
+
+function command_adapter.argv(action)
+  local argv = { "mkchad-opencode-server" }
+  if vim.g.mkchad_opencode_test_api and type(vim.g.mkchad_opencode_test_command_argv) == "table" then
+    argv = vim.deepcopy(vim.g.mkchad_opencode_test_command_argv)
+  end
+  table.insert(argv, action)
+  table.insert(argv, "--json")
+  return argv
+end
+
+function command_adapter.invoke(action, callback)
+  run_subprocess(command_adapter.argv(action), { timeout_ms = command_adapter.timeout_ms }, function(result, command_err)
+    if command_err or not result or result.code ~= 0 then
+      callback(nil, "mkchad-opencode-server " .. action .. " failed")
+      return
+    end
+    local parsed, parse_err = command_adapter.decode(action, result.stdout)
+    callback(parsed, parse_err)
+  end)
+end
+
+function command_adapter.cached_endpoint()
+  if not command_adapter.endpoint_cache then
+    return nil
+  end
+  return {
+    schema = 3,
+    url = command_adapter.endpoint_cache.url,
+    transport = command_adapter.endpoint_cache.transport,
+    generation = command_adapter.endpoint_cache.generation,
+    ca_path = command_adapter.endpoint_cache.ca_cert,
+  }
+end
+
+function command_adapter.ensure(callback)
+  command_adapter.endpoint_epoch = command_adapter.endpoint_epoch + 1
+  local epoch = command_adapter.endpoint_epoch
+  command_adapter.endpoint_cache = nil
+  command_adapter.invoke("start", function(result, command_err)
+    if epoch ~= command_adapter.endpoint_epoch then
+      callback(false, "OpenCode lifecycle command result was superseded")
+    elseif not result then
+      command_adapter.endpoint_cache = nil
+      callback(false, command_err)
+    else
+      command_adapter.endpoint_cache = result.state
+      callback(true, nil, command_adapter.cached_endpoint())
+    end
+  end)
+end
+
+function command_adapter.status(callback)
+  command_adapter.invoke("status", function(result, command_err)
+    if result then
+      callback(result.status, result.state, nil)
+    else
+      callback("blocked", nil, command_err)
+    end
+  end)
+end
+
+function command_adapter.stop(callback)
+  command_adapter.endpoint_epoch = command_adapter.endpoint_epoch + 1
+  command_adapter.endpoint_cache = nil
+  command_adapter.invoke("stop", function(result, command_err)
+    callback(result ~= nil, command_err)
+  end)
+end
+
 local function show_local_tui(toggle)
-  ensure_backend(function(ok, err)
+  command_adapter.ensure(function(ok, err, state)
     if not ok then
       notify(err, vim.log.levels.ERROR)
       return
     end
-    if toggle then
-      local_tui.term:toggle()
-    else
-      local_tui.term:show()
-    end
+    ensure_local_tui(state, function(tui_ok, tui_err)
+      if not tui_ok then
+        notify(tui_err, vim.log.levels.ERROR)
+      elseif toggle then
+        local_tui.term:toggle()
+      else
+        local_tui.term:show()
+      end
+    end)
   end)
 end
 
@@ -4298,13 +4491,37 @@ local function render_info(state, state_status, launch_intent, launch_status, co
 end
 
 local function show_info()
-  local state, state_status = read_state()
-  local launch_intent, launch_status = read_launch_intent()
-  local configured, configured_err = explicit_port()
-  local scheme = requested_transport() == "tls-proxy" and "https" or "http"
-  local url = state and state.url or (configured and ("%s://%s:%d"):format(scheme, host, configured))
-  resolve_executable(uv.hrtime() + subprocess_timeout_ms * 1000000, function(executable, local_version)
-    render_info(state, state_status, launch_intent, launch_status, configured, configured_err, url, executable, local_version)
+  if vim.g.mkchad_opencode_test_api and not vim.g.mkchad_opencode_test_command_argv then
+    local state, state_status = read_state()
+    local launch_intent, launch_status = read_launch_intent()
+    local configured, configured_err = explicit_port()
+    local scheme = requested_transport() == "tls-proxy" and "https" or "http"
+    local url = state and state.url or (configured and ("%s://%s:%d"):format(scheme, host, configured))
+    resolve_executable(uv.hrtime() + subprocess_timeout_ms * 1000000, function(executable, local_version)
+      render_info(state, state_status, launch_intent, launch_status, configured, configured_err, url, executable, local_version)
+    end)
+    return
+  end
+  command_adapter.status(function(status, state, command_err)
+    local server = package.loaded["opencode.server"]
+    local lines = {
+      "Command status: " .. status,
+      "URL: " .. (state and state.url or "inactive"),
+      "Transport: " .. (state and state.transport or "inactive"),
+      "Generation: " .. (state and state.generation or "inactive"),
+      "Plugin SSE: " .. (server and server.connected and "connected" or "disconnected"),
+      "Local TUI: "
+        .. (tui_valid()
+            and ("valid; " .. local_tui.url .. "; " .. local_tui.directory .. "; generation " .. local_tui.generation)
+          or "absent"),
+    }
+    if state and state.transport == "tls-proxy" then
+      table.insert(lines, "CA certificate: " .. state.ca_cert)
+    end
+    if command_err then
+      table.insert(lines, "Command diagnostic: " .. command_err)
+    end
+    notify(table.concat(lines, "\n"), (status == "healthy" or status == "inactive") and vim.log.levels.INFO or vim.log.levels.WARN)
   end)
 end
 
@@ -4390,7 +4607,14 @@ local function run_opencode_command(opts)
   elseif action == "start" then
     show_local_tui(false)
   elseif action == "stop" then
-    stop_shared_server()
+    command_adapter.stop(function(stopped, stop_err)
+      if stopped then
+        close_local_tui()
+        notify("Stopped shared OpenCode server", vim.log.levels.INFO)
+      else
+        notify(stop_err or "Unable to stop shared OpenCode server", vim.log.levels.ERROR)
+      end
+    end)
   elseif action == "info" then
     show_info()
   elseif action == "reload" then
@@ -4412,17 +4636,26 @@ if not lifecycle_only then
 vim.g.opencode_opts = {
   server = {
     url = function(callback)
-      local state = read_state()
-      callback(state and (state.schema == 2 or state.schema == 3) and state.url or nil)
+      if vim.g.mkchad_opencode_test_api and not vim.g.mkchad_opencode_test_command_argv then
+        local state = read_state()
+        callback(state and (state.schema == 2 or state.schema == 3) and state.url or nil)
+      else
+        callback(command_adapter.endpoint_cache and command_adapter.endpoint_cache.url or nil)
+      end
     end,
     ensure = function(callback)
-      ensure_backend(function(ok, err)
-        callback(ok, err)
-      end)
+      if vim.g.mkchad_opencode_test_api and not vim.g.mkchad_opencode_test_command_argv then
+        ensure_backend(callback)
+      else
+        command_adapter.ensure(callback)
+      end
     end,
     ca_cert = function()
-      local state = read_state()
-      return state and state_transport(state) == "tls-proxy" and state.ca_path or nil
+      if vim.g.mkchad_opencode_test_api and not vim.g.mkchad_opencode_test_command_argv then
+        local state = read_state()
+        return state and state_transport(state) == "tls-proxy" and state.ca_path or nil
+      end
+      return command_adapter.endpoint_cache and command_adapter.endpoint_cache.transport == "tls-proxy" and command_adapter.endpoint_cache.ca_cert or nil
     end,
     start = false,
   },
@@ -4437,7 +4670,16 @@ vim.api.nvim_create_user_command("Opencode", run_opencode_command, {
 vim.api.nvim_create_user_command("OpenCodeStart", function()
   show_local_tui(false)
 end, { desc = "Start the shared OpenCode server and local TUI", force = true })
-vim.api.nvim_create_user_command("OpenCodeStop", stop_shared_server, {
+vim.api.nvim_create_user_command("OpenCodeStop", function()
+  command_adapter.stop(function(stopped, stop_err)
+    if stopped then
+      close_local_tui()
+      notify("Stopped shared OpenCode server", vim.log.levels.INFO)
+    else
+      notify(stop_err or "Unable to stop shared OpenCode server", vim.log.levels.ERROR)
+    end
+  end)
+end, {
   desc = "Stop the shared OpenCode server and close the local TUI",
   force = true,
 })
@@ -4514,6 +4756,9 @@ if vim.g.mkchad_opencode_test_api then
     ensure_server = ensure_server,
     observe_server = observe_server,
     stop_server = stop_server,
+    command_adapter_ensure = command_adapter.ensure,
+    command_adapter_status = command_adapter.status,
+    command_adapter_stop = command_adapter.stop,
     tui_valid = tui_valid,
   }
 end
