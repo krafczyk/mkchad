@@ -100,11 +100,16 @@ local function result_state(state)
   if transport == "tls-proxy" and type(ca_cert) ~= "string" then
     return nil
   end
+  local server_version = state.backend and state.backend.server_version
+  if server_version ~= nil and (has_control(server_version) or #server_version > 128) then
+    return nil
+  end
   return {
     url = state.url,
     transport = transport,
     generation = state.generation,
     ca_cert = ca_cert,
+    server_version = server_version,
   }
 end
 
@@ -115,6 +120,7 @@ local function human_status(status, state, message)
     "URL: " .. (state and state.url or "inactive"),
     "Transport: " .. (state and state.transport or "inactive"),
     "Generation: " .. (state and state.generation or "inactive"),
+    "Server version: " .. (state and state.server_version or "unknown"),
   }
   if state and state.transport == "tls-proxy" then
     table.insert(lines, "CA certificate: " .. state.ca_cert)

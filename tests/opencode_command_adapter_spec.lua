@@ -9,19 +9,24 @@ vim.fn.writefile({
   "import json, os, sys, time",
   "action = sys.argv[1]",
   "with open(os.environ['MKCHAD_COMMAND_LOG'], 'a') as output: output.write(action + '\\n')",
-  "if action == 'status': print(json.dumps({'schema': 1, 'ok': True, 'command': action, 'status': 'inactive', 'state': None})); raise SystemExit(0)",
+  "if action == 'status':",
+  "  if os.environ.get('MKCHAD_STATUS_MODE') == 'healthy': print(json.dumps({'schema': 1, 'ok': True, 'command': action, 'status': 'healthy', 'state': {'url': 'http://127.0.0.1:4096', 'transport': 'loopback-http', 'generation': 'external-generation', 'ca_cert': None, 'server_version': 'fixture-server'}}))",
+  "  else: print(json.dumps({'schema': 1, 'ok': True, 'command': action, 'status': 'inactive', 'state': None}))",
+  "  raise SystemExit(0)",
   "if action == 'stop': print(json.dumps({'schema': 1, 'ok': True, 'command': action, 'status': 'inactive', 'state': None})); raise SystemExit(0)",
   "mode = os.environ.get('MKCHAD_COMMAND_MODE', 'valid')",
   "if mode == 'malformed': print('not json')",
   "elif mode == 'trailing': print(json.dumps({'schema': 1, 'ok': True, 'command': action, 'status': 'healthy', 'state': {'url': 'http://127.0.0.1:4096', 'transport': 'loopback-http', 'generation': 'external-generation', 'ca_cert': None}}) + ' trailing')",
   "elif mode == 'oversized': print('x' * (64 * 1024 + 1))",
   "elif mode == 'exit': print(json.dumps({'schema': 1, 'ok': True, 'command': action, 'status': 'healthy', 'state': {'url': 'http://127.0.0.1:4096', 'transport': 'loopback-http', 'generation': 'external-generation', 'ca_cert': None}})); raise SystemExit(7)",
+  "elif mode == 'badversion': print(json.dumps({'schema': 1, 'ok': True, 'command': action, 'status': 'healthy', 'state': {'url': 'http://127.0.0.1:4096', 'transport': 'loopback-http', 'generation': 'external-generation', 'ca_cert': None, 'server_version': 7}}))",
   "elif mode == 'blocked': print(json.dumps({'schema': 1, 'ok': False, 'command': action, 'status': 'blocked', 'error': {'code': 'fixture_blocked', 'message': 'fixture refused startup'}})); raise SystemExit(1)",
+  "elif mode == 'legacy': print(json.dumps({'schema': 1, 'ok': True, 'command': action, 'status': 'healthy', 'state': {'url': 'http://127.0.0.1:4096', 'transport': 'loopback-http', 'generation': 'legacy-generation', 'ca_cert': None}}))",
   "else:",
   "  if mode == 'slow': time.sleep(0.3); generation = 'stale-generation'",
   "  elif mode == 'valid2': generation = 'new-generation'",
   "  else: generation = 'external-generation'",
-  "  print(json.dumps({'schema': 1, 'ok': True, 'command': action, 'status': 'healthy', 'state': {'url': 'http://127.0.0.1:4096', 'transport': 'loopback-http', 'generation': generation, 'ca_cert': None}}))",
+  "  print(json.dumps({'schema': 1, 'ok': True, 'command': action, 'status': 'healthy', 'state': {'url': 'http://127.0.0.1:4096', 'transport': 'loopback-http', 'generation': generation, 'ca_cert': None, 'server_version': 'fixture-server'}}))",
 }, fixture)
 assert(vim.uv.fs_chmod(fixture, 493))
 
@@ -84,15 +89,20 @@ expect_start_failure("malformed")
 expect_start_failure("trailing")
 expect_start_failure("oversized")
 expect_start_failure("exit")
+expect_start_failure("badversion")
 assert(expect_start_failure("blocked") == "mkchad-opencode-server: fixture refused startup", "structured command failure was hidden")
 vim.g.mkchad_opencode_test_command_argv = { vim.fs.joinpath(root, "missing-command") }
 local spawn_ok, spawn_err = await(api.command_adapter_ensure)
 vim.g.mkchad_opencode_test_command_argv = fixture_argv
 assert(spawn_ok == false and spawn_err:find("unable to start missing-command", 1, true), "spawn failure was hidden")
 
+vim.env.MKCHAD_COMMAND_MODE = "legacy"
+local legacy_ok, legacy_err, legacy_state = await(api.command_adapter_ensure)
+assert(legacy_ok and not legacy_err and legacy_state.generation == "legacy-generation" and legacy_state.server_version == nil)
+
 vim.env.MKCHAD_COMMAND_MODE = "valid"
 local ok, err, state = await(api.command_adapter_ensure)
-assert(ok and not err and state.generation == "external-generation")
+assert(ok and not err and state.generation == "external-generation" and state.server_version == "fixture-server")
 local url
 vim.g.opencode_opts.server.url(function(value)
   url = value
@@ -119,6 +129,21 @@ assert(url == "http://127.0.0.1:4096", "stale completion replaced the current en
 
 local status = await(api.command_adapter_status)
 assert(status == "inactive", "status was not delegated to the command")
+vim.env.MKCHAD_STATUS_MODE = "healthy"
+local healthy_status, healthy_state = await(api.command_adapter_status)
+assert(healthy_status == "healthy" and healthy_state.server_version == "fixture-server", "status omitted server version")
+local info
+local original_notify = vim.notify
+vim.notify = function(message)
+  info = message
+end
+api.show_info()
+assert(vim.wait(5000, function()
+  return info ~= nil
+end, 10), "OpenCodeInfo callback timed out")
+vim.notify = original_notify
+vim.env.MKCHAD_STATUS_MODE = nil
+assert(info:find("Server version: fixture-server", 1, true), "OpenCodeInfo omitted server version")
 local attached, closed = 0, false
 package.loaded["snacks.terminal"] = {
   get = function()

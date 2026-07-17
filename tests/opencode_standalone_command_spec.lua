@@ -71,6 +71,7 @@ assert(inactive_human.stdout == table.concat({
   "URL: inactive",
   "Transport: inactive",
   "Generation: inactive",
+  "Server version: unknown",
   "",
 }, "\n"), "inactive human status changed")
 
@@ -79,6 +80,7 @@ assert(started.code == 0 and started.stdout:match("^%b{}\n$"), started.stderr)
 local started_result = vim.json.decode(started.stdout)
 assert(started_result.ok and started_result.status == "healthy")
 assert(started_result.state.transport == "loopback-http" and started_result.state.ca_cert == vim.NIL)
+assert(started_result.state.server_version == "standalone-test")
 assert(started_result.state.url:match("^http://127%.0%.0%.1:%d+$"))
 local healthy_human = invoke("status")
 assert(healthy_human.code == 0, healthy_human.stderr)
@@ -87,6 +89,7 @@ assert(healthy_human.stdout == table.concat({
   "URL: " .. started_result.state.url,
   "Transport: loopback-http",
   "Generation: " .. started_result.state.generation,
+  "Server version: standalone-test",
   "",
 }, "\n"), "healthy human status did not report shared server details")
 

@@ -51,13 +51,15 @@ completed operations, including observational unhealthy or blocked status, exit
 `0`.
 
 With `--json`, stdout contains exactly one versioned JSON result and newline.
-Successful healthy results contain only `url`, `transport`, `generation`, and
-the active `ca_cert` (or JSON `null` in direct mode); they never contain
-credentials or config contents. Keep wrapper/runtime diagnostics on stderr.
+Successful healthy results contain only `url`, `transport`, `generation`, the
+live `server_version`, and the active `ca_cert` (or JSON `null` in direct mode);
+they never contain credentials or config contents. Keep wrapper/runtime
+diagnostics on stderr.
 Without `--json`, `status` reports the shared `:OpenCodeInfo` fields available
-outside the editor: command status, public URL, transport, generation, active
-TLS CA, and any blocked or unhealthy lifecycle diagnostic. Editor-local plugin
-SSE and attached-TUI state remain exclusive to `:OpenCodeInfo`.
+outside the editor: command status, public URL, transport, generation, live
+server version, active TLS CA, and any blocked or unhealthy lifecycle
+diagnostic. Editor-local plugin SSE and attached-TUI state remain exclusive to
+`:OpenCodeInfo`.
 If the runtime, active image, or lifecycle asset is missing, correct that
 installation issue before retrying; do not bypass the managed state with a
 host-native server.

@@ -2822,6 +2822,9 @@ local function managed_state_if_healthy(state, requested, callback)
     if detail.kind == "unauthorized" then
       callback(nil, detail)
     elseif health then
+      if safe_string(health.version, 128) then
+        state.backend.server_version = health.version
+      end
       if requested and state.port ~= requested then
         callback(nil, {
           kind = "explicit-port-conflict",
@@ -3891,8 +3894,12 @@ function command_adapter.endpoint_state(value)
   local transport = value.transport
   local generation = value.generation
   local ca_cert = value.ca_cert
+  local server_version = value.server_version
   local port = type(url) == "string" and tonumber(url:match("^https?://127%.0%.0%.1:(%d+)$")) or nil
   if not port or port < 1 or port > 65535 or not command_adapter.safe_string(generation, 256) then
+    return nil
+  end
+  if server_version ~= nil and not command_adapter.safe_string(server_version, 128) then
     return nil
   end
   if transport == "tls-proxy" then
@@ -3906,7 +3913,7 @@ function command_adapter.endpoint_state(value)
   else
     return nil
   end
-  return { url = url, transport = transport, generation = generation, ca_cert = ca_cert }
+  return { url = url, transport = transport, generation = generation, ca_cert = ca_cert, server_version = server_version }
 end
 
 function command_adapter.decode(action, stdout)
@@ -4012,6 +4019,7 @@ function command_adapter.cached_endpoint()
     transport = command_adapter.endpoint_cache.transport,
     generation = command_adapter.endpoint_cache.generation,
     ca_path = command_adapter.endpoint_cache.ca_cert,
+    server_version = command_adapter.endpoint_cache.server_version,
   }
 end
 
@@ -4536,6 +4544,7 @@ local function show_info()
       "URL: " .. (state and state.url or "inactive"),
       "Transport: " .. (state and state.transport or "inactive"),
       "Generation: " .. (state and state.generation or "inactive"),
+      "Server version: " .. (state and state.server_version or "unknown"),
       "Plugin SSE: " .. (server and server.connected and "connected" or "disconnected"),
       "Local TUI: "
         .. (tui_valid()
