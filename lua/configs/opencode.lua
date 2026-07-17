@@ -3962,7 +3962,11 @@ function command_adapter.argv(action)
     if not command_adapter.safe_string(vim.env.HOME, 4096) or vim.env.HOME:sub(1, 1) ~= "/" then
       return nil, "Unable to locate installed mkchad-opencode-server: HOME must be an absolute path"
     end
-    argv = { vim.fs.joinpath(vim.env.HOME, ".local", "bin", "mkchad-opencode-server") }
+    local bin = vim.fs.joinpath(vim.env.HOME, ".local", "bin")
+    local image_command = vim.fs.joinpath(bin, "mkchad-opencode-server-image")
+    local executable = vim.fn.executable(image_command) == 1 and image_command
+      or vim.fs.joinpath(bin, "mkchad-opencode-server")
+    argv = { executable }
   end
   table.insert(argv, action)
   table.insert(argv, "--json")

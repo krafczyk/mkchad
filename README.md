@@ -17,15 +17,21 @@ mkchad-opencode-server status [--json]
 mkchad-opencode-server stop [--json]
 ```
 
-The command is installed as `~/.local/bin/mkchad-opencode-server` by
-`msk_containers/bin/install_nvim.sh`. It requires the installed MkChad lifecycle
-assets, the active `${NVIM_CONTAINER_DIR:-$HOME/containers}/neovim.sif` (or the
-supported `NVIM_CONT_LOCATION` override), and SingularityCE or Apptainer when
-run from the host. It uses minimal `nvim -u NONE` execution inside that image;
-it does not load `init.lua`, plugins, an attached OpenCode TUI, or a MkChad UI.
-There is no host-native OpenCode fallback.
+The public host command is installed as `~/.local/bin/mkchad-opencode-server`
+by `msk_containers/bin/install_nvim.sh`. It enters the active image through the
+same `ct_exec.sh` launcher as MkChad, including configured container mounts,
+then delegates to the installed `mkchad-opencode-server-image` companion.
+MkChad prefers that companion directly because it is already inside the image;
+during a staggered upgrade it falls back to the public launcher's compatible
+in-image route until the companion has been installed.
+The commands require the installed MkChad lifecycle assets, the active
+`${NVIM_CONTAINER_DIR:-$HOME/containers}/neovim.sif` (or the supported
+`NVIM_CONT_LOCATION` override), and SingularityCE or Apptainer when run from the
+host. They use minimal `nvim -u NONE` execution; they do not load `init.lua`,
+plugins, an attached OpenCode TUI, or a MkChad UI. There is no host-native
+OpenCode fallback.
 
-MkChad uses this same command asynchronously before it connects opencode.nvim.
+MkChad uses the in-image companion asynchronously before it connects opencode.nvim.
 It accepts only the current validated command result for its URL and TLS CA;
 command failure leaves no plugin terminal-start fallback. `:OpenCodeStop` uses
 the command and closes only that editor's local TUI after successful or inactive

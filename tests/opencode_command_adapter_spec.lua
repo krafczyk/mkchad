@@ -32,11 +32,21 @@ dofile(config)
 local api = vim.g.mkchad_opencode_test_api
 assert(type(api.command_adapter_ensure) == "function", "missing command adapter test seam")
 local fixture_argv = vim.g.mkchad_opencode_test_command_argv
+local home = vim.env.HOME
+local test_home = vim.fs.joinpath(root, "home")
+local test_bin = vim.fs.joinpath(test_home, ".local", "bin")
+local image_command = vim.fs.joinpath(test_bin, "mkchad-opencode-server-image")
+assert(vim.fn.mkdir(test_bin, "p", 448) ~= 0 or vim.uv.fs_stat(test_bin))
+vim.fn.writefile({ "#!/usr/bin/env bash" }, image_command)
+assert(vim.uv.fs_chmod(image_command, 493))
+vim.env.HOME = test_home
 vim.g.mkchad_opencode_test_command_argv = nil
 local production_argv = api.command_adapter_argv("status")
-assert(production_argv[1] == vim.fs.joinpath(vim.env.HOME, ".local", "bin", "mkchad-opencode-server"), "production adapter did not use the installed wrapper path")
+assert(production_argv[1] == image_command, "production adapter did not use the installed in-image command path")
 assert(production_argv[2] == "status" and production_argv[3] == "--json", "production adapter argv changed")
-local home = vim.env.HOME
+assert(vim.uv.fs_unlink(image_command))
+local fallback_argv = api.command_adapter_argv("status")
+assert(fallback_argv[1] == vim.fs.joinpath(test_bin, "mkchad-opencode-server"), "production adapter did not preserve staggered-upgrade fallback")
 vim.env.HOME = nil
 local missing_home_argv, missing_home_err = api.command_adapter_argv("status")
 vim.env.HOME = home
