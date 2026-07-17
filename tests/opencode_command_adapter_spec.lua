@@ -16,6 +16,7 @@ vim.fn.writefile({
   "elif mode == 'trailing': print(json.dumps({'schema': 1, 'ok': True, 'command': action, 'status': 'healthy', 'state': {'url': 'http://127.0.0.1:4096', 'transport': 'loopback-http', 'generation': 'external-generation', 'ca_cert': None}}) + ' trailing')",
   "elif mode == 'oversized': print('x' * (64 * 1024 + 1))",
   "elif mode == 'exit': print(json.dumps({'schema': 1, 'ok': True, 'command': action, 'status': 'healthy', 'state': {'url': 'http://127.0.0.1:4096', 'transport': 'loopback-http', 'generation': 'external-generation', 'ca_cert': None}})); raise SystemExit(7)",
+  "elif mode == 'blocked': print(json.dumps({'schema': 1, 'ok': False, 'command': action, 'status': 'blocked', 'error': {'code': 'fixture_blocked', 'message': 'fixture refused startup'}})); raise SystemExit(1)",
   "else:",
   "  if mode == 'slow': time.sleep(0.3); generation = 'stale-generation'",
   "  elif mode == 'valid2': generation = 'new-generation'",
@@ -30,6 +31,17 @@ vim.env.MKCHAD_COMMAND_LOG = log
 dofile(config)
 local api = vim.g.mkchad_opencode_test_api
 assert(type(api.command_adapter_ensure) == "function", "missing command adapter test seam")
+local fixture_argv = vim.g.mkchad_opencode_test_command_argv
+vim.g.mkchad_opencode_test_command_argv = nil
+local production_argv = api.command_adapter_argv("status")
+assert(production_argv[1] == vim.fs.joinpath(vim.env.HOME, ".local", "bin", "mkchad-opencode-server"), "production adapter did not use the installed wrapper path")
+assert(production_argv[2] == "status" and production_argv[3] == "--json", "production adapter argv changed")
+local home = vim.env.HOME
+vim.env.HOME = nil
+local missing_home_argv, missing_home_err = api.command_adapter_argv("status")
+vim.env.HOME = home
+vim.g.mkchad_opencode_test_command_argv = fixture_argv
+assert(missing_home_argv == nil and missing_home_err:find("HOME must be an absolute path", 1, true), "missing HOME did not fail closed")
 
 local function await(invoke)
   local calls, result = 0, nil
@@ -48,19 +60,25 @@ end
 
 local function expect_start_failure(mode)
   vim.env.MKCHAD_COMMAND_MODE = mode
-  local ok = await(api.command_adapter_ensure)
+  local ok, err = await(api.command_adapter_ensure)
   assert(ok == false, mode .. " command output was accepted")
   local url
   vim.g.opencode_opts.server.url(function(value)
     url = value
   end)
   assert(url == nil, mode .. " retained a stale endpoint")
+  return err
 end
 
 expect_start_failure("malformed")
 expect_start_failure("trailing")
 expect_start_failure("oversized")
 expect_start_failure("exit")
+assert(expect_start_failure("blocked") == "mkchad-opencode-server: fixture refused startup", "structured command failure was hidden")
+vim.g.mkchad_opencode_test_command_argv = { vim.fs.joinpath(root, "missing-command") }
+local spawn_ok, spawn_err = await(api.command_adapter_ensure)
+vim.g.mkchad_opencode_test_command_argv = fixture_argv
+assert(spawn_ok == false and spawn_err:find("unable to start missing-command", 1, true), "spawn failure was hidden")
 
 vim.env.MKCHAD_COMMAND_MODE = "valid"
 local ok, err, state = await(api.command_adapter_ensure)

@@ -3941,7 +3941,7 @@ function command_adapter.decode(action, stdout)
     if action == "stop" and result.status ~= "inactive" then
       return nil, "mkchad-opencode-server returned an inconsistent stop result"
     end
-    return result
+    return result, nil, true
   end
   if result.status ~= "blocked"
     or type(result.error) ~= "table"
@@ -3951,13 +3951,18 @@ function command_adapter.decode(action, stdout)
   then
     return nil, "mkchad-opencode-server returned an invalid failure result"
   end
-  return nil, "mkchad-opencode-server: " .. result.error.message
+  return nil, "mkchad-opencode-server: " .. result.error.message, true
 end
 
 function command_adapter.argv(action)
-  local argv = { "mkchad-opencode-server" }
+  local argv
   if vim.g.mkchad_opencode_test_api and type(vim.g.mkchad_opencode_test_command_argv) == "table" then
     argv = vim.deepcopy(vim.g.mkchad_opencode_test_command_argv)
+  else
+    if not command_adapter.safe_string(vim.env.HOME, 4096) or vim.env.HOME:sub(1, 1) ~= "/" then
+      return nil, "Unable to locate installed mkchad-opencode-server: HOME must be an absolute path"
+    end
+    argv = { vim.fs.joinpath(vim.env.HOME, ".local", "bin", "mkchad-opencode-server") }
   end
   table.insert(argv, action)
   table.insert(argv, "--json")
@@ -3965,12 +3970,30 @@ function command_adapter.argv(action)
 end
 
 function command_adapter.invoke(action, callback)
-  run_subprocess(command_adapter.argv(action), { timeout_ms = command_adapter.timeout_ms }, function(result, command_err)
+  local argv, argv_err = command_adapter.argv(action)
+  if not argv then
+    vim.schedule(function()
+      safe_subprocess_callback(callback, nil, argv_err)
+    end)
+    return
+  end
+  run_subprocess(argv, { timeout_ms = command_adapter.timeout_ms }, function(result, command_err)
+    local parsed, parse_err, decoded
+    if result and type(result.stdout) == "string" and result.stdout ~= "" then
+      parsed, parse_err, decoded = command_adapter.decode(action, result.stdout)
+    end
     if command_err or not result or result.code ~= 0 then
-      callback(nil, "mkchad-opencode-server " .. action .. " failed")
+      if decoded and not parsed then
+        callback(nil, parse_err)
+      else
+        local message = "mkchad-opencode-server " .. action .. " failed"
+        if command_adapter.safe_string(command_err, 1024) then
+          message = message .. ": " .. command_err
+        end
+        callback(nil, message)
+      end
       return
     end
-    local parsed, parse_err = command_adapter.decode(action, result.stdout)
     callback(parsed, parse_err)
   end)
 end
@@ -4758,6 +4781,7 @@ if vim.g.mkchad_opencode_test_api then
     stop_server = stop_server,
     command_adapter_ensure = command_adapter.ensure,
     command_adapter_status = command_adapter.status,
+    command_adapter_argv = command_adapter.argv,
     command_adapter_stop = command_adapter.stop,
     tui_valid = tui_valid,
   }
