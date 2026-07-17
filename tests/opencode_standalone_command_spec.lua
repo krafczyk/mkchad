@@ -64,6 +64,15 @@ assert(inactive.code == 0 and inactive.stdout:match("^%b{}\n$"), inactive.stderr
 local inactive_result = vim.json.decode(inactive.stdout)
 assert(inactive_result.ok and inactive_result.status == "inactive" and inactive_result.state == vim.NIL)
 assert(not vim.uv.fs_stat(vim.fs.joinpath(state_home, "mkchad", "opencode")), "inactive status created lifecycle state")
+local inactive_human = invoke("status")
+assert(inactive_human.code == 0, inactive_human.stderr)
+assert(inactive_human.stdout == table.concat({
+  "Command status: inactive",
+  "URL: inactive",
+  "Transport: inactive",
+  "Generation: inactive",
+  "",
+}, "\n"), "inactive human status changed")
 
 local started = invoke("start", "--json")
 assert(started.code == 0 and started.stdout:match("^%b{}\n$"), started.stderr)
@@ -71,6 +80,15 @@ local started_result = vim.json.decode(started.stdout)
 assert(started_result.ok and started_result.status == "healthy")
 assert(started_result.state.transport == "loopback-http" and started_result.state.ca_cert == vim.NIL)
 assert(started_result.state.url:match("^http://127%.0%.0%.1:%d+$"))
+local healthy_human = invoke("status")
+assert(healthy_human.code == 0, healthy_human.stderr)
+assert(healthy_human.stdout == table.concat({
+  "Command status: healthy",
+  "URL: " .. started_result.state.url,
+  "Transport: loopback-http",
+  "Generation: " .. started_result.state.generation,
+  "",
+}, "\n"), "healthy human status did not report shared server details")
 
 local reused = invoke("start", "--json")
 assert(reused.code == 0, reused.stderr)

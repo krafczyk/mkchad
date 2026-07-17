@@ -90,7 +90,7 @@ end
 
 local function result_state(state)
   if not state then
-    return vim.NIL
+    return nil
   end
   local transport = state.schema == 2 and "tls-proxy" or state.transport
   if type(state.url) ~= "string" or type(state.generation) ~= "string" or (transport ~= "tls-proxy" and transport ~= "loopback-http") then
@@ -108,6 +108,23 @@ local function result_state(state)
   }
 end
 
+local function human_status(status, state, message)
+  state = type(state) == "table" and state or nil
+  local lines = {
+    "Command status: " .. status,
+    "URL: " .. (state and state.url or "inactive"),
+    "Transport: " .. (state and state.transport or "inactive"),
+    "Generation: " .. (state and state.generation or "inactive"),
+  }
+  if state and state.transport == "tls-proxy" then
+    table.insert(lines, "CA certificate: " .. state.ca_cert)
+  end
+  if message and status ~= "healthy" and status ~= "inactive" then
+    table.insert(lines, "Command diagnostic: " .. bounded_message(message))
+  end
+  return table.concat(lines, "\n")
+end
+
 local completed = false
 local function finish(exit_code, ok, status, state, message)
   if completed then
@@ -122,6 +139,8 @@ local function finish(exit_code, ok, status, state, message)
       result.error = { code = error_code(message or ""), message = bounded_message(message) }
     end
     io.stdout:write(vim.json.encode(result) .. "\n")
+  elseif ok and command == "status" then
+    io.stdout:write(human_status(status, state, message) .. "\n")
   elseif ok then
     io.stdout:write(command .. ": " .. status .. "\n")
   else
@@ -155,9 +174,9 @@ elseif command == "status" then
   lifecycle.status(function(status, state, message)
     local stable_state = result_state(state)
     if status == "healthy" and not stable_state then
-      finish(0, true, "blocked", nil)
+      finish(0, true, "blocked", nil, message or "lifecycle returned an invalid state")
     else
-      finish(0, true, status, stable_state)
+      finish(0, true, status, stable_state, message)
     end
   end)
 else
