@@ -13,8 +13,10 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 PROXY = ROOT / "java" / "MkChadTlsProxy.java"
-PLUGIN = Path(os.environ.get("OPENCODE_NVIM_ROOT", "/data1/matthew/Projects/opencode.nvim"))
-BASE = Path(os.environ.get("MKCHAD_TLS_TEST_ROOT", "/tmp/opencode/mkchad-tls-proxy"))
+PLUGIN = Path(os.environ.get("OPENCODE_NVIM_ROOT", ROOT.parent / "opencode.nvim"))
+BASE = Path(os.environ.get("MKCHAD_TLS_TEST_ROOT", "/tmp/opencode-mkchad/tls-proxy"))
+JAVA = os.environ.get("JAVA", "java")
+KEYTOOL = os.environ.get("KEYTOOL", str(Path(JAVA).parent / "keytool"))
 PASSWORD = "test-password-file-only"
 
 
@@ -113,13 +115,13 @@ def make_certs(root: Path) -> tuple[Path, Path]:
     password.write_text(PASSWORD)
     os.chmod(password, 0o600)
     common = ("-storepass:file", str(password))
-    run("keytool", "-genkeypair", "-alias", "ca", "-keyalg", "EC", "-groupname", "secp256r1", "-dname", "CN=test CA", "-ext", "bc:c", "-ext", "ku=keyCertSign,cRLSign", "-validity", "2", "-keystore", str(ca_store), "-storetype", "PKCS12", *common, "-noprompt")
-    run("keytool", "-exportcert", "-rfc", "-alias", "ca", "-keystore", str(ca_store), *common, "-file", str(ca))
-    run("keytool", "-genkeypair", "-alias", "server", "-keyalg", "EC", "-groupname", "secp256r1", "-dname", "CN=127.0.0.1", "-ext", "SAN=IP:127.0.0.1", "-validity", "2", "-keystore", str(server_store), "-storetype", "PKCS12", *common, "-noprompt")
-    run("keytool", "-certreq", "-alias", "server", "-keystore", str(server_store), *common, "-file", str(csr))
-    run("keytool", "-gencert", "-rfc", "-alias", "ca", "-keystore", str(ca_store), *common, "-infile", str(csr), "-outfile", str(leaf), "-validity", "2", "-ext", "SAN=IP:127.0.0.1", "-ext", "EKU=serverAuth")
-    run("keytool", "-importcert", "-alias", "ca", "-keystore", str(server_store), *common, "-file", str(ca), "-noprompt")
-    run("keytool", "-importcert", "-alias", "server", "-keystore", str(server_store), *common, "-file", str(leaf), "-noprompt")
+    run(KEYTOOL, "-genkeypair", "-alias", "ca", "-keyalg", "EC", "-groupname", "secp256r1", "-dname", "CN=test CA", "-ext", "bc:c", "-ext", "ku=keyCertSign,cRLSign", "-validity", "2", "-keystore", str(ca_store), "-storetype", "PKCS12", *common, "-noprompt")
+    run(KEYTOOL, "-exportcert", "-rfc", "-alias", "ca", "-keystore", str(ca_store), *common, "-file", str(ca))
+    run(KEYTOOL, "-genkeypair", "-alias", "server", "-keyalg", "EC", "-groupname", "secp256r1", "-dname", "CN=127.0.0.1", "-ext", "SAN=IP:127.0.0.1", "-validity", "2", "-keystore", str(server_store), "-storetype", "PKCS12", *common, "-noprompt")
+    run(KEYTOOL, "-certreq", "-alias", "server", "-keystore", str(server_store), *common, "-file", str(csr))
+    run(KEYTOOL, "-gencert", "-rfc", "-alias", "ca", "-keystore", str(ca_store), *common, "-infile", str(csr), "-outfile", str(leaf), "-validity", "2", "-ext", "SAN=IP:127.0.0.1", "-ext", "EKU=serverAuth")
+    run(KEYTOOL, "-importcert", "-alias", "ca", "-keystore", str(server_store), *common, "-file", str(ca), "-noprompt")
+    run(KEYTOOL, "-importcert", "-alias", "server", "-keystore", str(server_store), *common, "-file", str(leaf), "-noprompt")
     for path in root.iterdir():
         if path.is_file():
             os.chmod(path, 0o600)
@@ -135,7 +137,7 @@ def backend(root: Path, port: int, name: str, mode: str = "normal") -> tuple[sub
 
 def proxy(root: Path, public: int, internal: int, expected: subprocess.Popen, store: Path, *, boot: str | None = None, start: str | None = None) -> subprocess.Popen:
     command = [
-        "java", "--source", "21", str(PROXY),
+        JAVA, "--source", "21", str(PROXY),
         "--listen-port", str(public),
         "--backend-port", str(internal),
         "--backend-pid", str(expected.pid),

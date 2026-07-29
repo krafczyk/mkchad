@@ -26,7 +26,7 @@ local function arguments_after_entrypoint()
 end
 
 local function has_control(value)
-  return type(value) ~= "string" or value:find("[%z\1-\31\127]") ~= nil
+  return type(value) ~= "string" or value:find "[%z\1-\31\127]" ~= nil
 end
 
 local function usage()
@@ -45,7 +45,7 @@ local usage_error
 if command == "--help" and #arguments == 1 then
   io.stdout:write(usage() .. "\n")
   io.stdout:flush()
-  vim.cmd("qa!")
+  vim.cmd "qa!"
   return
 elseif command ~= "start" and command ~= "status" and command ~= "stop" then
   usage_error = "expected start, status, stop, or --help"
@@ -66,7 +66,7 @@ end
 if usage_error then
   io.stderr:write("mkchad-opencode-server: " .. usage_error .. "\n" .. usage() .. "\n")
   io.stderr:flush()
-  vim.cmd("cquit 2")
+  vim.cmd "cquit 2"
   return
 end
 
@@ -84,6 +84,10 @@ local function error_code(message)
     return "launch_intent_blocked"
   elseif message:find("unverifiable", 1, true) then
     return "process_unverifiable"
+  elseif message:find("broker control", 1, true) then
+    return "broker_control_unavailable"
+  elseif message:find("Broker activation", 1, true) then
+    return "broker_activation_failed"
   end
   return "lifecycle_failed"
 end
@@ -93,7 +97,11 @@ local function result_state(state)
     return nil
   end
   local transport = state.schema == 2 and "tls-proxy" or state.transport
-  if type(state.url) ~= "string" or type(state.generation) ~= "string" or (transport ~= "tls-proxy" and transport ~= "loopback-http") then
+  if
+    type(state.url) ~= "string"
+    or type(state.generation) ~= "string"
+    or (transport ~= "tls-proxy" and transport ~= "loopback-http")
+  then
     return nil
   end
   local ca_cert = transport == "tls-proxy" and state.ca_path or vim.NIL
@@ -132,7 +140,7 @@ local function human_status(status, state, message)
 end
 
 local completed = false
-local function finish(exit_code, ok, status, state, message)
+local function finish(exit_code, ok, status, state, message, diagnostic_code)
   if completed then
     return
   end
@@ -141,6 +149,12 @@ local function finish(exit_code, ok, status, state, message)
     local result = { schema = 1, ok = ok, command = command, status = status }
     if ok then
       result.state = state or vim.NIL
+      if message and status ~= "healthy" and status ~= "inactive" then
+        result.diagnostic = {
+          code = diagnostic_code or ("observation_" .. status),
+          message = bounded_message(message),
+        }
+      end
     else
       result.error = { code = error_code(message or ""), message = bounded_message(message) }
     end
@@ -158,7 +172,7 @@ local function finish(exit_code, ok, status, state, message)
 end
 
 local loaded, lifecycle = xpcall(function()
-  return require("mkchad.opencode.lifecycle")
+  return require "mkchad.opencode.lifecycle"
 end, function()
   return "unable to load the installed MkChad lifecycle assets"
 end)
@@ -177,12 +191,12 @@ if command == "start" then
     end
   end)
 elseif command == "status" then
-  lifecycle.status(function(status, state, message)
+  lifecycle.status(function(status, state, message, diagnostic_code)
     local stable_state = result_state(state)
     if status == "healthy" and not stable_state then
-      finish(0, true, "blocked", nil, message or "lifecycle returned an invalid state")
+      finish(0, true, "blocked", nil, message or "lifecycle returned an invalid state", "invalid_lifecycle_state")
     else
-      finish(0, true, status, stable_state, message)
+      finish(0, true, status, stable_state, message, diagnostic_code)
     end
   end)
 else

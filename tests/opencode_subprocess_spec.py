@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "lua" / "configs" / "opencode.lua"
 WORKER = ROOT / "tests" / "opencode_subprocess_worker.lua"
 FIXTURE = ROOT / "tests" / "bounded_subprocess_fixture.py"
-BASE = Path("/tmp/opencode/mkchad-bounded-subprocess")
+BASE = Path("/tmp/opencode-mkchad/bounded-subprocess")
 
 
 def wait_path(path: Path, timeout: float = 5) -> None:

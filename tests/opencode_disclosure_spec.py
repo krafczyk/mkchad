@@ -11,8 +11,8 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "lua" / "configs" / "opencode.lua"
 SPEC = ROOT / "tests" / "opencode_auth_disclosure_spec.lua"
 CONTENDER = ROOT / "tests" / "opencode_delayed_contender_spec.lua"
-BASE = Path("/tmp/opencode/mkchad-disclosure")
-PLUGIN = Path("/data1/matthew/Projects/opencode.nvim")
+BASE = Path("/tmp/opencode-mkchad/disclosure")
+PLUGIN = Path(os.environ.get("OPENCODE_NVIM_ROOT", ROOT.parent / "opencode.nvim"))
 
 
 def repository_snapshot(path: Path) -> bytes:
@@ -47,6 +47,8 @@ def main() -> None:
             config_home.mkdir(mode=0o700)
             server_config = config_home / "opencode-server.json"
             env = os.environ.copy()
+            for name in ("OPENCODE_PORT", "OPENCODE_SERVER_USERNAME", "OPENCODE_SERVER_PASSWORD"):
+                env.pop(name, None)
             env.update({
                 "XDG_CONFIG_HOME": str(config_home),
                 "XDG_STATE_HOME": str(state),

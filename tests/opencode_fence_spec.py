@@ -13,7 +13,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "lua" / "configs" / "opencode.lua"
 WORKER = ROOT / "tests" / "opencode_fence_worker.lua"
-BASE = Path("/tmp/opencode/mkchad-fence")
+BASE = Path("/tmp/opencode-mkchad/fence")
 
 
 def wait_path(path: Path, timeout: float = 10) -> None:

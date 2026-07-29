@@ -43,8 +43,8 @@ MkChad XDG, npm, and `OPENCODE_CONFIG` environment remain in effect.
 
 `start` reuses a fully validated generation or performs the bounded reviewed
 recovery flow. `status` is observational: it reports `healthy`, `inactive`,
-`unhealthy`, or `blocked` without starting, stopping, repairing, or creating
-lifecycle state. `stop` follows validated active state rather than the current
+`unhealthy`, `stopping`, or `blocked` without starting, stopping, repairing, or
+creating lifecycle state. `stop` follows validated active state rather than the current
 transport setting and is an idempotent success when no managed service is
 active. Usage errors exit `2`; refused or failed start/stop operations exit `1`;
 completed operations, including observational unhealthy or blocked status, exit
@@ -53,8 +53,9 @@ completed operations, including observational unhealthy or blocked status, exit
 With `--json`, stdout contains exactly one versioned JSON result and newline.
 Successful healthy results contain only `url`, `transport`, `generation`, the
 live `server_version`, and the active `ca_cert` (or JSON `null` in direct mode);
-they never contain credentials or config contents. Keep wrapper/runtime
-diagnostics on stderr.
+they never contain credentials or config contents. Non-healthy observations may
+include one bounded `diagnostic` object with a stable code and presentation
+message. Keep wrapper/runtime diagnostics on stderr.
 Without `--json`, `status` reports the shared `:OpenCodeInfo` fields available
 outside the editor: command status, public URL, transport, generation, live
 server version, active TLS CA, and any blocked or unhealthy lifecycle
@@ -100,28 +101,48 @@ health without changing lifecycle state.
 > terminates.
 
 State lives in `${XDG_STATE_HOME:-$HOME/.local/state}/mkchad/opencode/<host>/`:
-`state.json`, `server.log`, `proxy.log`, a startup lock, and `tls/`. The
-directory and `tls/` are mode `0700`; state, logs, CA, PKCS12 stores, and the
-random keytool password file are mode `0600`. The password value is passed to
-keytool with `-storepass:file` and is never placed in argv, state, logs, or
-notifications. Schema-3 state records its `tls-proxy` or `loopback-http`
-transport plus immutable runtime executable device/inode,
-launch executable device/inode, exact argv, PID start time, boot identity, and
-listener information for each managed process. The Java source launcher also
-records the proxy source device/inode.
+`state.json`, `pending.json`, `launch.json`, `control.sock`, `server.log`,
+`proxy.log`, a startup lock, and `tls/`. The directory and `tls/` are mode
+`0700`; state, logs, TLS files, lock metadata, and broker-created control files
+are current-user-only. The password value is passed to keytool with
+`-storepass:file` and is never placed in argv, state, logs, or notifications.
+
+New TLS generations use schema 4. They record the broker protocol, protected
+control-socket path and device/inode, plus immutable runtime and launch
+executable identity, exact argv, PID start time, boot identity, listener proof,
+and certificate identity for the broker and backend. Direct HTTP remains schema
+3. Schema 2 and schema 3 TLS records remain supported by their existing exact
+proof route; MkChad does not silently rewrite a healthy pre-broker generation.
+State paths and PIDs are evidence, not authority by themselves: MkChad also
+requires current-user private path checks and exact process, boot, executable,
+argv, listener, certificate, and control-socket evidence before it uses a
+recorded generation.
 
 Before each process spawn, MkChad records a generation-specific `launch.json`
-intent. Successful immutable identity capture transfers authority to
-`pending.json`; an unresolved intent blocks later starts so a cleanup-refused
-process cannot be multiplied. Remove an unresolved intent only after trusted OS
-process accounting confirms its recorded role is dead.
+intent. A TLS broker first publishes control-ready schema-4 `pending.json`, then
+commits backend activation and finally complete state. The broker owns backend
+creation and committed stop after the control request is accepted; Lua owns the
+kernel fence and metadata publication/removal. Its private protocol accepts one
+bounded request on the recorded socket and exposes `control-ready`, `activating`,
+`running`, `unhealthy`, `activation-failed`, `stopping`, `stopped`, or `blocked`
+status. The nonce correlates a response but is not authorization. The socket is
+not a public lifecycle API and must remain inside the protected state root.
+
+Concurrent starts serialize through the lifecycle fence and logical lock. A
+losing caller waits only for a fully validated winning generation and never
+activates another backend or sends a duplicate lifecycle signal. An unresolved
+intent or pending record that cannot be proved remains blocking authority rather
+than a candidate for replacement.
 
 The proxy completes TLS first, opens one backend connection, sends only a fixed
 unauthenticated `GET /global/health`, and proves the exact reverse established
 tuple's socket inode belongs to the recorded backend PID before reading or
-forwarding client HTTP bytes. It never reconnects a client stream. Loss of the
-proxy, backend, listener, process identity, certificate identity, or pinned
-health replaces both processes under the renewable lifecycle lock.
+forwarding client HTTP bytes. It never reconnects a client stream. For schema-4
+TLS, a live broker with a dead backend is unhealthy and may be cleaned only by a
+committed broker stop; a dead broker with a live backend is blocked for manual
+operating-system accounting; both dead roles may be reconciled only after the
+recorded control inode is safely accounted for. Loss of the public broker drops
+existing streams. Status and reload remain observational and never restart it.
 
 MkChad reads optional server settings from
 `${XDG_CONFIG_HOME:-$HOME/.config}/mkchad/opencode-server.json` when the
@@ -196,7 +217,7 @@ never probe its URL with credentials. Live schema-1 processes are never
 signalable because their records lack the immutable identity required by the
 current lifecycle. Stop a live legacy process through trusted OS process
 accounting; once it is dead, the next lifecycle operation removes its stale
-state and creates a schema-3 generation.
+state and creates a schema-4 TLS generation (or schema-3 direct generation).
 
 Schema-2 state created before immutable executable device/inode fields were
 added is malformed and is never used to signal a process. Recovery is bounded:
@@ -206,9 +227,21 @@ manually; do not delete pending metadata until its old processes are accounted
 for.
 
 Before downgrading MkChad, run `:OpenCodeStop` while the current version can
-still validate and remove its schema-3 generation. Confirm that complete and
-pending schema-3 metadata and `launch.json` are absent before starting an older
-version, which must treat schema 3 as unsupported rather than mutating it.
+still validate and remove its schema-4 broker generation. A committed broker
+stop first closes public admission and registered relays, then stops its backend,
+removes the matching control socket, returns its terminal receipt, and exits.
+Lua removes matching metadata only after that receipt, broker termination, and
+control-path absence. If the receipt is lost, state is deliberately preserved
+until later fenced reconciliation proves the broker, backend, and recorded
+control path are absent. Do not delete it to force a replacement.
+
+Confirm that complete state, pending metadata, and `launch.json` are absent
+before starting a reviewed pre-broker version. Older launchers must preserve
+schema-4 complete, pending, and broker-launch bytes and must not signal their
+recorded processes. On upgrade, current MkChad continues to validate restricted
+schema-2/3 state through its legacy proof route; stop a healthy old TLS
+generation before starting again to move to schema 4. Retained valid certificate
+material survives this migration and ordinary recovery.
 
 `:OpenCodeReload` (or `:Opencode reload`) refreshes only the current absolute
 directory instance. It refuses while that directory has active work, a pending

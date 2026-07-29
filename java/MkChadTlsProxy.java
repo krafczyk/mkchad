@@ -9,24 +9,39 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketException;
+import java.net.StandardProtocolFamily;
+import java.net.UnixDomainSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.nio.ByteBuffer;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
+import java.nio.file.LinkOption;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.security.KeyStore;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.HashSet;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.CountDownLatch;
 import java.util.regex.Pattern;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
@@ -51,6 +66,12 @@ public final class MkChadTlsProxy {
   private static final int PROC_BYTE_LIMIT = 16 * 1024 * 1024;
   private static final long PROC_SCAN_TIMEOUT_NANOS = Duration.ofSeconds(5).toNanos();
   private static final int MAX_CONCURRENT_PROOF_SCANS = 8;
+  private static final int CONTROL_FRAME_LIMIT = 64 * 1024;
+  private static final int CONTROL_CONNECTION_LIMIT = 8;
+  private static final int CONTROL_QUEUE_LIMIT = 16;
+  private static final long CONTROL_DEADLINE_NANOS = Duration.ofSeconds(3).toNanos();
+  private static final long PIDFD_TERM_GRACE_NANOS = Duration.ofMillis(250).toNanos();
+  private static final int HELPER_OUTPUT_LIMIT = 64 * 1024;
   private static final Semaphore PROOF_SCAN_PERMITS = new Semaphore(MAX_CONCURRENT_PROOF_SCANS, true);
   private static final AtomicInteger ACTIVE_PROOF_SCANS = new AtomicInteger();
   private static final AtomicInteger MAX_OBSERVED_PROOF_SCANS = new AtomicInteger();
@@ -75,7 +96,56 @@ public final class MkChadTlsProxy {
       String bootId,
       Path keyStore,
       Path passwordFile,
-      int maxConnections) {}
+       int maxConnections) {}
+
+  private record BrokerConfig(
+      Path stateRoot,
+      Path control,
+      String generation,
+      String bootId,
+      Path backendExecutable,
+      String backendVersion,
+      int backendPort,
+      int listenPort,
+      Path keyStore,
+      Path passwordFile,
+      int maxConnections,
+      Path backendLog,
+      Path pidfdPython,
+      Path pidfdHelper) {}
+
+  private record BrokerAuthority(
+      long pid,
+      String start,
+      Path runtimePath,
+      FileIdentity runtime,
+      Path launchPath,
+      FileIdentity launch,
+      List<String> argv,
+      Path source,
+      FileIdentity sourceIdentity,
+      FileIdentity backendExecutable,
+      FileIdentity pidfdPython,
+      FileIdentity pidfdHelper) {}
+
+  private record ControlRequest(String operation, String generation, String nonce) {}
+
+  private enum BrokerPhase {
+    CONTROL_READY("control-ready"),
+    ACTIVATING("activating"),
+    RUNNING("running"),
+    UNHEALTHY("unhealthy"),
+    ACTIVATION_FAILED("activation-failed"),
+    STOPPING("stopping"),
+    STOPPED("stopped"),
+    BLOCKED("blocked");
+
+    private final String wire;
+
+    BrokerPhase(String wire) {
+      this.wire = wire;
+    }
+  }
 
   private MkChadTlsProxy() {}
 
@@ -88,24 +158,17 @@ public final class MkChadTlsProxy {
       validateKeyStore(Path.of(args[1]), Path.of(args[3]), Path.of(args[5]), Path.of(args[7]));
       return;
     }
+    if (args.length > 0 && args[0].equals("--broker")) {
+      runBroker(parseBroker(Arrays.copyOfRange(args, 1, args.length)));
+      return;
+    }
     Config config = parse(args);
     requireLinuxEvidence(config);
-    SSLContext context = tlsContext(config);
-    SSLServerSocketFactory factory = context.getServerSocketFactory();
-    SSLServerSocket server = (SSLServerSocket) factory.createServerSocket();
-    server.setReuseAddress(false);
-    server.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), config.listenPort()));
-    Set<String> supported = Set.of(server.getSupportedProtocols());
-    String[] protocols = Arrays.stream(new String[] {"TLSv1.3", "TLSv1.2"})
-        .filter(supported::contains)
-        .toArray(String[]::new);
-    if (protocols.length == 0) {
-      throw new IOException("TLS 1.2 or newer is unavailable");
-    }
-    server.setEnabledProtocols(protocols);
-    SSLParameters parameters = server.getSSLParameters();
-    parameters.setApplicationProtocols(new String[0]);
-    server.setSSLParameters(parameters);
+    serveTls(config);
+  }
+
+  private static void serveTls(Config config) throws Exception {
+    SSLServerSocket server = openTlsServer(config);
 
     Semaphore permits = new Semaphore(config.maxConnections());
     Runtime.getRuntime().addShutdownHook(new Thread(() -> close(server)));
@@ -127,13 +190,197 @@ public final class MkChadTlsProxy {
     }
   }
 
-  private static Config parse(String[] args) {
-    Map<String, String> values = new HashMap<>();
-    for (int i = 0; i < args.length; i += 2) {
-      if (i + 1 >= args.length || !args[i].startsWith("--") || values.put(args[i], args[i + 1]) != null) {
-        throw new IllegalArgumentException("invalid or duplicate proxy argument");
+  private static SSLServerSocket openTlsServer(Config config) throws Exception {
+    SSLContext context = tlsContext(config);
+    SSLServerSocketFactory factory = context.getServerSocketFactory();
+    SSLServerSocket server = (SSLServerSocket) factory.createServerSocket();
+    server.setReuseAddress(false);
+    server.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), config.listenPort()));
+    Set<String> supported = Set.of(server.getSupportedProtocols());
+    String[] protocols = Arrays.stream(new String[] {"TLSv1.3", "TLSv1.2"})
+        .filter(supported::contains)
+        .toArray(String[]::new);
+    if (protocols.length == 0) {
+      close(server);
+      throw new IOException("TLS 1.2 or newer is unavailable");
+    }
+    server.setEnabledProtocols(protocols);
+    SSLParameters parameters = server.getSSLParameters();
+    parameters.setApplicationProtocols(new String[0]);
+    server.setSSLParameters(parameters);
+    return server;
+  }
+
+  /** Broker-only listener ownership: no accepted peer can escape the stop registry. */
+  private static final class BrokerTlsService {
+    private final Config config;
+    private final Object registryLock = new Object();
+    private final Set<RelayRegistration> relays = new HashSet<>();
+    private volatile SSLServerSocket listener;
+    private volatile Thread acceptThread;
+    private boolean stopping;
+
+    private BrokerTlsService(Config config) {
+      this.config = config;
+    }
+
+    private void start() throws Exception {
+      listener = openTlsServer(config);
+      acceptThread = Thread.ofVirtual().start(this::accept);
+    }
+
+    private void accept() {
+      try {
+        while (true) {
+          SSLSocket client = (SSLSocket) listener.accept();
+          testHook("accept-return");
+          RelayRegistration registration;
+          synchronized (registryLock) {
+            if (stopping) {
+              close(client);
+              continue;
+            }
+            registration = new RelayRegistration(client);
+            relays.add(registration);
+          }
+          testHook("relay-registered");
+          synchronized (registryLock) {
+            if (stopping) {
+              registration.close();
+              relays.remove(registration);
+              continue;
+            }
+          }
+          registration.thread = Thread.ofVirtual().start(() -> {
+            try {
+              relay(client, config, registration);
+            } catch (Exception ignored) {
+              close(client);
+            } finally {
+              registration.close();
+              try {
+                testHook("relay-removal");
+              } catch (IOException ignored) {
+                // The disabled production hook cannot affect relay cleanup.
+              }
+              synchronized (registryLock) {
+                relays.remove(registration);
+              }
+            }
+          });
+        }
+      } catch (IOException ignored) {
+        // Closing the admission listener is the committed stop gate.
       }
     }
+
+    private void quiesce() throws IOException {
+      List<RelayRegistration> snapshot;
+      Thread accept;
+      synchronized (registryLock) {
+        stopping = true;
+        close(listener);
+        snapshot = List.copyOf(relays);
+        accept = acceptThread;
+      }
+      if (accept != null) {
+        join(accept, "public accept loop");
+      }
+      for (RelayRegistration relay : snapshot) {
+        relay.close();
+      }
+      for (RelayRegistration relay : snapshot) {
+        if (relay.thread != null) {
+          join(relay.thread, "public relay");
+        }
+      }
+      synchronized (registryLock) {
+        if (!relays.isEmpty()) {
+          throw new IOException("public relay registry did not quiesce");
+        }
+      }
+    }
+
+    private static void join(Thread thread, String role) throws IOException {
+      try {
+        thread.join(Duration.ofSeconds(3));
+      } catch (InterruptedException interrupted) {
+        Thread.currentThread().interrupt();
+        throw new IOException("interrupted while joining " + role, interrupted);
+      }
+      if (thread.isAlive()) {
+        throw new IOException(role + " did not quiesce");
+      }
+    }
+
+    private final class RelayRegistration {
+      private final SSLSocket client;
+      private Socket backend;
+      private Thread thread;
+
+      private RelayRegistration(SSLSocket client) {
+        this.client = client;
+      }
+
+      private boolean registerBackend(Socket candidate) {
+        synchronized (registryLock) {
+          if (stopping) {
+            MkChadTlsProxy.close(candidate);
+            return false;
+          }
+          backend = candidate;
+          return true;
+        }
+      }
+
+      private void close() {
+        MkChadTlsProxy.close(client);
+        synchronized (registryLock) {
+          MkChadTlsProxy.close(backend);
+        }
+      }
+    }
+  }
+
+  private static BrokerConfig parseBroker(String[] args) {
+    Map<String, String> values = parseOptions(args);
+    if (values.size() != 14) {
+      throw new IllegalArgumentException("invalid broker argument count");
+    }
+    Path stateRoot = Path.of(required(values, "--state-root"));
+    Path control = Path.of(required(values, "--control"));
+    if (!stateRoot.isAbsolute() || !control.isAbsolute() || !control.getParent().equals(stateRoot)) {
+      throw new IllegalArgumentException("broker state paths must be absolute direct children");
+    }
+    String generation = required(values, "--generation");
+    String bootId = required(values, "--boot-id");
+    String backendVersion = required(values, "--backend-version");
+    if (!safeToken(generation, 256) || !safeToken(bootId, 64) || !safeText(backendVersion, 128)) {
+      throw new IllegalArgumentException("broker generation, boot identity, or backend version is invalid");
+    }
+    int maxConnections = Integer.parseInt(required(values, "--max-connections"));
+    if (maxConnections < 1 || maxConnections > 1024) {
+      throw new IllegalArgumentException("invalid proxy bounds");
+    }
+    return new BrokerConfig(
+        stateRoot,
+        control,
+        generation,
+        bootId,
+        Path.of(required(values, "--backend-executable")),
+        backendVersion,
+        port(values, "--backend-port"),
+        port(values, "--listen-port"),
+        Path.of(required(values, "--keystore")),
+        Path.of(required(values, "--password-file")),
+        maxConnections,
+        Path.of(required(values, "--backend-log")),
+        Path.of(required(values, "--pidfd-python")),
+        Path.of(required(values, "--pidfd-helper")));
+  }
+
+  private static Config parse(String[] args) {
+    Map<String, String> values = parseOptions(args);
     int listenPort = port(values, "--listen-port");
     int backendPort = port(values, "--backend-port");
     long backendPid = Long.parseLong(required(values, "--backend-pid"));
@@ -152,12 +399,925 @@ public final class MkChadTlsProxy {
         maxConnections);
   }
 
+  private static Map<String, String> parseOptions(String[] args) {
+    Map<String, String> values = new HashMap<>();
+    for (int i = 0; i < args.length; i += 2) {
+      if (i + 1 >= args.length || !args[i].startsWith("--") || values.put(args[i], args[i + 1]) != null) {
+        throw new IllegalArgumentException("invalid or duplicate proxy argument");
+      }
+    }
+    return values;
+  }
+
+  private static void runBroker(BrokerConfig config) throws Exception {
+    FileIdentity root = requirePrivateDirectory(config.stateRoot());
+    if (Files.exists(config.control(), LinkOption.NOFOLLOW_LINKS)) {
+      throw new IOException("control socket already exists");
+    }
+    requireRegularFile(config.backendExecutable());
+    requirePrivateRegularFile(config.keyStore());
+    requirePrivateRegularFile(config.passwordFile());
+    requirePrivateRegularFile(config.backendLog());
+    requireRegularFile(config.pidfdPython());
+    requireRegularFile(config.pidfdHelper());
+    BrokerAuthority authority = captureBrokerAuthority(config);
+    AtomicReference<BrokerPhase> phase = new AtomicReference<>(BrokerPhase.CONTROL_READY);
+    AtomicReference<Process> backend = new AtomicReference<>();
+    AtomicReference<BrokerTlsService> service = new AtomicReference<>();
+    AtomicBoolean activationInFlight = new AtomicBoolean();
+    CountDownLatch activationDone = new CountDownLatch(1);
+    CountDownLatch terminalReceiptWritten = new CountDownLatch(1);
+    AtomicReference<ServerSocketChannel> controlListener = new AtomicReference<>();
+    ThreadPoolExecutor workers = new ThreadPoolExecutor(
+        CONTROL_CONNECTION_LIMIT,
+        CONTROL_CONNECTION_LIMIT,
+        0L,
+        TimeUnit.MILLISECONDS,
+        new ArrayBlockingQueue<>(CONTROL_QUEUE_LIMIT),
+        new ThreadPoolExecutor.AbortPolicy());
+    try (ServerSocketChannel listener = ServerSocketChannel.open(StandardProtocolFamily.UNIX)) {
+      controlListener.set(listener);
+      listener.bind(UnixDomainSocketAddress.of(config.control()));
+      setPrivateMode(config.control(), false);
+      FileIdentity control = requirePrivateSocket(config.control());
+      if (!root.equals(requirePrivateDirectory(config.stateRoot()))) {
+        throw new IOException("state root changed while binding control socket");
+      }
+      while (phase.get() != BrokerPhase.STOPPED) {
+        SocketChannel channel;
+        try {
+          channel = listener.accept();
+        } catch (IOException closed) {
+          if (phase.get() == BrokerPhase.STOPPING || phase.get() == BrokerPhase.STOPPED) {
+            break;
+          }
+          throw closed;
+        }
+        try {
+          workers.execute(() -> handleControl(
+              channel,
+              config,
+              authority,
+              root,
+              control,
+              phase,
+              backend,
+              service,
+              activationInFlight,
+              activationDone,
+              controlListener,
+              terminalReceiptWritten));
+        } catch (RuntimeException rejected) {
+          close(channel);
+        }
+      }
+      if (phase.get() == BrokerPhase.STOPPING || phase.get() == BrokerPhase.STOPPED) {
+        terminalReceiptWritten.await(CONTROL_DEADLINE_NANOS, TimeUnit.NANOSECONDS);
+      }
+    } finally {
+      workers.shutdownNow();
+    }
+  }
+
+  private static void handleControl(
+      SocketChannel channel,
+      BrokerConfig config,
+      BrokerAuthority authority,
+      FileIdentity root,
+      FileIdentity control,
+      AtomicReference<BrokerPhase> phase,
+      AtomicReference<Process> backend,
+      AtomicReference<BrokerTlsService> service,
+      AtomicBoolean activationInFlight,
+      CountDownLatch activationDone,
+      AtomicReference<ServerSocketChannel> controlListener,
+      CountDownLatch terminalReceiptWritten) {
+    try (channel) {
+      channel.configureBlocking(false);
+      long deadline = System.nanoTime() + CONTROL_DEADLINE_NANOS;
+      ControlRequest request = readControlRequest(channel, deadline);
+      if (!request.generation().equals(config.generation())) {
+        return;
+      }
+      // A complete request must still name the original private authority at commit time.
+      if (!root.equals(requirePrivateDirectory(config.stateRoot()))
+          || !control.equals(requirePrivateSocket(config.control()))) {
+        return;
+      }
+      requireBrokerSelf(config, authority, phase.get() == BrokerPhase.RUNNING);
+      BrokerPhase current = phase.get();
+      if (request.operation().equals("activate")
+          && current == BrokerPhase.CONTROL_READY
+          && phase.compareAndSet(BrokerPhase.CONTROL_READY, BrokerPhase.ACTIVATING)) {
+        activationInFlight.set(true);
+        Thread.ofVirtual().start(() -> activateBroker(
+            config, authority, phase, backend, service, activationInFlight, activationDone));
+        try {
+          activationDone.await(Math.max(1, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+        } catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+          return;
+        }
+        current = BrokerPhase.ACTIVATING;
+      } else if (request.operation().equals("stop") && beginStop(phase)) {
+        completeStop(
+            config,
+            authority,
+            root,
+            control,
+            phase,
+            backend,
+            service,
+            activationInFlight,
+            activationDone,
+            controlListener,
+            request,
+            channel,
+            terminalReceiptWritten);
+        return;
+      }
+      String response = controlResponse(
+          request, current == BrokerPhase.STOPPING ? current : phase.get(), config, authority, control, backend.get());
+      writeControlResponse(channel, response, deadline);
+    } catch (IOException ignored) {
+      // Invalid, incomplete, and overloaded exchanges are deliberately non-mutating.
+    }
+  }
+
+  private static boolean beginStop(AtomicReference<BrokerPhase> phase) {
+    while (true) {
+      BrokerPhase current = phase.get();
+      if (current == BrokerPhase.STOPPING || current == BrokerPhase.STOPPED) {
+        return false;
+      }
+      if (!Set.of(BrokerPhase.CONTROL_READY, BrokerPhase.ACTIVATING, BrokerPhase.ACTIVATION_FAILED,
+          BrokerPhase.RUNNING, BrokerPhase.UNHEALTHY, BrokerPhase.BLOCKED).contains(current)) {
+        return false;
+      }
+      if (phase.compareAndSet(current, BrokerPhase.STOPPING)) {
+        return true;
+      }
+    }
+  }
+
+  private static BrokerAuthority captureBrokerAuthority(BrokerConfig config) throws IOException {
+    long pid = ProcessHandle.current().pid();
+    Path proc = Path.of("/proc", Long.toString(pid));
+    List<String> argv = List.copyOf(procArgv(proc.resolve("cmdline")));
+    int sourceOption = argv.indexOf("--source");
+    int brokerOption = argv.indexOf("--broker");
+    if (sourceOption < 1
+        || sourceOption + 3 != brokerOption
+        || !"21".equals(argv.get(sourceOption + 1))
+        || !argv.subList(brokerOption, argv.size()).equals(expectedBrokerTail(config))) {
+      throw new IOException("broker source-mode argv is invalid");
+    }
+    Path launchPath = Path.of(argv.getFirst());
+    Path source = Path.of(argv.get(sourceOption + 2));
+    if (!launchPath.isAbsolute() || !source.isAbsolute()) {
+      throw new IOException("broker runtime and source paths must be absolute");
+    }
+    BrokerAuthority authority = new BrokerAuthority(
+        pid,
+        processStart(proc.resolve("stat")),
+        Path.of(Files.readSymbolicLink(proc.resolve("exe")).toString().replaceFirst(" \\(deleted\\)$", "")),
+        fileIdentity(proc.resolve("exe")),
+        launchPath,
+        fileIdentity(launchPath),
+        argv,
+        source,
+        fileIdentity(source),
+        fileIdentity(config.backendExecutable()),
+        fileIdentity(config.pidfdPython()),
+        fileIdentity(config.pidfdHelper()));
+    requireBrokerSelf(config, authority, false);
+    return authority;
+  }
+
+  private static List<String> expectedBrokerTail(BrokerConfig config) {
+    return List.of(
+        "--broker",
+        "--state-root", config.stateRoot().toString(),
+        "--control", config.control().toString(),
+        "--generation", config.generation(),
+        "--boot-id", config.bootId(),
+        "--backend-executable", config.backendExecutable().toString(),
+        "--backend-version", config.backendVersion(),
+        "--backend-port", Integer.toString(config.backendPort()),
+        "--listen-port", Integer.toString(config.listenPort()),
+        "--keystore", config.keyStore().toString(),
+        "--password-file", config.passwordFile().toString(),
+        "--max-connections", Integer.toString(config.maxConnections()),
+        "--backend-log", config.backendLog().toString(),
+        "--pidfd-python", config.pidfdPython().toString(),
+        "--pidfd-helper", config.pidfdHelper().toString());
+  }
+
+  private static void requireBrokerSelf(BrokerConfig config, BrokerAuthority authority, boolean requireListener)
+      throws IOException {
+    Path proc = Path.of("/proc", Long.toString(authority.pid()));
+    List<String> argv = procArgv(proc.resolve("cmdline"));
+    boolean listenerOwned = !requireListener || ownsUniqueListener(config.listenPort(), authority.pid());
+    validateBrokerSelfEvidenceForTest(authority.argv(), argv, listenerOwned);
+    if (ProcessHandle.current().pid() != authority.pid()
+        || !Files.readString(Path.of("/proc/sys/kernel/random/boot_id"), StandardCharsets.US_ASCII).trim()
+            .equals(config.bootId())
+        || !processStart(proc.resolve("stat")).equals(authority.start())
+        || !Path.of(Files.readSymbolicLink(proc.resolve("exe")).toString().replaceFirst(" \\(deleted\\)$", ""))
+            .equals(authority.runtimePath())
+        || !fileIdentity(proc.resolve("exe")).equals(authority.runtime())
+        || !fileIdentity(authority.launchPath()).equals(authority.launch())
+        || !fileIdentity(authority.source()).equals(authority.sourceIdentity())
+        || !fileIdentity(config.backendExecutable()).equals(authority.backendExecutable())
+        || !fileIdentity(config.pidfdPython()).equals(authority.pidfdPython())
+        || !fileIdentity(config.pidfdHelper()).equals(authority.pidfdHelper())) {
+      throw new IOException("broker self or frozen asset identity changed");
+    }
+  }
+
+  static void validateBrokerSelfEvidenceForTest(
+      List<String> expectedArgv, List<String> actualArgv, boolean listenerOwned) throws IOException {
+    if (!expectedArgv.equals(actualArgv) || !listenerOwned) {
+      throw new IOException("broker full argv or listener identity changed");
+    }
+  }
+
+  static void validateFrozenIdentityForTest(
+      long expectedDevice, long expectedInode, long actualDevice, long actualInode) throws IOException {
+    if (expectedDevice != actualDevice || expectedInode != actualInode) {
+      throw new IOException("frozen lifecycle asset identity changed");
+    }
+  }
+
+  private static void activateBroker(
+      BrokerConfig config,
+      BrokerAuthority authority,
+      AtomicReference<BrokerPhase> phase,
+      AtomicReference<Process> backend,
+      AtomicReference<BrokerTlsService> service,
+      AtomicBoolean activationInFlight,
+      CountDownLatch activationDone) {
+    try {
+      if (phase.get() != BrokerPhase.ACTIVATING) {
+        return;
+      }
+      Process started = new ProcessBuilder(
+          config.backendExecutable().toString(), "serve", "--hostname", "127.0.0.1", "--port",
+          Integer.toString(config.backendPort()))
+          .redirectInput(ProcessBuilder.Redirect.from(Path.of("/dev/null").toFile()))
+          .redirectOutput(ProcessBuilder.Redirect.appendTo(config.backendLog().toFile()))
+          .redirectError(ProcessBuilder.Redirect.appendTo(config.backendLog().toFile()))
+          .start();
+      backend.set(started);
+      Config tls = new Config(config.listenPort(), config.backendPort(), started.pid(),
+          processStart(Path.of("/proc", Long.toString(started.pid()), "stat")), config.bootId(),
+          config.keyStore(), config.passwordFile(), config.maxConnections());
+      requireLinuxEvidence(tls);
+      waitForListener(tls, System.nanoTime() + CONTROL_DEADLINE_NANOS);
+      if (phase.get() != BrokerPhase.ACTIVATING) {
+        return;
+      }
+      BrokerTlsService startedService = new BrokerTlsService(tls);
+      service.set(startedService);
+      startedService.start();
+      waitForOwnedListener(tls.listenPort(), ProcessHandle.current().pid(), System.nanoTime() + CONTROL_DEADLINE_NANOS);
+      phase.compareAndSet(BrokerPhase.ACTIVATING, BrokerPhase.RUNNING);
+    } catch (Exception failure) {
+      if (phase.get() == BrokerPhase.ACTIVATING) {
+        boolean cleaned = cleanupFailedActivation(config, authority, backend.get(), service.get());
+        phase.compareAndSet(
+            BrokerPhase.ACTIVATING, cleaned ? BrokerPhase.ACTIVATION_FAILED : BrokerPhase.BLOCKED);
+      }
+    } finally {
+      activationInFlight.set(false);
+      activationDone.countDown();
+    }
+  }
+
+  private static boolean cleanupFailedActivation(
+      BrokerConfig config, BrokerAuthority authority, Process backend, BrokerTlsService service) {
+    try {
+      if (service != null) {
+        service.quiesce();
+      }
+      if (backend != null && backend.isAlive()) {
+        terminateBackend(backend, config, authority, false, System.nanoTime() + CONTROL_DEADLINE_NANOS);
+      }
+      return backend == null || !backend.isAlive();
+    } catch (Exception failure) {
+      return false;
+    }
+  }
+
+  private static void completeStop(
+      BrokerConfig config,
+      BrokerAuthority authority,
+      FileIdentity root,
+      FileIdentity control,
+      AtomicReference<BrokerPhase> phase,
+      AtomicReference<Process> backend,
+      AtomicReference<BrokerTlsService> service,
+      AtomicBoolean activationInFlight,
+      CountDownLatch activationDone,
+      AtomicReference<ServerSocketChannel> controlListener,
+      ControlRequest request,
+      SocketChannel channel,
+      CountDownLatch terminalReceiptWritten) {
+    try {
+      BrokerTlsService publicService = service.get();
+      if (publicService != null) {
+        publicService.quiesce();
+      }
+      if (activationInFlight.get()
+          && !activationDone.await(CONTROL_DEADLINE_NANOS, TimeUnit.NANOSECONDS)) {
+        return;
+      }
+      publicService = service.get();
+      if (publicService != null) {
+        publicService.quiesce();
+      }
+      Process child = backend.get();
+      if (child != null && child.isAlive()) {
+        terminateBackend(
+            child, config, authority, publicService != null, System.nanoTime() + CONTROL_DEADLINE_NANOS);
+      }
+      if (child != null && child.isAlive()) {
+        return;
+      }
+      if (!root.equals(requirePrivateDirectory(config.stateRoot()))
+          || !control.equals(requirePrivateSocket(config.control()))) {
+        return;
+      }
+      close(controlListener.get());
+      if (!Files.deleteIfExists(config.control())) {
+        return;
+      }
+      phase.set(BrokerPhase.STOPPED);
+      writeControlResponse(channel, controlResponse(request, BrokerPhase.STOPPED, config, authority, control, child),
+          System.nanoTime() + CONTROL_DEADLINE_NANOS);
+    } catch (Exception ignored) {
+      // A committed stop leaves authority intact unless all terminal proof succeeds.
+    } finally {
+      terminalReceiptWritten.countDown();
+    }
+  }
+
+  private static void terminateBackend(
+      Process backend, BrokerConfig config, BrokerAuthority authority, boolean requireListener, long deadline)
+      throws IOException {
+    invokePidfdHelper(
+        backendReceipt(backend.pid(), config, authority, requireListener), config, authority, "SIGTERM", deadline);
+    long killAt = Math.min(deadline, System.nanoTime() + PIDFD_TERM_GRACE_NANOS);
+    while (backend.isAlive() && System.nanoTime() < killAt) {
+      sleepBriefly();
+    }
+    if (backend.isAlive()) {
+      invokePidfdHelper(
+          backendReceipt(backend.pid(), config, authority, requireListener), config, authority, "SIGKILL", deadline);
+      while (backend.isAlive() && System.nanoTime() < deadline) {
+        sleepBriefly();
+      }
+    }
+    if (backend.isAlive()) {
+      throw new IOException("backend did not exit after pidfd signal");
+    }
+  }
+
+  private static void invokePidfdHelper(
+      String backend, BrokerConfig config, BrokerAuthority authority, String signal, long deadline) throws IOException {
+    if (System.nanoTime() >= deadline) {
+      throw new IOException("pidfd signal helper timed out");
+    }
+    String request = "{\"schema\":1,\"boot_id\":\"" + json(config.bootId()) + "\",\"signal\":\""
+        + signal + "\",\"process\":" + backend + "}";
+    requireBrokerSelf(config, authority, false);
+    testHook("pidfd-signal");
+    Process helper = new ProcessBuilder(config.pidfdPython().toString(), config.pidfdHelper().toString()).start();
+    AtomicReference<byte[]> stderr = new AtomicReference<>(new byte[0]);
+    AtomicReference<IOException> streamFailure = new AtomicReference<>();
+    CountDownLatch streamsDone = new CountDownLatch(2);
+    Thread.ofVirtual().start(() -> {
+      try {
+        stderr.set(readBounded(helper.getErrorStream()));
+      } catch (IOException failure) {
+        streamFailure.compareAndSet(null, failure);
+      } finally {
+        streamsDone.countDown();
+      }
+    });
+    Thread.ofVirtual().start(() -> {
+      try {
+        readBounded(helper.getInputStream());
+      } catch (IOException failure) {
+        streamFailure.compareAndSet(null, failure);
+      } finally {
+        streamsDone.countDown();
+      }
+    });
+    try {
+      try (OutputStream input = helper.getOutputStream()) {
+        input.write(request.getBytes(StandardCharsets.UTF_8));
+      }
+      long remaining = deadline - System.nanoTime();
+      if (remaining <= 0 || !helper.waitFor(remaining, TimeUnit.NANOSECONDS)) {
+        helper.destroy();
+        if (!helper.waitFor(PIDFD_TERM_GRACE_NANOS, TimeUnit.NANOSECONDS)) {
+          helper.destroyForcibly();
+          helper.waitFor();
+        }
+        throw new IOException("pidfd signal helper timed out");
+      }
+      if (!streamsDone.await(Math.max(1, deadline - System.nanoTime()), TimeUnit.NANOSECONDS)) {
+        throw new IOException("pidfd signal helper streams did not close");
+      }
+      if (streamFailure.get() != null) {
+        throw streamFailure.get();
+      }
+      if (helper.exitValue() != 0) {
+        String detail = new String(stderr.get(), StandardCharsets.UTF_8).trim();
+        throw new IOException(detail.isEmpty() ? "pidfd signal helper refused the managed process" : detail);
+      }
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+      throw new IOException("interrupted while waiting for pidfd signal helper", interrupted);
+    } finally {
+      helper.destroyForcibly();
+    }
+  }
+
+  private static byte[] readBounded(InputStream input) throws IOException {
+    ByteArrayOutputStream output = new ByteArrayOutputStream();
+    byte[] buffer = new byte[4096];
+    for (int count; (count = input.read(buffer)) >= 0; ) {
+      if (output.size() + count > HELPER_OUTPUT_LIMIT) {
+        throw new IOException("pidfd signal helper output exceeded its bound");
+      }
+      output.write(buffer, 0, count);
+    }
+    return output.toByteArray();
+  }
+
+  /** Test-only deterministic scheduling hook. It is inert without an explicit JVM property. */
+  private static void testHook(String name) throws IOException {
+    String directory = System.getProperty("mkchad.proxy.test-hook-dir");
+    if (directory == null || directory.isEmpty()) {
+      return;
+    }
+    Path root = Path.of(directory);
+    if (!Files.isRegularFile(root.resolve(name + ".enabled"), LinkOption.NOFOLLOW_LINKS)) {
+      return;
+    }
+    Path reached = root.resolve(name + ".reached");
+    Path resume = root.resolve(name + ".resume");
+    Files.writeString(reached, "reached\n", StandardCharsets.US_ASCII);
+    long deadline = System.nanoTime() + CONTROL_DEADLINE_NANOS;
+    while (!Files.isRegularFile(resume, LinkOption.NOFOLLOW_LINKS)) {
+      if (System.nanoTime() >= deadline) {
+        throw new IOException("test hook timed out: " + name);
+      }
+      sleepBriefly();
+    }
+  }
+
+  private static void sleepBriefly() throws IOException {
+    try {
+      Thread.sleep(10);
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+      throw new IOException("interrupted while waiting for backend exit", interrupted);
+    }
+  }
+
+  private static void waitForListener(Config config, long deadline) throws IOException {
+    while (System.nanoTime() < deadline) {
+      requireLinuxEvidence(config);
+      String inode = findUniqueListenerInode(config.backendPort());
+      if (inode != null && ownsInode(config.backendPid(), inode)) {
+        return;
+      }
+      try {
+        Thread.sleep(20);
+      } catch (InterruptedException interrupted) {
+        Thread.currentThread().interrupt();
+        throw new IOException("interrupted while waiting for backend listener", interrupted);
+      }
+    }
+    throw new IOException("backend did not acquire its expected loopback listener");
+  }
+
+  private static String findUniqueListenerInode(int port) {
+    try {
+      String wanted = "%04X".formatted(port);
+      List<String> matches = new ArrayList<>();
+      for (Path table : List.of(Path.of("/proc/net/tcp"), Path.of("/proc/net/tcp6"))) {
+        List<String> lines = Files.readAllLines(table, StandardCharsets.US_ASCII);
+        if (lines.size() > PROC_ENTRY_LIMIT) {
+          return null;
+        }
+        for (int index = 1; index < lines.size(); index++) {
+          String[] fields = WHITESPACE.split(lines.get(index).trim());
+          if (fields.length >= 10 && fields[1].endsWith(":" + wanted) && fields[3].equals("0A")) {
+            matches.add(fields[9]);
+          }
+        }
+      }
+      return matches.size() == 1 ? matches.getFirst() : null;
+    } catch (IOException ignored) {
+      return null;
+    }
+  }
+
+  private static void waitForOwnedListener(int port, long pid, long deadline) throws IOException {
+    while (System.nanoTime() < deadline) {
+      String inode = findUniqueListenerInode(port);
+      if (inode != null && ownsInode(pid, inode)) {
+        return;
+      }
+      try {
+        Thread.sleep(20);
+      } catch (InterruptedException interrupted) {
+        Thread.currentThread().interrupt();
+        throw new IOException("interrupted while waiting for broker listener", interrupted);
+      }
+    }
+    throw new IOException("broker did not acquire its expected loopback listener");
+  }
+
+  private static boolean ownsUniqueListener(int port, long pid) throws IOException {
+    String inode = findUniqueListenerInode(port);
+    return inode != null && ownsInode(pid, inode);
+  }
+
   private static String required(Map<String, String> values, String key) {
     String value = values.get(key);
     if (value == null || value.isEmpty()) {
       throw new IllegalArgumentException("missing " + key);
     }
     return value;
+  }
+
+  private record FileIdentity(long device, long inode) {}
+
+  private static FileIdentity requirePrivateDirectory(Path path) throws IOException {
+    if (!path.isAbsolute()) {
+      throw new IOException("state root is not absolute");
+    }
+    Path current = path.getRoot();
+    for (Path component : path) {
+      current = current.resolve(component);
+      if (Files.isSymbolicLink(current)) {
+        throw new IOException("authority directory is a symlink");
+      }
+    }
+    if (!Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)) {
+      throw new IOException("authority directory is missing or not a directory");
+    }
+    return requirePrivate(path, true);
+  }
+
+  private static FileIdentity requirePrivateSocket(Path path) throws IOException {
+    if (Files.isSymbolicLink(path) || !"socket".equals(socketType(path))) {
+      throw new IOException("control path is not a socket");
+    }
+    return requirePrivate(path, false);
+  }
+
+  private static String socketType(Path path) throws IOException {
+    int mode = (Integer) Files.getAttribute(path, "unix:mode", LinkOption.NOFOLLOW_LINKS);
+    return (mode & 0170000) == 0140000 ? "socket" : "";
+  }
+
+  private static void requireRegularFile(Path path) throws IOException {
+    if (Files.isSymbolicLink(path) || !Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
+      throw new IOException("broker authority file is missing or unsafe");
+    }
+  }
+
+  private static void requirePrivateRegularFile(Path path) throws IOException {
+    requireRegularFile(path);
+    requirePrivate(path, false);
+  }
+
+  private static FileIdentity requirePrivate(Path path, boolean directory) throws IOException {
+    int mode = (Integer) Files.getAttribute(path, "unix:mode", LinkOption.NOFOLLOW_LINKS);
+    long owner = ((Number) Files.getAttribute(path, "unix:uid", LinkOption.NOFOLLOW_LINKS)).longValue();
+    long current = currentEffectiveUid();
+    int expected = directory ? 0700 : 0600;
+    if ((mode & 0777) != expected || owner != current) {
+      throw new IOException("authority path ownership or mode is unsafe");
+    }
+    return new FileIdentity(
+        ((Number) Files.getAttribute(path, "unix:dev", LinkOption.NOFOLLOW_LINKS)).longValue(),
+        ((Number) Files.getAttribute(path, "unix:ino", LinkOption.NOFOLLOW_LINKS)).longValue());
+  }
+
+  private static long currentEffectiveUid() throws IOException {
+    String status = Files.readString(Path.of("/proc/self/status"), StandardCharsets.US_ASCII);
+    for (String line : status.split("\\n")) {
+      if (line.startsWith("Uid:")) {
+        String[] fields = WHITESPACE.split(line.substring(4).trim());
+        if (fields.length >= 2 && fields[1].matches("[0-9]+")) {
+          return Long.parseLong(fields[1]);
+        }
+      }
+    }
+    throw new IOException("unable to determine the effective Unix user identity");
+  }
+
+  private static void setPrivateMode(Path path, boolean directory) throws IOException {
+    Files.setPosixFilePermissions(path, PosixFilePermissions.fromString(directory ? "rwx------" : "rw-------"));
+  }
+
+  static void validateControlFrameForTest(byte[] frame) throws IOException {
+    decodeControlFrame(frame);
+  }
+
+  private static ControlRequest readControlRequest(SocketChannel channel, long deadline) throws IOException {
+    byte[] length = readExact(channel, 4, deadline);
+    int size = ByteBuffer.wrap(length).getInt();
+    if (size < 2 || size > CONTROL_FRAME_LIMIT) {
+      throw new IOException("control frame length is invalid");
+    }
+    byte[] body = readExact(channel, size, deadline);
+    byte[] trailing = readAtMostOne(channel, deadline);
+    if (trailing != null) {
+      throw new IOException("control frame has trailing bytes");
+    }
+    return decodeControlFrame(concat(length, body));
+  }
+
+  private static ControlRequest decodeControlFrame(byte[] frame) throws IOException {
+    if (frame.length < 6) {
+      throw new IOException("control frame is truncated");
+    }
+    int size = ByteBuffer.wrap(frame, 0, 4).getInt();
+    if (size < 2 || size > CONTROL_FRAME_LIMIT || frame.length != size + 4) {
+      throw new IOException("control frame length is invalid");
+    }
+    String json = StandardCharsets.UTF_8.newDecoder()
+        .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+        .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+        .decode(ByteBuffer.wrap(frame, 4, size)).toString();
+    Map<String, String> values = parseFlatJson(json);
+    if (!values.keySet().equals(Set.of("protocol", "operation", "generation", "nonce"))
+        || !"1".equals(values.get("protocol"))
+        || !Set.of("activate", "status", "stop").contains(values.get("operation"))
+        || !safeToken(values.get("generation"), 256)
+        || !safeToken(values.get("nonce"), 256)) {
+      throw new IOException("control request schema is invalid");
+    }
+    return new ControlRequest(values.get("operation"), values.get("generation"), values.get("nonce"));
+  }
+
+  private static Map<String, String> parseFlatJson(String json) throws IOException {
+    if (json.length() < 2 || json.charAt(0) != '{' || json.charAt(json.length() - 1) != '}') {
+      throw new IOException("control JSON must be one object");
+    }
+    Map<String, String> result = new LinkedHashMap<>();
+    int index = 1;
+    while (index < json.length() - 1) {
+      if (json.charAt(index) != '"') {
+        throw new IOException("control JSON key is invalid");
+      }
+      int keyEnd = json.indexOf('"', index + 1);
+      int keyEscape = json.indexOf('\\', index + 1);
+      if (keyEnd < 0 || keyEnd == index + 1 || (keyEscape >= index + 1 && keyEscape < keyEnd)) {
+        throw new IOException("control JSON key is invalid");
+      }
+      String key = json.substring(index + 1, keyEnd);
+      index = keyEnd + 1;
+      if (index >= json.length() || json.charAt(index++) != ':') {
+        throw new IOException("control JSON separator is invalid");
+      }
+      String value;
+      if (index < json.length() && json.charAt(index) == '"') {
+        int valueEnd = json.indexOf('"', index + 1);
+        int valueEscape = json.indexOf('\\', index + 1);
+        if (valueEnd < 0 || (valueEscape >= index + 1 && valueEscape < valueEnd)) {
+          throw new IOException("control JSON value is invalid");
+        }
+        value = json.substring(index + 1, valueEnd);
+        index = valueEnd + 1;
+      } else {
+        int valueEnd = index;
+        while (valueEnd < json.length() - 1 && Character.isDigit(json.charAt(valueEnd))) {
+          valueEnd++;
+        }
+        if (valueEnd == index) {
+          throw new IOException("control JSON value is invalid");
+        }
+        value = json.substring(index, valueEnd);
+        index = valueEnd;
+      }
+      if (result.put(key, value) != null) {
+        throw new IOException("control JSON has duplicate fields");
+      }
+      if (index == json.length() - 1) {
+        break;
+      }
+      if (json.charAt(index++) != ',') {
+        throw new IOException("control JSON has trailing content");
+      }
+    }
+    return result;
+  }
+
+  private static boolean safeToken(String value, int maximum) {
+    return value != null && value.length() > 0 && value.length() <= maximum && value.matches("[A-Za-z0-9_.+\\-]+") ;
+  }
+
+  private static boolean safeText(String value, int maximum) {
+    return value != null && value.length() > 0 && value.length() <= maximum && value.chars().allMatch(c -> c >= 0x20 && c <= 0x7e);
+  }
+
+  private static byte[] readExact(SocketChannel channel, int length, long deadline) throws IOException {
+    ByteBuffer buffer = ByteBuffer.allocate(length);
+    while (buffer.hasRemaining()) {
+      if (System.nanoTime() >= deadline) {
+        throw new IOException("control exchange timed out");
+      }
+      int count = channel.read(buffer);
+      if (count < 0) {
+        throw new IOException("control frame is incomplete");
+      }
+    }
+    return buffer.array();
+  }
+
+  private static byte[] readAtMostOne(SocketChannel channel, long deadline) throws IOException {
+    ByteBuffer byteBuffer = ByteBuffer.allocate(1);
+    while (System.nanoTime() < deadline) {
+      int count = channel.read(byteBuffer);
+      if (count < 0) {
+        return null;
+      }
+      if (count > 0) {
+        return byteBuffer.array();
+      }
+      try {
+        Thread.sleep(1);
+      } catch (InterruptedException interrupted) {
+        Thread.currentThread().interrupt();
+        throw new IOException("interrupted while waiting for control EOF", interrupted);
+      }
+    }
+    throw new IOException("control exchange did not half-close");
+  }
+
+  private static void writeControlResponse(SocketChannel channel, String json, long deadline) throws IOException {
+    byte[] body = json.getBytes(StandardCharsets.UTF_8);
+    if (body.length > CONTROL_FRAME_LIMIT) {
+      throw new IOException("control response exceeds its bound");
+    }
+    ByteBuffer frame = ByteBuffer.allocate(body.length + 4).putInt(body.length).put(body);
+    frame.flip();
+    while (frame.hasRemaining()) {
+      if (System.nanoTime() >= deadline || channel.write(frame) < 0) {
+        throw new IOException("control response write failed");
+      }
+    }
+  }
+
+  private static byte[] concat(byte[] first, byte[] second) {
+    byte[] result = Arrays.copyOf(first, first.length + second.length);
+    System.arraycopy(second, 0, result, first.length, second.length);
+    return result;
+  }
+
+  private static String controlResponse(
+      ControlRequest request,
+      BrokerPhase phase,
+      BrokerConfig config,
+      BrokerAuthority authority,
+      FileIdentity control,
+      Process backend) {
+    BrokerPhase responsePhase = phase;
+    String backendReceipt = null;
+    String error = null;
+    if (phase == BrokerPhase.RUNNING && backend != null) {
+      try {
+        requireBrokerSelf(config, authority, true);
+        backendReceipt = backendReceipt(backend.pid(), config, authority, true);
+      } catch (IOException failure) {
+        // The broker remains live, but its recorded child is no longer exact.
+        responsePhase = BrokerPhase.UNHEALTHY;
+        error = "backend-evidence-lost";
+      }
+    }
+    StringBuilder response = new StringBuilder("{")
+        .append("\"protocol\":1,\"operation\":\"").append(request.operation())
+        .append("\",\"generation\":\"").append(config.generation())
+        .append("\",\"nonce\":\"").append(request.nonce())
+        .append("\",\"phase\":\"").append(responsePhase.wire).append("\",")
+        .append("\"control\":{\"path\":\"").append(json(config.control().toString()))
+        .append("\",\"dev\":\"").append(unsignedIdentityForTest(control.device()))
+        .append("\",\"ino\":\"").append(unsignedIdentityForTest(control.inode())).append("\"}")
+        .append(",\"proxy\":").append(proxyReceipt(config, authority));
+    if (backendReceipt != null) {
+      response.append(",\"backend\":").append(backendReceipt);
+    } else if (error != null) {
+      response.append(",\"error\":\"").append(error).append("\"");
+    } else if (responsePhase == BrokerPhase.ACTIVATION_FAILED || responsePhase == BrokerPhase.BLOCKED) {
+      response.append(",\"error\":\"")
+          .append(phase == BrokerPhase.BLOCKED ? "blocked" : "activation-failed")
+          .append("\"");
+    }
+    return response.append('}').toString();
+  }
+
+  private static String proxyReceipt(BrokerConfig config, BrokerAuthority authority) {
+    StringBuilder value = new StringBuilder("{")
+        .append("\"pid\":").append(authority.pid())
+        .append(",\"port\":").append(config.listenPort())
+        .append(",\"argv\":[");
+    appendJsonArray(value, authority.argv());
+    return value.append("],\"process_executable\":\"").append(json(authority.runtimePath().toString()))
+        .append("\",\"process_executable_dev\":\"").append(unsignedIdentityForTest(authority.runtime().device()))
+        .append("\",\"process_executable_ino\":\"").append(unsignedIdentityForTest(authority.runtime().inode()))
+        .append("\",\"executable\":\"").append(json(authority.launchPath().toString()))
+        .append("\",\"executable_dev\":\"").append(unsignedIdentityForTest(authority.launch().device()))
+        .append("\",\"executable_ino\":\"").append(unsignedIdentityForTest(authority.launch().inode()))
+        .append("\",\"start_time\":\"").append(authority.start())
+        .append("\",\"source\":\"").append(json(authority.source().toString()))
+        .append("\",\"source_dev\":\"").append(unsignedIdentityForTest(authority.sourceIdentity().device()))
+        .append("\",\"source_ino\":\"").append(unsignedIdentityForTest(authority.sourceIdentity().inode()))
+        .append("\"}").toString();
+  }
+
+  private static String backendReceipt(
+      long pid, BrokerConfig config, BrokerAuthority authority, boolean requireListener) throws IOException {
+    Path proc = Path.of("/proc", Long.toString(pid));
+    FileIdentity runtime = fileIdentity(proc.resolve("exe"));
+    FileIdentity executable = fileIdentity(config.backendExecutable());
+    if (!executable.equals(authority.backendExecutable())
+        || (requireListener && !ownsUniqueListener(config.backendPort(), pid))) {
+      throw new IOException("backend frozen executable or listener identity changed");
+    }
+    List<String> argv = procArgv(proc.resolve("cmdline"));
+    if (argv.isEmpty()) {
+      throw new IOException("backend argv is absent");
+    }
+    StringBuilder value = new StringBuilder("{")
+        .append("\"pid\":").append(pid)
+        .append(",\"port\":").append(config.backendPort())
+        .append(",\"argv\":[");
+    appendJsonArray(value, argv);
+    return value.append("],\"process_executable\":\"").append(json(Files.readSymbolicLink(proc.resolve("exe")).toString()))
+        .append("\",\"process_executable_dev\":\"").append(unsignedIdentityForTest(runtime.device()))
+        .append("\",\"process_executable_ino\":\"").append(unsignedIdentityForTest(runtime.inode()))
+        .append("\",\"executable\":\"").append(json(config.backendExecutable().toString()))
+        .append("\",\"executable_dev\":\"").append(unsignedIdentityForTest(executable.device()))
+        .append("\",\"executable_ino\":\"").append(unsignedIdentityForTest(executable.inode()))
+        .append("\",\"start_time\":\"").append(processStart(proc.resolve("stat")))
+        .append("\",\"local_version\":\"").append(json(config.backendVersion()))
+        .append("\",\"log\":\"").append(json(config.backendLog().toString()))
+        .append("\"}").toString();
+  }
+
+  private static void appendJsonArray(StringBuilder value, List<String> entries) {
+    for (int index = 0; index < entries.size(); index++) {
+      if (index > 0) {
+        value.append(',');
+      }
+      value.append('"').append(json(entries.get(index))).append('"');
+    }
+  }
+
+  private static FileIdentity fileIdentity(Path path) throws IOException {
+    return new FileIdentity(
+        ((Number) Files.getAttribute(path, "unix:dev")).longValue(),
+        ((Number) Files.getAttribute(path, "unix:ino")).longValue());
+  }
+
+  static String unsignedIdentityForTest(long value) {
+    return Long.toUnsignedString(value);
+  }
+
+  private static List<String> procArgv(Path path) throws IOException {
+    byte[] content = Files.readAllBytes(path);
+    List<String> result = new ArrayList<>();
+    int start = 0;
+    for (int index = 0; index < content.length; index++) {
+      if (content[index] == 0) {
+        if (index == start) {
+          throw new IOException("backend argv is malformed");
+        }
+        String value = new String(content, start, index - start, StandardCharsets.UTF_8);
+        if (!safeText(value, 4096)) {
+          throw new IOException("backend argv is unsafe");
+        }
+        result.add(value);
+        start = index + 1;
+      }
+    }
+    if (start != content.length || result.isEmpty() || result.size() > 128) {
+      throw new IOException("backend argv is malformed");
+    }
+    return result;
+  }
+
+  private static String json(String value) {
+    return value.replace("\\", "\\\\").replace("\"", "\\\"");
   }
 
   private static int port(Map<String, String> values, String key) {
@@ -238,6 +1398,11 @@ public final class MkChadTlsProxy {
   }
 
   private static void relay(SSLSocket client, Config config) throws Exception {
+    relay(client, config, null);
+  }
+
+  private static void relay(SSLSocket client, Config config, BrokerTlsService.RelayRegistration registration)
+      throws Exception {
     client.setSoTimeout(PROOF_TIMEOUT_MS);
     SSLParameters parameters = client.getSSLParameters();
     parameters.setApplicationProtocols(new String[0]);
@@ -247,6 +1412,10 @@ public final class MkChadTlsProxy {
     // No decrypted client byte is read until this immutable process identity is live.
     requireLinuxEvidence(config);
     try (client; Socket backend = new Socket()) {
+      if (registration != null && !registration.registerBackend(backend)) {
+        return;
+      }
+      testHook("backend-connect");
       backend.connect(new InetSocketAddress("127.0.0.1", config.backendPort()), PROOF_TIMEOUT_MS);
       backend.setSoTimeout(PROOF_TIMEOUT_MS);
       backend.getOutputStream().write(PREFLIGHT);
@@ -339,7 +1508,8 @@ public final class MkChadTlsProxy {
       throws IOException {
     boolean acquired;
     try {
-      acquired = PROOF_SCAN_PERMITS.tryAcquire(PROOF_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+      // A queued scan may wait as long as one bounded scan, but never indefinitely.
+      acquired = PROOF_SCAN_PERMITS.tryAcquire(PROC_SCAN_TIMEOUT_NANOS, TimeUnit.NANOSECONDS);
     } catch (InterruptedException interrupted) {
       Thread.currentThread().interrupt();
       throw new IOException("interrupted while waiting for a proc proof scan", interrupted);

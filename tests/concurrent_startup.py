@@ -11,7 +11,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = ROOT / "tests" / "opencode_delayed_contender_spec.lua"
 CONFIG = ROOT / "lua" / "configs" / "opencode.lua"
-BASE = Path("/tmp/opencode/mkchad-concurrent-startup")
+BASE = Path("/tmp/opencode-mkchad/concurrent-startup")
 
 
 def command(mode: str, env: dict[str, str]) -> subprocess.CompletedProcess:
@@ -30,6 +30,8 @@ def run_case(root: Path, direct: bool) -> None:
     state_root.mkdir(mode=0o700)
     results.mkdir(mode=0o700)
     env = os.environ.copy()
+    for name in ("OPENCODE_PORT", "OPENCODE_SERVER_USERNAME", "OPENCODE_SERVER_PASSWORD"):
+        env.pop(name, None)
     env.update({
         "XDG_STATE_HOME": str(state_root),
         "NVIM_APPNAME": "mkchad",
@@ -76,7 +78,8 @@ def run_case(root: Path, direct: bool) -> None:
         state_files = list(state_root.glob("mkchad/opencode/*/state.json"))
         assert len(state_files) == 1
         state = json.loads(state_files[0].read_text())
-        assert state["schema"] == 3 and state["transport"] == expected_transport and state["port"] != 4096
+        expected_schema = 3 if direct else 4
+        assert state["schema"] == expected_schema and state["transport"] == expected_transport and state["port"] != 4096
         expected_record = [state["generation"], str(state["backend"]["pid"])]
         roles = ["backend"]
         if not direct:

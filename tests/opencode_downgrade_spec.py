@@ -3,7 +3,6 @@ import json
 import os
 from pathlib import Path
 import shutil
-import socket
 import subprocess
 import tempfile
 import time
@@ -13,7 +12,9 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "lua" / "configs" / "opencode.lua"
 CONTENDER = ROOT / "tests" / "opencode_delayed_contender_spec.lua"
 WORKER = ROOT / "tests" / "opencode_downgrade_worker.lua"
-BASE = Path("/tmp/opencode/mkchad-downgrade")
+BASE = Path("/tmp/opencode-mkchad/downgrade")
+# Reviewed pre-broker lifecycle revision. It must fail closed on schema-4
+# authority without altering records or signaling their recorded processes.
 BASELINE = "938c325"
 
 
@@ -55,9 +56,11 @@ def complete_state_case(root: Path, baseline: Path) -> None:
     state_root.mkdir(mode=0o700)
     results.mkdir(mode=0o700)
     server_config = root / "direct-server.json"
-    server_config.write_text(json.dumps({"tls_proxy": False}))
+    server_config.write_text(json.dumps({"tls_proxy": True}))
     server_config.chmod(0o600)
     env = os.environ.copy()
+    for name in ("OPENCODE_PORT", "OPENCODE_SERVER_USERNAME", "OPENCODE_SERVER_PASSWORD"):
+        env.pop(name, None)
     env.update({
         "XDG_STATE_HOME": str(state_root),
         "NVIM_APPNAME": "mkchad",
@@ -74,14 +77,17 @@ def complete_state_case(root: Path, baseline: Path) -> None:
         state_path = next(state_root.glob("mkchad/opencode/*/state.json"))
         before = state_path.read_bytes()
         state = json.loads(before)
-        assert state["schema"] == 3 and state["transport"] == "loopback-http"
+        assert state["schema"] == 4 and state["transport"] == "tls-proxy"
         backend_pid = state["backend"]["pid"]
+        proxy_pid = state["proxy"]["pid"]
         assert Path(f"/proc/{backend_pid}").exists()
+        assert Path(f"/proc/{proxy_pid}").exists()
         env["PATH"] = str(Path(state["backend"]["executable"]).parent) + os.pathsep + env["PATH"]
         checked = run_nvim(env, WORKER, baseline, "complete")
         assert checked.returncode == 0, checked.stderr
-        assert state_path.read_bytes() == before, "baseline mutated schema-3 complete state"
-        assert Path(f"/proc/{backend_pid}").exists(), "baseline signaled the schema-3 backend"
+        assert state_path.read_bytes() == before, "baseline mutated schema-4 complete state"
+        assert Path(f"/proc/{backend_pid}").exists(), "baseline signaled the schema-4 backend"
+        assert Path(f"/proc/{proxy_pid}").exists(), "baseline signaled the schema-4 broker"
         assert len(list(state_root.glob("mkchad/opencode/*/state.json"))) == 1
     finally:
         cleanup = run_nvim(env, CONTENDER, CONFIG, "cleanup")
@@ -92,36 +98,82 @@ def complete_state_case(root: Path, baseline: Path) -> None:
 
 def pending_case(root: Path, baseline: Path) -> None:
     state_root = root / "pending-state"
+    results = root / "pending-results"
     state_root.mkdir(mode=0o700)
+    results.mkdir(mode=0o700)
     env = os.environ.copy()
+    for name in ("OPENCODE_PORT", "OPENCODE_SERVER_USERNAME", "OPENCODE_SERVER_PASSWORD"):
+        env.pop(name, None)
     env.update({"XDG_STATE_HOME": str(state_root), "NVIM_APPNAME": "mkchad"})
-    sleeper = subprocess.Popen(["sleep", "60"])
+    env["MKCHAD_OPENCODE_RESULT"] = str(results / "result")
+    state_path = None
+    state_before = None
     try:
-        host = "".join(character if character.isalnum() or character in "_.-" else "_" for character in socket.gethostname())
-        pending_root = state_root / "mkchad" / "opencode" / host
-        pending_root.mkdir(parents=True, mode=0o700)
+        setup = run_nvim(env, CONTENDER, CONFIG, "setup")
+        assert setup.returncode == 0, setup.stderr
+        worker = run_nvim(env, CONTENDER, CONFIG, "worker")
+        assert worker.returncode == 0, worker.stderr
+        state_path = next(state_root.glob("mkchad/opencode/*/state.json"))
+        state_before = state_path.read_bytes()
+        state = json.loads(state_before)
+        assert state["schema"] == 4 and state["transport"] == "tls-proxy"
+        pending_root = state_path.parent
         pending_path = pending_root / "pending.json"
-        pending_path.write_text(json.dumps({
-            "schema": 3,
-            "transport": "loopback-http",
-            "generation": "downgrade-pending",
-            "pid": sleeper.pid,
-            "sentinel": "preserve-schema-3-pending",
-        }))
+        launch_path = pending_root / "launch.json"
+        pending = {
+            "schema": 4,
+            "transport": "tls-proxy",
+            "phase": "running",
+            "hostname": state["hostname"],
+            "generation": state["generation"],
+            "boot_id": state["boot_id"],
+            "proxy": state["proxy"],
+            "backend": state["backend"],
+            "broker": state["broker"],
+        }
+        launch = {
+            "schema": 2,
+            "transport": "tls-proxy",
+            "hostname": state["hostname"],
+            "generation": state["generation"],
+            "boot_id": state["boot_id"],
+            "proxy": {
+                key: state["proxy"][key]
+                for key in ("port", "executable", "executable_dev", "executable_ino", "source", "source_dev", "source_ino", "log", "argv", "pid")
+            },
+            "public": {"role": "public", "port": state["port"]},
+            "control": {"protocol": 1, "path": state["broker"]["control_path"]},
+            "backend": {
+                "role": "backend",
+                "executable": state["backend"]["executable"],
+                "executable_dev": state["backend"]["executable_dev"],
+                "executable_ino": state["backend"]["executable_ino"],
+                "version": state["backend"]["local_version"],
+                "port": state["backend"]["port"],
+                "log": state["backend"]["log"],
+            },
+        }
+        launch["proxy"]["role"] = "proxy"
+        state_path.unlink()
+        pending_path.write_text(json.dumps(pending))
         pending_path.chmod(0o600)
+        launch_path.write_text(json.dumps(launch))
+        launch_path.chmod(0o600)
         before = pending_path.read_bytes()
+        launch_before = launch_path.read_bytes()
         checked = run_nvim(env, WORKER, baseline, "pending")
         assert checked.returncode == 0, checked.stderr
-        assert pending_path.read_bytes() == before, "baseline mutated schema-3 pending metadata"
-        assert sleeper.poll() is None, "baseline signaled the pending sentinel process"
+        assert pending_path.read_bytes() == before, "baseline mutated schema-4 pending metadata"
+        assert launch_path.read_bytes() == launch_before, "baseline mutated schema-4 broker launch metadata"
+        for process in (state["proxy"], state["backend"]):
+            assert Path(f"/proc/{process['pid']}").exists(), "baseline signaled a schema-4 pending role"
     finally:
-        if sleeper.poll() is None:
-            sleeper.terminate()
-            try:
-                sleeper.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                sleeper.kill()
-                sleeper.wait(timeout=3)
+        if state_path and state_before:
+            state_path.write_bytes(state_before)
+            for path in (state_path.parent / "pending.json", state_path.parent / "launch.json"):
+                path.unlink(missing_ok=True)
+            cleanup = run_nvim(env, CONTENDER, CONFIG, "cleanup")
+            assert cleanup.returncode == 0, cleanup.stderr
 
 
 def rollback_case(root: Path, baseline: Path) -> None:
@@ -135,6 +187,8 @@ def rollback_case(root: Path, baseline: Path) -> None:
     server_config.write_text(json.dumps({"tls_proxy": True}))
     server_config.chmod(0o600)
     env = os.environ.copy()
+    for name in ("OPENCODE_PORT", "OPENCODE_SERVER_USERNAME", "OPENCODE_SERVER_PASSWORD"):
+        env.pop(name, None)
     env.update({
         "XDG_CONFIG_HOME": str(config_home),
         "XDG_STATE_HOME": str(state_root),
@@ -150,14 +204,14 @@ def rollback_case(root: Path, baseline: Path) -> None:
         assert current.returncode == 0, current.stderr
         state_path = next(state_root.glob("mkchad/opencode/*/state.json"))
         current_state = json.loads(state_path.read_bytes())
-        assert current_state["schema"] == 3 and current_state["transport"] == "tls-proxy"
+        assert current_state["schema"] == 4 and current_state["transport"] == "tls-proxy"
         current_pids = [current_state["proxy"]["pid"], current_state["backend"]["pid"]]
         ca_before = Path(current_state["ca_path"]).read_bytes()
 
         cleanup = run_nvim(env, CONTENDER, CONFIG, "cleanup")
         assert cleanup.returncode == 0, cleanup.stderr
         for pid in current_pids:
-            assert not Path(f"/proc/{pid}").exists(), "schema-3 role survived rollback stop"
+            assert not Path(f"/proc/{pid}").exists(), "schema-4 role survived rollback stop"
         lifecycle_root = state_path.parent
         for name in ("state.json", "pending.json", "launch.json"):
             assert not (lifecycle_root / name).exists(), f"rollback retained {name}"
