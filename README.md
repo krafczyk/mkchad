@@ -21,8 +21,10 @@ mkchad-opencode-server kill [--json]
 
 The public host command is installed as `~/.local/bin/mkchad-opencode-server`
 by `msk_containers/bin/install_nvim.sh`. It enters the active image through the
-same `ct_exec.sh` launcher as MkChad, including configured container mounts,
-then delegates to the installed `mkchad-opencode-server-image` companion.
+same profile-bound persistent SingularityCE/Apptainer contract as the MkChad
+launcher, including configured container mounts, then delegates to the installed
+`mkchad-opencode-server-image` companion. The instance retains image executables
+and libraries after a short-lived manager or originating editor exits.
 MkChad prefers that companion directly because it is already inside the image;
 during a staggered upgrade it falls back to the public launcher's compatible
 in-image route until the companion has been installed.
@@ -41,7 +43,9 @@ stop. `:OpenCodeInfo` obtains its server status through the command while
 reporting editor-local TUI and SSE presentation separately. When invoked from a
 MkChad Neovim image, the wrapper recognizes the image/runtime marker and runs
 that image's Neovim directly without nesting SingularityCE or Apptainer; its
-MkChad XDG, npm, and `OPENCODE_CONFIG` environment remain in effect.
+MkChad XDG, npm, and `OPENCODE_CONFIG` environment remain in effect. Detached
+`start` is refused inside an ordinary foreground container because its image
+mount can disappear while the server is still running.
 
 `start` reuses a fully validated generation or performs the bounded reviewed
 recovery flow. `status` is observational: it reports `healthy`, `inactive`,
@@ -51,6 +55,14 @@ transport setting and is an idempotent success when no managed service is
 active. Usage errors exit `2`; refused or failed lifecycle operations exit `1`;
 completed operations, including observational unhealthy or blocked status, exit
 `0`.
+
+Server `stop` leaves the idle runtime instance available for future MkChad and
+lifecycle commands. It never maps a successful server stop to `instance stop`,
+which could race another caller and kill a newly started generation or editor.
+After stopping the server and accounting for all MkChad/container users, an
+operator may list and stop the exact idle instance with the selected container
+runtime. Image or bootstrap upgrades select a new instance profile rather than
+silently reusing stale mounts.
 
 `clear` is the explicit stale-authority reset for an operator who has already
 accounted for any old processes. It removes this host lifecycle root's metadata,
