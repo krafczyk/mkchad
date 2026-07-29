@@ -34,6 +34,25 @@ local requested_transport
 local ffi_ok, ffi = pcall(require, "ffi")
 if ffi_ok then
   pcall(ffi.cdef, "int flock(int fd, int operation);")
+  pcall(
+    ffi.cdef,
+    [[
+    struct mkchad_statx {
+      unsigned int stx_mask;
+      unsigned int stx_blksize;
+      unsigned long long stx_attributes;
+      unsigned int stx_nlink;
+      unsigned int stx_uid;
+      unsigned int stx_gid;
+      unsigned short stx_mode;
+      unsigned short stx_spare0;
+      unsigned long long stx_ino;
+      unsigned char stx_rest[216];
+    };
+  ]]
+  )
+  pcall(ffi.cdef, "typedef int (*mkchad_statx_fn)(int, const char *, int, unsigned int, void *);")
+  pcall(ffi.cdef, "void *dlsym(void *handle, const char *symbol);")
 end
 local flock_exclusive = 2
 local flock_nonblocking = 4
@@ -2786,6 +2805,44 @@ local function capture_process(pid, extra)
   return process
 end
 
+function test_hooks.uint64_decimal(value)
+  return tostring(value):match "^(%d+)ULL$"
+end
+
+function test_hooks.statx_function()
+  if not ffi_ok then
+    return nil
+  end
+  local resolved, symbol = pcall(function()
+    return ffi.C.dlsym(nil, "statx")
+  end)
+  if not resolved or symbol == nil then
+    return nil
+  end
+  local cast, statx = pcall(ffi.cast, "mkchad_statx_fn", symbol)
+  return cast and statx or nil
+end
+
+function test_hooks.exact_lstat_inode(path)
+  if not ffi_ok or not absolute_path(path) then
+    return nil
+  end
+  local statx = test_hooks.statx_function()
+  if not statx then
+    return nil
+  end
+  local buffer = ffi.new "struct mkchad_statx[1]"
+  local called, result = pcall(function()
+    return statx(-100, path, 0x100, 0x100, buffer)
+  end)
+  local mask = called and tonumber(buffer[0].stx_mask) or 0
+  if not called or result ~= 0 or math.floor(mask / 0x100) % 2 ~= 1 then
+    return nil
+  end
+  local inode = test_hooks.uint64_decimal(buffer[0].stx_ino)
+  return inode and inode ~= "0" and inode or nil
+end
+
 local function private_socket_identity(path, root_identity)
   if root_identity and not authority_root_is_stable(root_identity) then
     return nil
@@ -2794,7 +2851,8 @@ local function private_socket_identity(path, root_identity)
   if not entry or entry.type ~= "socket" or entry.mode % 512 ~= 384 or (uv.getuid and entry.uid ~= uv.getuid()) then
     return nil
   end
-  return { dev = tostring(entry.dev), ino = tostring(entry.ino) }
+  local inode = test_hooks.exact_lstat_inode(path)
+  return inode and { dev = tostring(entry.dev), ino = inode } or nil
 end
 
 function test_hooks.reclaim_dead_schema4_control_while_locked(state)
@@ -2816,7 +2874,8 @@ function test_hooks.reclaim_dead_schema4_control_while_locked(state)
   if entry.type ~= "socket" or entry.mode % 512 ~= 384 or (uv.getuid and entry.uid ~= uv.getuid()) then
     return nil, "schema-4 stale control path is unsafe or not a socket"
   end
-  if tostring(entry.dev) ~= state.broker.control_dev or tostring(entry.ino) ~= state.broker.control_ino then
+  local inode = test_hooks.exact_lstat_inode(state.broker.control_path)
+  if tostring(entry.dev) ~= state.broker.control_dev or inode ~= state.broker.control_ino then
     return nil, "schema-4 stale control inode differs from the recorded generation"
   end
   local quarantine = paths().control_quarantine
@@ -2827,11 +2886,12 @@ function test_hooks.reclaim_dead_schema4_control_while_locked(state)
     return nil, "unable to quarantine the matching dead schema-4 control socket"
   end
   local moved = uv.fs_lstat(quarantine)
+  local moved_inode = test_hooks.exact_lstat_inode(quarantine)
   if
     not moved
     or moved.type ~= "socket"
     or tostring(moved.dev) ~= state.broker.control_dev
-    or tostring(moved.ino) ~= state.broker.control_ino
+    or moved_inode ~= state.broker.control_ino
     or not authority_root_is_stable(root_identity)
   then
     return nil, "schema-4 control changed while being quarantined"
@@ -6136,6 +6196,8 @@ if vim.g.mkchad_opencode_test_api then
     managed_state_if_healthy = managed_state_if_healthy,
     paths = paths,
     find_unique_listener_inode = find_unique_listener_inode,
+    exact_lstat_inode = test_hooks.exact_lstat_inode,
+    uint64_decimal = test_hooks.uint64_decimal,
     process_listens_on_port = process_listens_on_port,
     port_is_available = port_is_available,
     process_is_owned = process_is_owned,
