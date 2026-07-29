@@ -2300,9 +2300,14 @@ local function acquire_lock(callback, retried, deadline_ns)
 end
 
 local function resolve_executable(deadline_ns, callback)
-  local executable = vim.fn.exepath "opencode"
-  if executable == "" then
+  local discovered = vim.fn.exepath "opencode"
+  if discovered == "" then
     callback(nil, nil, "Unable to find opencode on PATH")
+    return
+  end
+  local executable = uv.fs_realpath(discovered)
+  if not executable then
+    callback(nil, nil, "Unable to resolve the canonical opencode executable")
     return
   end
   run_subprocess({ executable, "--version" }, { deadline_ns = deadline_ns }, function(result, subprocess_err)

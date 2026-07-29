@@ -66,6 +66,7 @@ local function broker_intent(state)
 end
 
 local fake = vim.fs.joinpath(paths.root, "opencode")
+local fake_target = vim.fs.joinpath(paths.root, "opencode-real")
 vim.fn.writefile({
   "#!/usr/bin/env python3",
   "import os, socket, sys, threading",
@@ -86,8 +87,9 @@ vim.fn.writefile({
   "      client.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nContent-Length: ' + str(len(body)).encode() + b'\\r\\nConnection: keep-alive\\r\\n\\r\\n' + body)",
   "while True:",
   "  client, _ = sock.accept(); threading.Thread(target=serve, args=(client,), daemon=True).start()",
-}, fake)
-assert(vim.uv.fs_chmod(fake, 493))
+}, fake_target)
+assert(vim.uv.fs_chmod(fake_target, 493))
+assert(vim.uv.fs_symlink(fake_target, fake))
 vim.env.PATH = paths.root .. ":" .. vim.env.PATH
 
 -- A broker that fails activation must stop through its exact control authority,
@@ -103,6 +105,7 @@ assert(
   "broker activation retry retained provisional metadata"
 )
 assert(state.schema == 4 and state.transport == "tls-proxy")
+assert(state.backend.executable == fake_target, "broker did not freeze the canonical OpenCode executable")
 
 assert(state.broker.protocol == 1 and state.broker.control_path == paths.control)
 assert(
