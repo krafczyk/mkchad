@@ -41,6 +41,55 @@ end
 
 local root = lifecycle.paths().root
 assert(vim.fn.mkdir(root, "p", 448) ~= 0 or vim.uv.fs_stat(root))
+acquire(function(ok, err)
+  assert(ok, err)
+end)
+local exact_owner = vim.json.decode(table.concat(vim.fn.readfile(lifecycle.paths().lock_owner), "\n"))
+assert(type(exact_owner.lock_dev) == "string", "lock device identity was not serialized as a decimal string")
+assert(type(exact_owner.lock_ino) == "string", "lock inode identity was not serialized as a decimal string")
+assert(exact_owner.lock_ino == lifecycle.exact_lstat_inode(lifecycle.paths().lock), "lock inode lost precision")
+lifecycle.release_lock()
+
+-- Old launchers persisted rounded numeric identities. A well-formed owner
+-- whose PID is dead remains immediately reclaimable without trusting those
+-- rounded identity fields.
+assert(vim.fn.mkdir(lifecycle.paths().lock, "p", 448) ~= 0)
+local legacy_stat = assert(vim.uv.fs_stat(lifecycle.paths().lock))
+local legacy_token = "legacy-numeric-lock"
+local legacy_pid = 4194304
+assert(not vim.uv.fs_stat("/proc/" .. legacy_pid), "legacy dead-PID fixture unexpectedly exists")
+local legacy_now = math.floor(vim.uv.hrtime() / 1000000)
+local legacy_owner = {
+  token = legacy_token,
+  pid = legacy_pid,
+  hostname = (vim.uv.os_gethostname() or "unknown"):gsub("[^%w_.-]", "_"),
+  lock_dev = legacy_stat.dev,
+  lock_ino = legacy_stat.ino,
+  boot_id = lifecycle.current_boot_id(),
+  acquired_at_unix_ms = os.time() * 1000,
+  acquired_monotonic_ms = legacy_now,
+}
+local legacy_lease = {
+  token = legacy_token,
+  pid = legacy_pid,
+  hostname = legacy_owner.hostname,
+  lock_dev = legacy_stat.dev,
+  lock_ino = legacy_stat.ino,
+  boot_id = legacy_owner.boot_id,
+  renewed_monotonic_ms = legacy_now,
+  deadline_monotonic_ms = legacy_now + 30000,
+}
+vim.fn.writefile({ vim.json.encode(legacy_owner) }, lifecycle.paths().lock_owner)
+vim.fn.writefile(
+  { vim.json.encode(legacy_lease) },
+  vim.fs.joinpath(lifecycle.paths().lock, "lease-" .. legacy_token .. ".json")
+)
+assert(vim.uv.fs_chmod(lifecycle.paths().lock_owner, 384))
+assert(vim.uv.fs_chmod(vim.fs.joinpath(lifecycle.paths().lock, "lease-" .. legacy_token .. ".json"), 384))
+acquire(function(ok, err)
+  assert(ok, err)
+end)
+lifecycle.release_lock()
 local script = vim.fn.fnamemodify(arg[0], ":p")
 local prefix = vim.fs.joinpath(root, "lease-cross-process")
 

@@ -1877,35 +1877,35 @@ local function read_lock_lease(owner, root)
   return ok and type(lease) == "table" and lease or nil
 end
 
-local function owner_matches_claim(owner, lock_stat, claim)
+local function owner_matches_claim(owner, lock_identity, claim)
   return owner
     and claim
     and owner.token == claim.token
     and owner.pid == vim.fn.getpid()
     and owner.hostname == hostname()
     and owner.boot_id == claim.boot_id
-    and lock_stat
-    and lock_stat.dev == claim.dev
-    and lock_stat.ino == claim.ino
+    and lock_identity
+    and lock_identity.dev == claim.dev
+    and lock_identity.ino == claim.ino
     and owner.lock_dev == claim.dev
     and owner.lock_ino == claim.ino
 end
 
-local function valid_lock_lease(lock_stat, owner, lease, now_ms)
-  return lock_stat
+local function valid_lock_lease(lock_identity, owner, lease, now_ms)
+  return lock_identity
     and owner
     and lease
     and valid_lock_token(owner.token)
     and owner.hostname == hostname()
     and owner.boot_id == current_boot_id()
-    and owner.lock_dev == lock_stat.dev
-    and owner.lock_ino == lock_stat.ino
+    and owner.lock_dev == lock_identity.dev
+    and owner.lock_ino == lock_identity.ino
     and lease.token == owner.token
     and lease.pid == owner.pid
     and lease.hostname == owner.hostname
     and lease.boot_id == owner.boot_id
-    and lease.lock_dev == lock_stat.dev
-    and lease.lock_ino == lock_stat.ino
+    and lease.lock_dev == lock_identity.dev
+    and lease.lock_ino == lock_identity.ino
     and type(lease.renewed_monotonic_ms) == "number"
     and type(lease.deadline_monotonic_ms) == "number"
     and lease.deadline_monotonic_ms >= lease.renewed_monotonic_ms
@@ -1916,26 +1916,28 @@ end
 local function lock_is_owned()
   local owner = read_lock_owner()
   local lock_stat = uv.fs_stat(paths().lock)
+  local lock_identity = test_hooks.path_identity(paths().lock, lock_stat)
   local lease = read_lock_lease(owner)
   local now_ms = monotonic_ms()
-  return owner_matches_claim(owner, lock_stat, lock_claim)
-    and valid_lock_lease(lock_stat, owner, lease, now_ms)
+  return owner_matches_claim(owner, lock_identity, lock_claim)
+    and valid_lock_lease(lock_identity, owner, lease, now_ms)
     and (fence_is_held() or lease.deadline_monotonic_ms > now_ms)
 end
 
-local function same_lock(stat, claim)
-  return stat and claim and stat.dev == claim.dev and stat.ino == claim.ino
+local function same_lock(path, claim)
+  local identity = test_hooks.path_identity(path)
+  return identity and claim and identity.dev == claim.dev and identity.ino == claim.ino
 end
 
 local function cleanup_created_lock(claim)
   if not fence_is_held() then
     return false
   end
-  if not same_lock(uv.fs_stat(paths().lock), claim) then
+  if not same_lock(paths().lock, claim) then
     return false
   end
   local detached = paths().lock .. ".unpublished-" .. claim.token
-  if not uv.fs_rename(paths().lock, detached) or not same_lock(uv.fs_stat(detached), claim) then
+  if not uv.fs_rename(paths().lock, detached) or not same_lock(detached, claim) then
     return false
   end
   local content = read_file(vim.fs.joinpath(detached, "owner.json"))
@@ -1973,7 +1975,8 @@ renew_lock = function()
   end
   local owner = read_lock_owner()
   local lock_stat = uv.fs_stat(paths().lock)
-  if not owner_matches_claim(owner, lock_stat, claim) then
+  local lock_identity = test_hooks.path_identity(paths().lock, lock_stat)
+  if not owner_matches_claim(owner, lock_identity, claim) then
     return nil, "the startup lock directory or owner changed"
   end
   local now_ms = monotonic_ms()
@@ -1995,7 +1998,8 @@ renew_lock = function()
   end
   owner = read_lock_owner()
   lock_stat = uv.fs_stat(paths().lock)
-  if not owner_matches_claim(owner, lock_stat, claim) or not lock_is_owned() then
+  lock_identity = test_hooks.path_identity(paths().lock, lock_stat)
+  if not owner_matches_claim(owner, lock_identity, claim) or not lock_is_owned() then
     uv.fs_unlink(temporary)
     return nil, "the startup lock changed during lease renewal"
   end
@@ -2007,9 +2011,10 @@ renew_lock = function()
   end
   local published = read_lock_lease(owner)
   lock_stat = uv.fs_stat(paths().lock)
+  lock_identity = test_hooks.path_identity(paths().lock, lock_stat)
   if
-    not owner_matches_claim(read_lock_owner(), lock_stat, claim)
-    or not valid_lock_lease(lock_stat, owner, published, monotonic_ms())
+    not owner_matches_claim(read_lock_owner(), lock_identity, claim)
+    or not valid_lock_lease(lock_identity, owner, published, monotonic_ms())
     or published.renewed_monotonic_ms ~= now_ms
   then
     return nil, "startup lock ownership changed while publishing the renewed lease"
@@ -2098,7 +2103,7 @@ release_lock = function()
       end
       local lease = read_lock_lease(owner, released)
       if
-        same_lock(uv.fs_stat(released), claim)
+        same_lock(released, claim)
         and ok
         and owner
         and owner.token == claim.token
@@ -2127,6 +2132,10 @@ local function lock_is_stale(lock_stat, owner)
   if not lock_stat then
     return false
   end
+  local lock_identity = test_hooks.path_identity(paths().lock, lock_stat)
+  if not lock_identity then
+    return false
+  end
   local now_ms = realtime_ms()
   local modified_ms = lock_stat.mtime and lock_stat.mtime.sec * 1000 + math.floor((lock_stat.mtime.nsec or 0) / 1000000)
   local old_or_clock_invalid = modified_ms
@@ -2142,8 +2151,6 @@ local function lock_is_stale(lock_stat, owner)
     or owner.pid <= 0
     or type(owner.token) ~= "string"
     or owner.token == ""
-    or owner.lock_dev ~= lock_stat.dev
-    or owner.lock_ino ~= lock_stat.ino
     or type(owner.acquired_at_unix_ms) ~= "number"
     or type(owner.boot_id) ~= "string"
     or owner.boot_id == ""
@@ -2156,7 +2163,10 @@ local function lock_is_stale(lock_stat, owner)
   if not pid_is_live(owner.pid) then
     return true
   end
-  if not valid_lock_lease(lock_stat, owner, lease, monotonic_now_ms) then
+  if owner.lock_dev ~= lock_identity.dev or owner.lock_ino ~= lock_identity.ino then
+    return old_or_clock_invalid or false
+  end
+  if not valid_lock_lease(lock_identity, owner, lease, monotonic_now_ms) then
     return old_or_clock_invalid or false
   end
   return monotonic_now_ms >= lease.deadline_monotonic_ms
@@ -2168,6 +2178,10 @@ local function reclaim_stale_lock()
   end
   local lock_stat = uv.fs_stat(paths().lock)
   if not lock_stat then
+    return false
+  end
+  local lock_identity = test_hooks.path_identity(paths().lock, lock_stat)
+  if not lock_identity then
     return false
   end
   local owner_content = read_file(paths().lock_owner)
@@ -2184,7 +2198,7 @@ local function reclaim_stale_lock()
   if not uv.fs_rename(paths().lock, tombstone) then
     return false
   end
-  if not same_lock(uv.fs_stat(tombstone), lock_stat) then
+  if not same_lock(tombstone, lock_identity) then
     uv.fs_rename(tombstone, paths().lock)
     return false
   end
@@ -2210,7 +2224,7 @@ local function publish_lock_owner(claim)
   if not fenced then
     return nil, fence_err
   end
-  if not same_lock(uv.fs_stat(paths().lock), claim) then
+  if not same_lock(paths().lock, claim) then
     return nil, "startup lock directory changed before owner publication"
   end
   local acquired_at = realtime_ms()
@@ -2263,7 +2277,8 @@ local function acquire_logical_lock_under_fence(callback, retried)
   local token = random_token()
   if uv.fs_mkdir(state_paths.lock, 448) then
     local lock_stat = uv.fs_stat(state_paths.lock)
-    local claim = lock_stat and { token = token, dev = lock_stat.dev, ino = lock_stat.ino } or nil
+    local lock_identity = test_hooks.path_identity(state_paths.lock, lock_stat)
+    local claim = lock_identity and { token = token, dev = lock_identity.dev, ino = lock_identity.ino } or nil
     lock_claim = claim
     local wrote, write_err
     if claim then
@@ -2841,6 +2856,12 @@ function test_hooks.exact_lstat_inode(path)
   end
   local inode = test_hooks.uint64_decimal(buffer[0].stx_ino)
   return inode and inode ~= "0" and inode or nil
+end
+
+function test_hooks.path_identity(path, stat)
+  stat = stat or uv.fs_stat(path)
+  local inode = stat and test_hooks.exact_lstat_inode(path) or nil
+  return inode and { dev = tostring(stat.dev), ino = inode } or nil
 end
 
 local function private_socket_identity(path, root_identity)
@@ -6197,6 +6218,7 @@ if vim.g.mkchad_opencode_test_api then
     paths = paths,
     find_unique_listener_inode = find_unique_listener_inode,
     exact_lstat_inode = test_hooks.exact_lstat_inode,
+    path_identity = test_hooks.path_identity,
     uint64_decimal = test_hooks.uint64_decimal,
     process_listens_on_port = process_listens_on_port,
     port_is_available = port_is_available,
