@@ -2797,7 +2797,7 @@ function test_hooks.reclaim_dead_schema4_control_while_locked(state)
   if not owned then
     return nil, ownership_err
   end
-  if pid_is_live(state.proxy.pid) or pid_is_live(state.backend.pid) then
+  if pid_is_live(state.proxy.pid) or (state.backend and pid_is_live(state.backend.pid)) then
     return nil, "schema-4 control may still belong to a live role"
   end
   local root_identity, root_err = test_hooks.read_authority_root()
@@ -3821,6 +3821,19 @@ read_pending = function()
     return nil
   end
   local ok, pending = pcall(vim.json.decode, content)
+  if ok and type(pending) == "table" then
+    if type(pending.schema) == "number" and pending.schema % 1 == 0 and pending.schema > 4 then
+      return nil, "unsupported schema"
+    end
+    if
+      pending.schema == 4
+      and type(pending.broker) == "table"
+      and type(pending.broker.protocol) == "number"
+      and pending.broker.protocol > 1
+    then
+      return nil, "unsupported broker protocol"
+    end
+  end
   if not ok or not valid_pending(pending) then
     return nil, "malformed"
   end
@@ -5608,6 +5621,368 @@ local function observe_server(callback)
   end)
 end
 
+function test_hooks.reset_record_roles(record)
+  local roles = {}
+  if record and record.schema == 1 and record.pid then
+    table.insert(roles, { name = "legacy server", process = { pid = record.pid } })
+  end
+  if record and record.proxy then
+    table.insert(roles, { name = record.schema == 4 and "broker" or "proxy", process = record.proxy })
+  end
+  if record and record.backend then
+    table.insert(roles, { name = "backend", process = record.backend })
+  end
+  return roles
+end
+
+function test_hooks.valid_record_live_role(record)
+  for _, role in ipairs(test_hooks.reset_record_roles(record)) do
+    if pid_is_live(role.process.pid) then
+      return role.name
+    end
+  end
+end
+
+function test_hooks.launch_intent_live_role(intent)
+  local pid = intent and intent.schema == 2 and intent.proxy.pid or intent and intent.pid
+  if pid and pid_is_live(pid) then
+    return intent.schema == 2 and "broker launch" or (intent.role .. " launch")
+  end
+end
+
+function test_hooks.recorded_roles_are_absent(record)
+  local live_role = test_hooks.valid_record_live_role(record)
+  if live_role then
+    return nil, "recorded " .. live_role .. " remains live"
+  end
+  if record and record.schema == 4 and uv.fs_lstat(record.broker.control_path) then
+    return nil, "recorded broker control authority remains present"
+  end
+  return true
+end
+
+function test_hooks.reset_file_is_safe(path)
+  local entry = uv.fs_lstat(path)
+  if entry and entry.type == "directory" then
+    return nil, "reset artifact is unexpectedly a directory: " .. path
+  end
+  return true
+end
+
+function test_hooks.unlink_reset_file(path)
+  local removed, remove_err = uv.fs_unlink(path)
+  if removed or (remove_err and tostring(remove_err):find("ENOENT", 1, true)) then
+    return true
+  end
+  return nil, remove_err or ("unable to remove reset artifact: " .. path)
+end
+
+-- Lifecycle-owned directories are flat. Preflight every child so reset never
+-- follows a substituted symlink or enters an unexpected nested tree.
+function test_hooks.preflight_flat_reset_directory(path)
+  local entry = uv.fs_lstat(path)
+  if not entry then
+    return { path = path, entries = {} }
+  end
+  if entry.type ~= "directory" then
+    return { path = path, entries = {} }
+  end
+  local scanner, scan_err = uv.fs_scandir(path)
+  if not scanner then
+    return nil, scan_err or ("unable to scan reset directory: " .. path)
+  end
+  local entries = {}
+  while true do
+    local name = uv.fs_scandir_next(scanner)
+    if not name then
+      break
+    end
+    local child = vim.fs.joinpath(path, name)
+    local child_entry = uv.fs_lstat(child)
+    if not child_entry or child_entry.type == "directory" then
+      return nil, "reset directory contains an unsafe nested entry: " .. child
+    end
+    table.insert(entries, child)
+  end
+  return { path = path, entries = entries, directory = path }
+end
+
+function test_hooks.remove_preflighted_reset_directory(artifact)
+  if not artifact.directory then
+    return test_hooks.unlink_reset_file(artifact.path)
+  end
+  for _, child in ipairs(artifact.entries) do
+    local removed, remove_err = test_hooks.unlink_reset_file(child)
+    if not removed then
+      return nil, remove_err
+    end
+  end
+  local removed, remove_err = uv.fs_rmdir(artifact.directory)
+  return removed or nil, remove_err or ("unable to remove reset directory: " .. artifact.directory)
+end
+
+function test_hooks.reset_lifecycle_artifacts_while_locked()
+  local owned, ownership_err = require_lock_ownership "lifecycle reset"
+  if not owned then
+    return nil, ownership_err
+  end
+  local root_identity, root_err = test_hooks.read_authority_root()
+  if not root_identity or not authority_root_is_stable(root_identity) then
+    return nil, root_err or "OpenCode authority root changed during lifecycle reset"
+  end
+  local state_paths = paths()
+  local files = {
+    state_paths.state,
+    state_paths.pending,
+    state_paths.launch,
+    state_paths.control,
+    state_paths.control_quarantine,
+    state_paths.log,
+    state_paths.proxy_log,
+  }
+  for _, path in ipairs(files) do
+    local safe, safe_err = test_hooks.reset_file_is_safe(path)
+    if not safe then
+      return nil, safe_err
+    end
+  end
+
+  local directories = { state_paths.tls }
+  local scanner, scan_err = uv.fs_scandir(state_paths.root)
+  if not scanner then
+    return nil, scan_err or "unable to scan lifecycle root for stale lifecycle debris"
+  end
+  while true do
+    local name = uv.fs_scandir_next(scanner)
+    if not name then
+      break
+    end
+    if
+      name:match "^startup%.lock%.stale%-.+$"
+      or name:match "^startup%.lock%.release%-.+$"
+      or name:match "^startup%.lock%.unpublished%-.+$"
+      or name:match "^state%.json%..+%.tmp$"
+      or name:match "^pending%.json%..+%.tmp$"
+      or name:match "^launch%.json%..+%.tmp$"
+      or name:match "^%.lease%-.+%.tmp$"
+      or name:match "^tls%.new%-.+$"
+      or name:match "^tls%.invalid%-.+$"
+    then
+      table.insert(directories, vim.fs.joinpath(state_paths.root, name))
+    end
+  end
+
+  local preflighted = {}
+  for _, path in ipairs(directories) do
+    local artifact, preflight_err = test_hooks.preflight_flat_reset_directory(path)
+    if not artifact then
+      return nil, preflight_err
+    end
+    table.insert(preflighted, artifact)
+  end
+  for _, artifact in ipairs(preflighted) do
+    local removed, remove_err = test_hooks.remove_preflighted_reset_directory(artifact)
+    if not removed then
+      return nil, remove_err
+    end
+  end
+  -- Remove authority metadata last so a preflight or debris-cleanup refusal
+  -- retains the evidence needed for manual process accounting.
+  for index = #files, 1, -1 do
+    local removed, remove_err = test_hooks.unlink_reset_file(files[index])
+    if not removed then
+      return nil, remove_err
+    end
+  end
+  return true
+end
+
+function test_hooks.clear_server(callback)
+  acquire_lock(function(locked, lock_err)
+    if not locked then
+      callback(false, lock_err)
+      return
+    end
+    local state, state_status = read_state()
+    local pending, pending_status = read_pending()
+    local intent, intent_status = read_launch_intent()
+    if not state and state_status ~= "missing" and state_status ~= "malformed" then
+      release_lock()
+      callback(false, "Refusing lifecycle reset: lifecycle state is " .. state_status)
+      return
+    end
+    if not pending and pending_status and pending_status ~= "malformed" then
+      release_lock()
+      callback(false, "Refusing lifecycle reset: pending lifecycle state is " .. pending_status)
+      return
+    end
+    if not intent and intent_status ~= "missing" and intent_status ~= "malformed" then
+      release_lock()
+      callback(false, "Refusing lifecycle reset: launch intent is " .. intent_status)
+      return
+    end
+    for _, record in pairs { state = state, pending = pending } do
+      local live_role = test_hooks.valid_record_live_role(record)
+      if live_role then
+        release_lock()
+        callback(false, "Refusing lifecycle reset: validated managed " .. live_role .. " remains live")
+        return
+      end
+    end
+    local live_intent_role = test_hooks.launch_intent_live_role(intent)
+    if live_intent_role then
+      release_lock()
+      callback(false, "Refusing lifecycle reset: validated managed " .. live_intent_role .. " remains live")
+      return
+    end
+    local reset, reset_err = test_hooks.reset_lifecycle_artifacts_while_locked()
+    release_lock()
+    callback(reset and true or false, reset_err)
+  end)
+end
+
+function test_hooks.stop_record_for_kill(record, deadline_ns, callback)
+  if not record then
+    callback(true)
+    return
+  end
+  if record.schema == 1 then
+    stop_legacy(record, deadline_ns, callback)
+    return
+  end
+  if record.schema == 4 then
+    if not pid_is_live(record.proxy.pid) and (not record.backend or not pid_is_live(record.backend.pid)) then
+      local reclaimed, reclaim_err = test_hooks.reclaim_dead_schema4_control_while_locked(record)
+      callback(reclaimed and true or false, reclaim_err)
+      return
+    end
+    test_hooks.stop_schema4(record, deadline_ns, callback)
+    return
+  end
+  local owned, ownership = process_is_owned(record)
+  if owned then
+    stop_pair(record, deadline_ns, callback)
+    return
+  end
+  local live_roles = {}
+  for _, role in ipairs(test_hooks.reset_record_roles(record)) do
+    if pid_is_live(role.process.pid) then
+      table.insert(live_roles, role)
+    end
+  end
+  if #live_roles == 0 then
+    callback(true)
+  elseif #live_roles == 1 then
+    local live_role = live_roles[1]
+    local verified, verify_err = process_identity_is_owned(live_role.process, record.boot_id)
+    if verified then
+      stop_pair(record, deadline_ns, callback)
+    else
+      callback(false, "recorded " .. live_role.name .. " is live but unverifiable: " .. (verify_err or ownership))
+    end
+  else
+    callback(
+      false,
+      "recorded managed roles are live but their joint identity is unverifiable: " .. (ownership or "unknown error")
+    )
+  end
+end
+
+function test_hooks.kill_server(callback)
+  local deadline_ns = uv.hrtime() + startup_timeout_ms * 1000000
+  acquire_lock(function(locked, lock_err)
+    if not locked then
+      callback(false, lock_err)
+      return
+    end
+    local function fail(message)
+      release_lock()
+      callback(false, message)
+    end
+    local state, state_status = read_state()
+    local pending, pending_status = read_pending()
+    local intent, intent_status = read_launch_intent()
+    if not state and state_status ~= "missing" then
+      fail("Lifecycle state is " .. state_status .. "; use clear only after manual process accounting")
+      return
+    end
+    if not pending and pending_status then
+      fail("Pending lifecycle state is " .. pending_status .. "; use clear only after manual process accounting")
+      return
+    end
+    if not intent and intent_status ~= "missing" then
+      fail("Launch intent is " .. intent_status .. "; use clear only after manual process accounting")
+      return
+    end
+    if intent and not launch_intent_is_covered(intent, pending) then
+      local intent_pid = intent.schema == 2 and intent.proxy.pid or intent.pid
+      if not intent_pid then
+        fail "Uncovered launch intent has no PID authority; use clear only after manual process accounting"
+        return
+      end
+      local live_intent_role = test_hooks.launch_intent_live_role(intent)
+      if live_intent_role then
+        fail("Recorded " .. live_intent_role .. " remains live without signal authority")
+        return
+      end
+    end
+    test_hooks.stop_record_for_kill(state, deadline_ns, function(stopped, stop_err)
+      if not stopped then
+        fail("Validated lifecycle shutdown failed: " .. (stop_err or "unknown error"))
+        return
+      end
+      if
+        pending
+        and pending.schema == 4
+        and not pid_is_live(pending.proxy.pid)
+        and (not pending.backend or not pid_is_live(pending.backend.pid))
+      then
+        local reclaimed, reclaim_err = test_hooks.reclaim_dead_schema4_control_while_locked(pending)
+        if not reclaimed then
+          fail("Validated pending control cleanup failed: " .. (reclaim_err or "unknown error"))
+          return
+        end
+      end
+      cleanup_pending(deadline_ns, function(pending_stopped, pending_err)
+        if not pending_stopped then
+          fail("Validated pending lifecycle shutdown failed: " .. (pending_err or "unknown error"))
+          return
+        end
+        local remaining_intent, remaining_intent_status = read_launch_intent()
+        if not remaining_intent and remaining_intent_status ~= "missing" then
+          fail "Launch intent changed or became malformed during validated shutdown"
+          return
+        end
+        local remaining_intent_role = test_hooks.launch_intent_live_role(remaining_intent)
+        if remaining_intent_role then
+          fail("Recorded " .. remaining_intent_role .. " remains live without signal authority")
+          return
+        end
+        local remaining_state, remaining_state_status = read_state()
+        local remaining_pending, remaining_pending_status = read_pending()
+        if not remaining_state and remaining_state_status ~= "missing" then
+          fail "Lifecycle state changed or became malformed during validated shutdown"
+          return
+        end
+        if not remaining_pending and remaining_pending_status then
+          fail "Pending lifecycle state changed or became malformed during validated shutdown"
+          return
+        end
+        for _, record in pairs { state = remaining_state, pending = remaining_pending } do
+          local absent, absent_err = test_hooks.recorded_roles_are_absent(record)
+          if not absent then
+            fail("Lifecycle reset refused: " .. absent_err)
+            return
+          end
+        end
+        local reset, reset_err = test_hooks.reset_lifecycle_artifacts_while_locked()
+        release_lock()
+        callback(reset and true or false, reset_err)
+      end)
+    end)
+  end)
+end
+
 local function stop_server(callback)
   if lifecycle_reporter then
     callback(false, "another lifecycle result is pending")
@@ -5812,6 +6187,8 @@ if vim.g.mkchad_opencode_test_api then
     ensure_server = ensure_server,
     observe_server = observe_server,
     stop_server = stop_server,
+    clear_server = test_hooks.clear_server,
+    kill_server = test_hooks.kill_server,
     command_adapter_ensure = command_adapter.ensure,
     command_adapter_status = command_adapter.status,
     command_adapter_argv = command_adapter.argv,
@@ -5829,5 +6206,7 @@ return {
   ensure = ensure_server,
   status = observe_server,
   stop = stop_server,
+  clear = test_hooks.clear_server,
+  kill = test_hooks.kill_server,
   paths = paths,
 }

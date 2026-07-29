@@ -34,6 +34,8 @@ local function usage()
     "Usage: mkchad-opencode-server start [--json]",
     "       mkchad-opencode-server status [--json]",
     "       mkchad-opencode-server stop [--json]",
+    "       mkchad-opencode-server clear [--json]",
+    "       mkchad-opencode-server kill [--json]",
     "       mkchad-opencode-server --help",
   }, "\n")
 end
@@ -47,8 +49,14 @@ if command == "--help" and #arguments == 1 then
   io.stdout:flush()
   vim.cmd "qa!"
   return
-elseif command ~= "start" and command ~= "status" and command ~= "stop" then
-  usage_error = "expected start, status, stop, or --help"
+elseif
+  command ~= "start"
+  and command ~= "status"
+  and command ~= "stop"
+  and command ~= "clear"
+  and command ~= "kill"
+then
+  usage_error = "expected start, status, stop, clear, kill, or --help"
 elseif #arguments > 2 then
   usage_error = "too many arguments"
 elseif #arguments == 2 then
@@ -76,6 +84,7 @@ local function bounded_message(value)
 end
 
 local function error_code(message)
+  message = message:lower()
   if message:find("configuration", 1, true) then
     return "configuration_invalid"
   elseif message:find("differs from active", 1, true) then
@@ -86,7 +95,7 @@ local function error_code(message)
     return "process_unverifiable"
   elseif message:find("broker control", 1, true) then
     return "broker_control_unavailable"
-  elseif message:find("Broker activation", 1, true) then
+  elseif message:find("broker activation", 1, true) then
     return "broker_activation_failed"
   end
   return "lifecycle_failed"
@@ -181,6 +190,14 @@ if not loaded then
   return
 end
 
+local function finish_inactive(ok, message)
+  if ok then
+    finish(0, true, "inactive", nil)
+  else
+    finish(1, false, "blocked", nil, message)
+  end
+end
+
 if command == "start" then
   lifecycle.ensure(function(ok, message, state)
     local stable_state = result_state(state)
@@ -199,14 +216,12 @@ elseif command == "status" then
       finish(0, true, status, stable_state, message, diagnostic_code)
     end
   end)
+elseif command == "stop" then
+  lifecycle.stop(finish_inactive)
+elseif command == "clear" then
+  lifecycle.clear(finish_inactive)
 else
-  lifecycle.stop(function(ok, message)
-    if ok then
-      finish(0, true, "inactive", nil)
-    else
-      finish(1, false, "blocked", nil, message)
-    end
-  end)
+  lifecycle.kill(finish_inactive)
 end
 
 -- `-l` otherwise exits after the top-level chunk returns, which would tear

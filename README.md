@@ -15,6 +15,8 @@ an ordinary shell to manage the shared detached service without opening MkChad:
 mkchad-opencode-server start [--json]
 mkchad-opencode-server status [--json]
 mkchad-opencode-server stop [--json]
+mkchad-opencode-server clear [--json]
+mkchad-opencode-server kill [--json]
 ```
 
 The public host command is installed as `~/.local/bin/mkchad-opencode-server`
@@ -46,9 +48,24 @@ recovery flow. `status` is observational: it reports `healthy`, `inactive`,
 `unhealthy`, `stopping`, or `blocked` without starting, stopping, repairing, or
 creating lifecycle state. `stop` follows validated active state rather than the current
 transport setting and is an idempotent success when no managed service is
-active. Usage errors exit `2`; refused or failed start/stop operations exit `1`;
+active. Usage errors exit `2`; refused or failed lifecycle operations exit `1`;
 completed operations, including observational unhealthy or blocked status, exit
 `0`.
+
+`clear` is the explicit stale-authority reset for an operator who has already
+accounted for any old processes. It removes this host lifecycle root's metadata,
+control artifacts, logs, stale lock debris, and TLS material. It refuses when a
+valid record proves a managed broker, proxy, or backend is live, but may remove
+malformed or stale metadata because it never derives signal authority from it.
+Unsupported future schemas and broker protocols remain protected authority and
+must be handled by a compatible MkChad version.
+It never deletes OpenCode sessions, authentication or credentials, XDG data, or
+general XDG cache. `kill` first performs the strongest validated managed
+shutdown available, including broker-owned schema-4 stop and direct TERM-to-KILL
+escalation. It verifies every recorded role and schema-4 control authority is
+absent before performing the same reset; a failed validation, shutdown, or live
+recorded role preserves lifecycle authority for manual accounting. Both commands
+are idempotent when inactive and serialize with lifecycle start and stop.
 
 With `--json`, stdout contains exactly one versioned JSON result and newline.
 Successful healthy results contain only `url`, `transport`, `generation`, the

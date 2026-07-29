@@ -254,22 +254,13 @@ assert(
   "both-dead schema-4 recovery did not replace the exact generation"
 )
 assert(not vim.uv.fs_lstat(paths.control_quarantine), "schema-4 stale control quarantine was not conditionally removed")
-local stop_notice
-original_notify = vim.notify
-vim.notify = function(message)
-  stop_notice = tostring(message)
-end
 assert(lifecycle.set_test_procfs_authority(false))
-lifecycle.stop_shared_server()
-assert(
-  vim.wait(10000, function()
-    return stop_notice ~= nil
-  end, 20),
-  "schema-4 broker stop timed out"
-)
-vim.notify = original_notify
+local cleared, clear_err = await(lifecycle.clear_server)
+assert(not cleared and clear_err:find("remains live", 1, true), clear_err)
+assert(lifecycle.read_state(), "clear removed a live schema-4 generation")
+local killed, kill_err = await(lifecycle.kill_server, 10000)
 assert(lifecycle.set_test_procfs_authority(true))
-assert(stop_notice:find("Stopped shared OpenCode broker and backend", 1, true), stop_notice)
+assert(killed, kill_err)
 assert(
   vim.wait(5000, function()
     return dead(recovered_state.backend.pid) and dead(recovered_state.proxy.pid)
@@ -278,4 +269,26 @@ assert(
 )
 assert(lifecycle.read_state() == nil, "broker terminal receipt did not remove matching state")
 assert(not vim.uv.fs_lstat(paths.control), "broker terminal receipt retained the control path")
+assert(not vim.uv.fs_lstat(paths.tls), "schema-4 kill retained TLS material")
+assert(not vim.uv.fs_lstat(paths.log), "schema-4 kill retained the backend log")
+assert(not vim.uv.fs_lstat(paths.proxy_log), "schema-4 kill retained the broker log")
+
+-- Kill also reconciles an exact stale control socket after both recorded roles
+-- were terminated outside the managed lifecycle.
+local crash_started, crash_err, crash_state = await(lifecycle.ensure_server)
+assert(crash_started, crash_err)
+assert(vim.uv.kill(crash_state.backend.pid, "sigkill"))
+assert(vim.uv.kill(crash_state.proxy.pid, "sigkill"))
+assert(
+  vim.wait(5000, function()
+    return dead(crash_state.backend.pid) and dead(crash_state.proxy.pid)
+  end, 20),
+  "crashed schema-4 roles did not terminate"
+)
+assert(vim.uv.fs_lstat(paths.control), "crashed broker did not leave its control socket fixture")
+killed, kill_err = await(lifecycle.kill_server, 10000)
+assert(killed, kill_err)
+assert(lifecycle.read_state() == nil, "crashed schema-4 kill retained lifecycle state")
+assert(not vim.uv.fs_lstat(paths.control), "crashed schema-4 kill retained the exact stale control socket")
+assert(not vim.uv.fs_lstat(paths.tls), "crashed schema-4 kill retained TLS material")
 vim.cmd "qa!"
