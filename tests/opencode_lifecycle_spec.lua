@@ -331,6 +331,21 @@ assert(vim.uv.kill(proxy_dead_state.backend.pid, "sigkill"))
 assert(vim.wait(2000, function()
   return process_dead(proxy_dead_state.backend.pid)
 end, 20))
+local both_dead_stop_notice
+original_notify = vim.notify
+vim.notify = function(message)
+  both_dead_stop_notice = tostring(message)
+end
+lifecycle.stop_shared_server()
+assert(
+  vim.wait(5000, function()
+    return both_dead_stop_notice ~= nil
+  end, 20),
+  "both-dead explicit stop timed out"
+)
+vim.notify = original_notify
+assert(both_dead_stop_notice:find("Stopped shared OpenCode broker and backend", 1, true), both_dead_stop_notice)
+assert(lifecycle.read_state() == nil, "both-dead explicit stop retained state")
 assert(wait_for(vim.g.opencode_opts.server.ensure), "both-dead schema-4 recovery did not reconcile safely")
 state = assert(lifecycle.read_state())
 

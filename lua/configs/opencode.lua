@@ -3812,6 +3812,13 @@ function test_hooks.stop_schema4(state, deadline_ns, callback)
     end
   end
   if not pid_is_live(state.proxy.pid) then
+    if not state.backend or not pid_is_live(state.backend.pid) then
+      local reclaimed, reclaim_err = test_hooks.reclaim_dead_schema4_control_while_locked(state)
+      if not reclaimed then
+        callback(false, reclaim_err)
+        return
+      end
+    end
     reconcile_dead()
     return
   end
