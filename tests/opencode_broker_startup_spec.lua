@@ -69,7 +69,7 @@ local fake = vim.fs.joinpath(paths.root, "opencode")
 local fake_target = vim.fs.joinpath(paths.root, "opencode-real")
 vim.fn.writefile({
   "#!/usr/bin/env python3",
-  "import os, socket, sys, threading",
+  "import os, signal, socket, sys, threading",
   "if len(sys.argv) > 1 and sys.argv[1] == '--version': print('broker-fixture'); raise SystemExit(0)",
   "retry_marker = os.environ.get('MKCHAD_OPENCODE_FAIL_ONCE')",
   "if retry_marker and not os.path.exists(retry_marker): open(retry_marker, 'w').close(); raise SystemExit(0)",
@@ -185,10 +185,16 @@ assert(vim.uv.fs_unlink(paths.state))
 lifecycle.release_lock()
 local pending_before = table.concat(vim.fn.readfile(paths.pending), "\n")
 local control_before_pending = assert(vim.uv.fs_lstat(paths.control))
-local incomplete_status, incomplete_state, incomplete_message = await(lifecycle.observe_server)
+local incomplete_status, incomplete_state, incomplete_message, _, incomplete_projection =
+  await(lifecycle.observe_server)
 assert(
   incomplete_status == "unhealthy" and incomplete_state == nil and incomplete_message:find("running", 1, true),
   "schema-4 running pending state was not observed as unhealthy"
+)
+assert(
+  incomplete_projection.persisted_state == "present"
+    and incomplete_projection.persisted_version == pending.backend.local_version,
+  "unhealthy lifecycle projection erased persisted backend evidence"
 )
 local entrypoint = vim.fs.joinpath(vim.fn.getcwd(), "lua", "mkchad", "opencode", "command.lua")
 local command_result = await(function(done)
@@ -201,6 +207,18 @@ assert(
     and command_status.state == vim.NIL
     and command_status.diagnostic.code == "broker_running_pending",
   "schema-4 broker diagnostic was not preserved by the standalone command"
+)
+local command_persisted
+for _, item in ipairs(command_status.inventory.observations) do
+  if item.id == "opencode:persisted" then
+    command_persisted = item
+  end
+end
+assert(
+  command_persisted
+    and command_persisted.state == "present"
+    and command_persisted.version == pending.backend.local_version,
+  "unhealthy status inventory erased persisted backend evidence"
 )
 assert(not vim.uv.fs_stat(paths.lock), "schema-4 status acquired a lifecycle lock")
 assert(table.concat(vim.fn.readfile(paths.pending), "\n") == pending_before, "schema-4 status changed pending bytes")
@@ -294,4 +312,51 @@ assert(killed, kill_err)
 assert(lifecycle.read_state() == nil, "crashed schema-4 kill retained lifecycle state")
 assert(not vim.uv.fs_lstat(paths.control), "crashed schema-4 kill retained the exact stale control socket")
 assert(not vim.uv.fs_lstat(paths.tls), "crashed schema-4 kill retained TLS material")
+
+local slow_fake = vim.fn.readfile(fake_target)
+table.insert(slow_fake, 4, "signal.signal(signal.SIGTERM, lambda *_: None)")
+vim.fn.writefile(slow_fake, fake_target)
+assert(vim.uv.fs_chmod(fake_target, 493))
+local stopping_started, stopping_start_err, stopping_state = await(lifecycle.ensure_server)
+assert(stopping_started, stopping_start_err)
+local stop_finished, stop_ok, stop_err = false, nil, nil
+lifecycle.stop_server(function(ok, err)
+  stop_ok, stop_err, stop_finished = ok, err, true
+end)
+local stopping_status
+local function poll_stopping()
+  lifecycle.observe_server(function(status)
+    if status == "stopping" then
+      stopping_status = status
+    elseif not stop_finished then
+      vim.defer_fn(poll_stopping, 10)
+    end
+  end)
+end
+poll_stopping()
+assert(
+  vim.wait(5000, function()
+    return stopping_status ~= nil
+  end, 10),
+  "broker stopping phase was not observable"
+)
+local stopping_command = await(function(done)
+  vim.system({ vim.fn.exepath "nvim", "--headless", "-u", "NONE", "-l", entrypoint, "--", "status", "--json" }, done)
+end)
+local stopping_result = vim.json.decode(stopping_command.stdout)
+assert(
+  stopping_command.code == 0
+    and stopping_result.status == "stopping"
+    and stopping_result.inventory
+    and #stopping_result.inventory.components == 14,
+  stopping_command.stderr
+)
+assert(
+  vim.wait(40000, function()
+    return stop_finished
+  end, 20),
+  "broker stopping fixture did not terminate"
+)
+assert(stop_ok, stop_err)
+assert(dead(stopping_state.backend.pid) and dead(stopping_state.proxy.pid), "broker stop retained a recorded role")
 vim.cmd "qa!"

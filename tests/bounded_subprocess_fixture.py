@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import time
 
@@ -44,7 +45,17 @@ if target == phase:
     marker = os.environ.get("MKCHAD_SUBPROCESS_PID")
     if marker:
         Path(marker).write_text(str(os.getpid()))
-    if phase == "direct-stdout":
+    if phase == "direct-group-leader":
+        child = subprocess.Popen([
+            sys.executable,
+            "-c",
+            "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
+        ])
+        if marker:
+            Path(marker).write_text(str(child.pid))
+        while True:
+            time.sleep(1)
+    elif phase == "direct-stdout":
         sys.stdout.write("x" * (128 * 1024))
         sys.stdout.flush()
     elif phase == "direct-stderr":

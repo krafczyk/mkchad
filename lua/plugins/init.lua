@@ -1,3 +1,5 @@
+local opencode_contracts = require "mkchad.opencode.contracts"
+
 return {
   {
     "stevearc/conform.nvim",
@@ -147,7 +149,7 @@ return {
 
   {
     "krafczyk/opencode.nvim",
-    commit = "59ad0b8",
+    commit = opencode_contracts.opencode_nvim_revision,
     cmd = { "Opencode", "OpenCodeStart", "OpenCodeStop", "OpenCodeInfo", "OpenCodeReload" },
     keys = {
       {

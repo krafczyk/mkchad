@@ -50,7 +50,11 @@ mount can disappear while the server is still running.
 `start` reuses a fully validated generation or performs the bounded reviewed
 recovery flow. `status` is observational: it reports `healthy`, `inactive`,
 `unhealthy`, `stopping`, or `blocked` without starting, stopping, repairing, or
-creating lifecycle state. `stop` follows validated active state rather than the current
+creating lifecycle state. Its additive inventory accounts for the MkChad,
+container, OpenCode, plugin, controller, and prerequisite components across
+declared, shipped, installed, cached, selected, loaded, persisted, and running
+evidence. Missing optional components and unattested loaded plugins are explicit
+states, not failures or claims that installed content is loaded. `stop` follows validated active state rather than the current
 transport setting and is an idempotent success when no managed service is
 active. Usage errors exit `2`; refused or failed lifecycle operations exit `1`;
 completed operations, including observational unhealthy or blocked status, exit
@@ -84,7 +88,12 @@ Successful healthy results contain only `url`, `transport`, `generation`, the
 live `server_version`, and the active `ca_cert` (or JSON `null` in direct mode);
 they never contain credentials or config contents. Non-healthy observations may
 include one bounded `diagnostic` object with a stable code and presentation
-message. Keep wrapper/runtime diagnostics on stderr.
+message. Status adds `inventory.schema = 1` without changing the top-level
+schema or lifecycle exit behavior. The inventory preserves complete version
+strings, evaluates owner-declared `ships`, `requires`, `supports`,
+`tested-with`, and `loaded-from` relationships, and marks incomplete evidence
+as partial rather than inferring compatibility. Keep wrapper/runtime diagnostics
+on stderr.
 Without `--json`, `status` reports the shared `:OpenCodeInfo` fields available
 outside the editor: command status, public URL, transport, generation, live
 server version, active TLS CA, and any blocked or unhealthy lifecycle

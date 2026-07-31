@@ -144,19 +144,57 @@ end
 
 local inactive = invoke("status", "--json")
 assert(inactive.code == 0 and inactive.stdout:match "^%b{}\n$", inactive.stderr)
+assert(#inactive.stdout < 60 * 1024, "status JSON exceeded the command output bound")
 local inactive_result = vim.json.decode(inactive.stdout)
-assert(inactive_result.ok and inactive_result.status == "inactive" and inactive_result.state == vim.NIL)
+assert(
+  inactive_result.ok and inactive_result.status == "inactive" and inactive_result.state == vim.NIL,
+  inactive.stdout .. inactive.stderr
+)
+assert(
+  inactive_result.inventory and inactive_result.inventory.schema == 1 and #inactive_result.inventory.components == 14
+)
+for _, diagnostic in ipairs(inactive_result.inventory.diagnostics) do
+  assert(diagnostic.code ~= "collector_internal_error", "collector discarded completed probe evidence")
+end
 assert(not vim.uv.fs_stat(vim.fs.joinpath(state_home, "mkchad", "opencode")), "inactive status created lifecycle state")
+local host_evidence = vim.base64
+  .encode(vim.json.encode {
+    schema = 1,
+    container_runtime = { state = "present", family = "apptainer", version = "1.3.0" },
+    selected_image = { state = "absent" },
+    persisted_instance = { state = "absent" },
+  })
+  :gsub("%+", "-")
+  :gsub("/", "_")
+  :gsub("=", "")
+local host_status = invoke("status", "--json", "--host-evidence-v1", host_evidence)
+local host_result = vim.json.decode(host_status.stdout)
+assert(host_status.code == 0 and host_result.status == "inactive")
+assert(host_result.inventory.observations[1].version == "1.3.0", "host evidence was not preserved")
+local malformed_host = invoke("status", "--json", "--host-evidence-v1", "unsafe-host-payload")
+local malformed_result = vim.json.decode(malformed_host.stdout)
+assert(malformed_host.code == 0 and malformed_result.status == "inactive" and malformed_result.inventory)
+assert(
+  malformed_result.inventory.diagnostics[1].code == "host_evidence_invalid",
+  "invalid host evidence changed lifecycle"
+)
+local missing_host_payload = invoke("status", "--host-evidence-v1", "--json")
+assert(missing_host_payload.code == 2, "host evidence consumed the following option as its payload")
+assert(missing_host_payload.stderr:find("requires a base64url payload", 1, true))
 local inactive_human = invoke "status"
 assert(inactive_human.code == 0, inactive_human.stderr)
-assert(inactive_human.stdout == table.concat({
-  "Command status: inactive",
-  "URL: inactive",
-  "Transport: inactive",
-  "Generation: inactive",
-  "Server version: unknown",
-  "",
-}, "\n"), "inactive human status changed")
+assert(inactive_human.stdout:find(
+  table.concat({
+    "Command status: inactive",
+    "URL: inactive",
+    "Transport: inactive",
+    "Generation: inactive",
+    "Server version: unknown",
+  }, "\n"),
+  1,
+  true
+) == 1, "inactive human lifecycle status changed")
+assert(inactive_human.stdout:find("Inventory: partial", 1, true), "inactive inventory summary missing")
 
 local started = invoke("start", "--json")
 assert(started.code == 0 and started.stdout:match "^%b{}\n$", started.stderr)
@@ -167,14 +205,18 @@ assert(started_result.state.server_version == "standalone-test")
 assert(started_result.state.url:match "^http://127%.0%.0%.1:%d+$")
 local healthy_human = invoke "status"
 assert(healthy_human.code == 0, healthy_human.stderr)
-assert(healthy_human.stdout == table.concat({
-  "Command status: healthy",
-  "URL: " .. started_result.state.url,
-  "Transport: loopback-http",
-  "Generation: " .. started_result.state.generation,
-  "Server version: standalone-test",
-  "",
-}, "\n"), "healthy human status did not report shared server details")
+assert(healthy_human.stdout:find(
+  table.concat({
+    "Command status: healthy",
+    "URL: " .. started_result.state.url,
+    "Transport: loopback-http",
+    "Generation: " .. started_result.state.generation,
+    "Server version: standalone-test",
+  }, "\n"),
+  1,
+  true
+) == 1, "healthy human lifecycle status changed")
+assert(healthy_human.stdout:find("Inventory: partial", 1, true), "healthy inventory summary missing")
 
 local reused = invoke("start", "--json")
 assert(reused.code == 0, reused.stderr)
@@ -193,6 +235,21 @@ clear_and_assert_reset()
 -- Clear is the explicit stale-authority override: malformed metadata and stale
 -- control, log, TLS, and lock debris are removable after manual accounting.
 write_stale_artifacts()
+local blocked_status = invoke("status", "--json")
+local blocked_result = vim.json.decode(blocked_status.stdout)
+assert(
+  blocked_status.code == 0
+    and blocked_result.ok
+    and blocked_result.status == "blocked"
+    and blocked_result.inventory
+    and #blocked_result.inventory.components == 14,
+  blocked_status.stderr
+)
+for _, item in ipairs(blocked_result.inventory.observations) do
+  if item.id == "opencode:persisted" then
+    assert(item.state == "unavailable", "malformed authority was reported as absent")
+  end
+end
 local malformed_kill = invoke("kill", "--json")
 assert(malformed_kill.code == 1 and not vim.json.decode(malformed_kill.stdout).ok, malformed_kill.stderr)
 assert(vim.uv.fs_stat(vim.fs.joinpath(lifecycle_root, "state.json")), "kill erased malformed authority")
@@ -334,7 +391,7 @@ assert(clear_human.code == 0 and clear_human.stdout == "clear: inactive\n", clea
 local help = invoke "--help"
 assert(help.code == 0 and help.stdout == table.concat({
   "Usage: mkchad-opencode-server start [--json]",
-  "       mkchad-opencode-server status [--json]",
+  "       mkchad-opencode-server status [--json] [--host-evidence-v1 BASE64URL]",
   "       mkchad-opencode-server stop [--json]",
   "       mkchad-opencode-server clear [--json]",
   "       mkchad-opencode-server kill [--json]",

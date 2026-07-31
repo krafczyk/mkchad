@@ -32,7 +32,7 @@ end
 local function usage()
   return table.concat({
     "Usage: mkchad-opencode-server start [--json]",
-    "       mkchad-opencode-server status [--json]",
+    "       mkchad-opencode-server status [--json] [--host-evidence-v1 BASE64URL]",
     "       mkchad-opencode-server stop [--json]",
     "       mkchad-opencode-server clear [--json]",
     "       mkchad-opencode-server kill [--json]",
@@ -43,6 +43,7 @@ end
 local arguments = arguments_after_entrypoint()
 local command = arguments[1]
 local json_mode = false
+local host_evidence
 local usage_error
 if command == "--help" and #arguments == 1 then
   io.stdout:write(usage() .. "\n")
@@ -57,13 +58,24 @@ elseif
   and command ~= "kill"
 then
   usage_error = "expected start, status, stop, clear, kill, or --help"
-elseif #arguments > 2 then
-  usage_error = "too many arguments"
-elseif #arguments == 2 then
-  if arguments[2] == "--json" then
-    json_mode = true
-  else
-    usage_error = "expected only --json after the command"
+else
+  local index = 2
+  while index <= #arguments do
+    local value = arguments[index]
+    if value == "--json" and not json_mode then
+      json_mode = true
+    elseif value == "--host-evidence-v1" and command == "status" and host_evidence == nil then
+      local payload = arguments[index + 1]
+      if not payload or payload == "" or payload:sub(1, 2) == "--" then
+        usage_error = "--host-evidence-v1 requires a base64url payload"
+      else
+        host_evidence = payload
+        index = index + 1
+      end
+    else
+      usage_error = "expected only --json and one --host-evidence-v1 payload after status"
+    end
+    index = index + 1
   end
 end
 for _, value in ipairs(arguments) do
@@ -130,7 +142,7 @@ local function result_state(state)
   }
 end
 
-local function human_status(status, state, message)
+local function human_status(status, state, message, inventory)
   state = type(state) == "table" and state or nil
   local lines = {
     "Command status: " .. status,
@@ -145,11 +157,16 @@ local function human_status(status, state, message)
   if message and status ~= "healthy" and status ~= "inactive" then
     table.insert(lines, "Command diagnostic: " .. bounded_message(message))
   end
+  if inventory then
+    for line in require("mkchad.opencode.inventory").human(inventory):gmatch "[^\n]+" do
+      table.insert(lines, line)
+    end
+  end
   return table.concat(lines, "\n")
 end
 
 local completed = false
-local function finish(exit_code, ok, status, state, message, diagnostic_code)
+local function finish(exit_code, ok, status, state, message, diagnostic_code, inventory)
   if completed then
     return
   end
@@ -164,12 +181,18 @@ local function finish(exit_code, ok, status, state, message, diagnostic_code)
           message = bounded_message(message),
         }
       end
+      if inventory then
+        result.inventory = inventory
+      end
     else
       result.error = { code = error_code(message or ""), message = bounded_message(message) }
+      if inventory then
+        result.inventory = inventory
+      end
     end
     io.stdout:write(vim.json.encode(result) .. "\n")
   elseif ok and command == "status" then
-    io.stdout:write(human_status(status, state, message) .. "\n")
+    io.stdout:write(human_status(status, state, message, inventory) .. "\n")
   elseif ok then
     io.stdout:write(command .. ": " .. status .. "\n")
   else
@@ -198,6 +221,7 @@ local function finish_inactive(ok, message)
   end
 end
 
+local status_inventory
 if command == "start" then
   lifecycle.ensure(function(ok, message, state)
     local stable_state = result_state(state)
@@ -208,13 +232,71 @@ if command == "start" then
     end
   end)
 elseif command == "status" then
-  lifecycle.status(function(status, state, message, diagnostic_code)
+  local collectors_loaded, collectors = xpcall(function()
+    return require "mkchad.opencode.inventory_collectors"
+  end, function()
+    return nil
+  end)
+  local lifecycle_result
+  local inventory_ready = not collectors_loaded
+  local function settle_status()
+    if not lifecycle_result or not inventory_ready then
+      return
+    end
+    local status, state, message, diagnostic_code = unpack(lifecycle_result)
     local stable_state = result_state(state)
     if status == "healthy" and not stable_state then
-      finish(0, true, "blocked", nil, message or "lifecycle returned an invalid state", "invalid_lifecycle_state")
-    else
-      finish(0, true, status, stable_state, message, diagnostic_code)
+      finish(
+        0,
+        true,
+        "blocked",
+        nil,
+        message or "lifecycle returned an invalid state",
+        "invalid_lifecycle_state",
+        status_inventory
+      )
+      return
     end
+    finish(0, true, status, stable_state, message, diagnostic_code, status_inventory)
+  end
+  local finish_collection
+  if collectors_loaded then
+    local started, result = pcall(collectors.collect_async, {
+      config_root = config_root,
+      host_evidence = host_evidence,
+      probe = lifecycle.probe,
+    }, function(value)
+      status_inventory = value
+      inventory_ready = true
+      settle_status()
+    end)
+    if started then
+      finish_collection = result
+    else
+      finish_collection = function(projection)
+        status_inventory = collectors.fallback(projection)
+        inventory_ready = true
+      end
+    end
+  end
+  lifecycle.status(function(status, state, message, diagnostic_code, projection)
+    lifecycle_result = { status, state, message, diagnostic_code }
+    projection = projection or lifecycle.projection and lifecycle.projection(status, state) or {}
+    if finish_collection then
+      finish_collection(projection)
+    elseif collectors_loaded then
+      local ok, value = pcall(collectors.collect, {
+        config_root = config_root,
+        host_evidence = host_evidence,
+        lifecycle = projection,
+      })
+      status_inventory = ok and value or nil
+      if not status_inventory then
+        status_inventory = collectors.fallback(projection)
+      end
+      inventory_ready = true
+    end
+    settle_status()
   end)
 elseif command == "stop" then
   lifecycle.stop(finish_inactive)
@@ -231,5 +313,5 @@ end
 if not vim.wait(35000, function()
   return completed
 end, 20) then
-  finish(1, false, "blocked", nil, "standalone lifecycle command timed out")
+  finish(1, false, "blocked", nil, "standalone lifecycle command timed out", nil, status_inventory)
 end

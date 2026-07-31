@@ -5,6 +5,9 @@ local lifecycle = vim.g.mkchad_opencode_test_api
 local paths = lifecycle.paths()
 assert(lifecycle.strict_json_objects '{"protocol":1,"control":{"path":"/tmp/control.sock"}}')
 assert(not lifecycle.strict_json_objects '{"protocol":1,"protocol":1}')
+assert(lifecycle.projection("inactive", nil).persisted_state == "absent")
+assert(lifecycle.projection("blocked", { inventory_state = "unavailable" }).persisted_state == "unavailable")
+assert(lifecycle.projection("blocked", { inventory_state = "not_discoverable" }).persisted_state == "not_discoverable")
 assert(vim.fn.mkdir(paths.root, "p", 448) ~= 0 or vim.uv.fs_stat(paths.root))
 
 package.loaded["opencode.server"] = {}

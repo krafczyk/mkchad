@@ -227,11 +227,11 @@ local function safe_subprocess_callback(callback, ...)
   end
 end
 
-local function subprocess_environment(overrides)
+local function subprocess_environment(overrides, replace)
   if not overrides then
     return nil
   end
-  local environment = uv.os_environ()
+  local environment = replace and {} or uv.os_environ()
   for name, value in pairs(overrides) do
     environment[name] = value
   end
@@ -276,10 +276,12 @@ local function run_subprocess(argv, options, callback)
   local failure
   local timed_out = false
   local killed = false
+  local group_termination_done = true
   local stdout = {}
   local stderr = {}
   local stdout_size = 0
   local stderr_size = 0
+  local output_limit = math.min(options.output_limit or subprocess_output_limit, subprocess_output_limit)
   local stdin_pipe = uv.new_pipe(false)
   local stdout_pipe = uv.new_pipe(false)
   local stderr_pipe = uv.new_pipe(false)
@@ -317,7 +319,7 @@ local function run_subprocess(argv, options, callback)
   end
 
   local function finish()
-    if completed or not exited or not stdout_done or not stderr_done then
+    if completed or not exited or not stdout_done or not stderr_done or not group_termination_done then
       return
     end
     completed = true
@@ -354,9 +356,20 @@ local function run_subprocess(argv, options, callback)
     failure = reason
     timed_out = timeout or false
     if process and not process:is_closing() then
-      pcall(process.kill, process, "sigterm")
+      if options.process_group and pid then
+        group_termination_done = false
+        pcall(uv.kill, -pid, "sigterm")
+      else
+        pcall(process.kill, process, "sigterm")
+      end
       kill_timer:start(subprocess_term_grace_ms, 0, function()
-        if not exited and process and not process:is_closing() then
+        if options.process_group and pid then
+          killed = true
+          pcall(uv.kill, -pid, "sigkill")
+          group_termination_done = true
+          close_timer(kill_timer)
+          finish()
+        elseif not exited and process and not process:is_closing() then
           killed = true
           pcall(process.kill, process, "sigkill")
         end
@@ -369,7 +382,7 @@ local function run_subprocess(argv, options, callback)
       return
     end
     local current = size_name == "stdout" and stdout_size or stderr_size
-    local remaining = subprocess_output_limit - current
+    local remaining = output_limit - current
     if remaining > 0 then
       table.insert(target, chunk:sub(1, remaining))
     end
@@ -379,7 +392,7 @@ local function run_subprocess(argv, options, callback)
     else
       stderr_size = current
     end
-    if current > subprocess_output_limit then
+    if current > output_limit then
       terminate(size_name .. " exceeded the bounded subprocess output limit", false)
     end
   end
@@ -410,7 +423,9 @@ local function run_subprocess(argv, options, callback)
   local remaining_ms = math.floor((deadline_ns - now) / 1000000)
   if remaining_ms <= 0 then
     close_timer(deadline_timer)
-    close_timer(kill_timer)
+    if group_termination_done then
+      close_timer(kill_timer)
+    end
     close_timer(drain_timer)
     close_handle(stdin_pipe)
     close_handle(stdout_pipe)
@@ -426,14 +441,17 @@ local function run_subprocess(argv, options, callback)
   process, pid = uv.spawn(argv[1], {
     args = arguments,
     cwd = options.cwd,
-    env = subprocess_environment(options.env),
+    env = subprocess_environment(options.env, options.replace_env),
+    detached = options.process_group or false,
     stdio = { stdin_pipe, stdout_pipe, stderr_pipe },
   }, function(code, signal)
     exited = true
     exit_code = code
     exit_signal = signal
     close_timer(deadline_timer)
-    close_timer(kill_timer)
+    if group_termination_done then
+      close_timer(kill_timer)
+    end
     drain_timer:start(subprocess_term_grace_ms, 0, function()
       if not stdout_done or not stderr_done then
         failure = failure or "bounded subprocess pipes did not close after child exit"
@@ -462,7 +480,11 @@ local function run_subprocess(argv, options, callback)
       failure = failure
         or (shutdown and "Neovim exited while subprocess was active" or "bounded subprocess was cancelled")
       killed = shutdown or killed
-      pcall(process.kill, process, shutdown and "sigkill" or "sigterm")
+      if options.process_group and pid then
+        pcall(uv.kill, -pid, shutdown and "sigkill" or "sigterm")
+      else
+        pcall(process.kill, process, shutdown and "sigkill" or "sigterm")
+      end
     end
   end
   stdout_pipe:read_start(function(err, chunk)
@@ -5647,10 +5669,45 @@ local function ensure_server(callback)
   ensure_backend(callback, false)
 end
 
+function test_hooks.inventory_projection(status, state)
+  local backend = type(state) == "table" and state.backend or nil
+  local persisted_state = type(state) == "table" and state.inventory_state
+    or type(state) == "table" and "present"
+    or "absent"
+  return {
+    persisted_state = persisted_state,
+    persisted_version = type(backend) == "table" and backend.local_version or nil,
+    persisted_identity_kind = type(backend) == "table" and "process-executable-v1" or nil,
+    persisted_identity = type(backend) == "table" and backend.executable_dev .. ":" .. backend.executable_ino or nil,
+    running_state = status == "healthy" and "present" or "unavailable",
+    running_version = status == "healthy" and type(backend) == "table" and backend.server_version or nil,
+    running_identity_kind = status == "healthy" and type(backend) == "table" and "process-executable-v1" or nil,
+    running_identity = status == "healthy"
+        and type(backend) == "table"
+        and backend.executable_dev .. ":" .. backend.executable_ino
+      or nil,
+  }
+end
+
 local function observe_server(callback)
+  local function complete(status, public_state, message, diagnostic_code, evidence_state)
+    callback(
+      status,
+      public_state,
+      message,
+      diagnostic_code,
+      test_hooks.inventory_projection(status, evidence_state or public_state)
+    )
+  end
   local loaded, config_err = load_server_config()
   if not loaded then
-    callback("blocked", nil, "OpenCode server configuration " .. (config_err or "is invalid"), "configuration_invalid")
+    complete(
+      "blocked",
+      nil,
+      "OpenCode server configuration " .. (config_err or "is invalid"),
+      "configuration_invalid",
+      { inventory_state = "not_discoverable" }
+    )
     return
   end
   local state, state_status = read_state()
@@ -5659,19 +5716,20 @@ local function observe_server(callback)
     if pending and pending.schema == 4 then
       test_hooks.observe_broker(pending, function(receipt, receipt_err)
         if not receipt then
-          callback("blocked", nil, receipt_err or "broker-control-unavailable", "broker_control_unavailable")
+          complete("blocked", nil, receipt_err or "broker-control-unavailable", "broker_control_unavailable", pending)
         elseif receipt.phase == "blocked" then
-          callback("blocked", nil, "broker-blocked-pending", "broker_blocked")
+          complete("blocked", nil, "broker-blocked-pending", "broker_blocked", pending)
         elseif receipt.phase == "stopping" then
-          callback("stopping", nil, "broker-stopping-pending", "broker_stopping")
+          complete("stopping", nil, "broker-stopping-pending", "broker_stopping", pending)
         elseif receipt.phase == "running" and test_hooks.broker_receipt_matches_backend(receipt, pending.backend) then
-          callback("unhealthy", nil, "broker-running-pending", "broker_running_pending")
+          complete("unhealthy", nil, "broker-running-pending", "broker_running_pending", pending)
         else
-          callback(
+          complete(
             "unhealthy",
             nil,
             "broker-" .. receipt.phase .. "-pending",
-            "broker_" .. receipt.phase:gsub("-", "_")
+            "broker_" .. receipt.phase:gsub("-", "_"),
+            pending
           )
         end
       end)
@@ -5679,23 +5737,41 @@ local function observe_server(callback)
     end
     local intent, intent_status = read_launch_intent()
     if intent and intent.schema == 2 then
-      callback("blocked", nil, "broker-starting", "broker_starting")
+      complete("blocked", nil, "broker-starting", "broker_starting", intent)
       return
     end
     if pending_status == "malformed" or intent_status == "malformed" then
-      callback("blocked", nil, "lifecycle authority metadata is malformed", "authority_metadata_malformed")
+      complete(
+        "blocked",
+        nil,
+        "lifecycle authority metadata is malformed",
+        "authority_metadata_malformed",
+        { inventory_state = "unavailable" }
+      )
       return
     end
-    callback(state_status == "missing" and "inactive" or "blocked", nil, state_status)
+    complete(
+      state_status == "missing" and "inactive" or "blocked",
+      nil,
+      state_status,
+      nil,
+      { inventory_state = state_status == "missing" and "absent" or "unavailable" }
+    )
     return
   end
   if state.schema == 1 then
-    callback("blocked", nil, "schema 1 state is legacy and is never probed", "legacy_state")
+    complete(
+      "blocked",
+      nil,
+      "schema 1 state is legacy and is never probed",
+      "legacy_state",
+      { inventory_state = "unavailable" }
+    )
     return
   end
   managed_state_if_healthy(state, nil, function(healthy, detail)
     if healthy then
-      callback("healthy", healthy)
+      complete("healthy", healthy)
       return
     end
     local message = detail and (detail.message or detail.kind) or "unknown state validation failure"
@@ -5705,11 +5781,12 @@ local function observe_server(callback)
         or detail.kind == "schema4-broker-live-backend-dead"
         or detail.kind == "schema4-both-dead"
       )
-    callback(
+    complete(
       detail and detail.kind == "stopping" and "stopping" or unhealthy and "unhealthy" or "blocked",
       nil,
       message,
-      detail and detail.kind and detail.kind:gsub("-", "_") or nil
+      detail and detail.kind and detail.kind:gsub("-", "_") or nil,
+      state
     )
   end)
 end
@@ -6282,6 +6359,7 @@ if vim.g.mkchad_opencode_test_api then
     stop_shared_server = stop_shared_server,
     ensure_server = ensure_server,
     observe_server = observe_server,
+    projection = test_hooks.inventory_projection,
     stop_server = stop_server,
     clear_server = test_hooks.clear_server,
     kill_server = test_hooks.kill_server,
@@ -6305,4 +6383,7 @@ return {
   clear = test_hooks.clear_server,
   kill = test_hooks.kill_server,
   paths = paths,
+  probe = run_subprocess,
+  -- Inventory consumes only this sanitized projection, never lifecycle records.
+  projection = test_hooks.inventory_projection,
 }

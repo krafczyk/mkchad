@@ -11,9 +11,12 @@ local function await(invoke, timeout)
   invoke(function(...)
     done, values = true, { n = select("#", ...), ... }
   end)
-  assert(vim.wait(timeout or 5000, function()
-    return done
-  end, 10), mode .. " timed out")
+  assert(
+    vim.wait(timeout or 5000, function()
+      return done
+    end, 10),
+    mode .. " timed out"
+  )
   return unpack(values, 1, values.n)
 end
 
@@ -27,8 +30,17 @@ local function fd_count()
 end
 
 local function child_count()
-  local content = table.concat(vim.fn.readfile("/proc/" .. vim.fn.getpid() .. "/task/" .. vim.fn.getpid() .. "/children"), "")
+  local content =
+    table.concat(vim.fn.readfile("/proc/" .. vim.fn.getpid() .. "/task/" .. vim.fn.getpid() .. "/children"), "")
   return #vim.split(content, "%s+", { trimempty = true })
+end
+
+local function process_dead(pid)
+  if not vim.uv.fs_stat("/proc/" .. pid) then
+    return true
+  end
+  local stat = table.concat(vim.fn.readfile("/proc/" .. pid .. "/stat"), "")
+  return stat:match "%)%s+Z" ~= nil
 end
 
 local function assert_reaped(result)
@@ -40,7 +52,7 @@ if mode == "contender" then
   assert(locked, lock_err)
   lifecycle.release_lock()
   vim.fn.writefile({ "acquired" }, control)
-  vim.cmd("qa!")
+  vim.cmd "qa!"
 end
 
 if mode == "holder" then
@@ -61,7 +73,7 @@ if mode == "holder" then
   assert_reaped(result)
   lifecycle.release_lock()
   vim.fn.writefile({ "released" }, control)
-  vim.cmd("qa!")
+  vim.cmd "qa!"
 end
 
 if mode == "shutdown" then
@@ -75,18 +87,52 @@ if mode == "shutdown" then
       MKCHAD_SUBPROCESS_PID = control .. ".pid",
     },
   }, function()
-    error("shutdown subprocess callback unexpectedly ran")
+    error "shutdown subprocess callback unexpectedly ran"
   end)
-  assert(vim.wait(2000, function()
-    return vim.uv.fs_stat(control .. ".pid") ~= nil
-  end, 10), "shutdown child did not start")
-  vim.cmd("qa!")
+  assert(
+    vim.wait(2000, function()
+      return vim.uv.fs_stat(control .. ".pid") ~= nil
+    end, 10),
+    "shutdown child did not start"
+  )
+  vim.cmd "qa!"
 end
 
 local bin = assert(vim.env.MKCHAD_SUBPROCESS_BIN)
 local before_fds = fd_count()
 local before_children = child_count()
-for _, executable in ipairs({ "opencode", "java", "keytool" }) do
+
+local isolated_result, isolated_err = await(function(done)
+  lifecycle.run_subprocess({ "/usr/bin/env" }, {
+    replace_env = true,
+    process_group = true,
+    output_limit = 4096,
+    env = { MKCHAD_INVENTORY_CANARY = "visible" },
+  }, done)
+end)
+assert(isolated_result and not isolated_err, isolated_err)
+assert(isolated_result.stdout == "MKCHAD_INVENTORY_CANARY=visible\n", "replacement environment inherited ambient state")
+
+local group_marker = control .. ".group-child.pid"
+local group_result, group_err = await(function(done)
+  lifecycle.run_subprocess({ vim.fs.joinpath(bin, "keytool"), "direct-group-leader" }, {
+    timeout_ms = 100,
+    process_group = true,
+    env = {
+      MKCHAD_SUBPROCESS_PHASE = "direct-group-leader",
+      MKCHAD_SUBPROCESS_PID = group_marker,
+    },
+  }, done)
+end)
+assert(
+  group_result and group_result.timed_out and group_result.killed and group_err,
+  "process-group timeout did not escalate"
+)
+local group_child = tonumber(vim.fn.readfile(group_marker)[1])
+assert(group_child and vim.wait(2000, function()
+  return process_dead(group_child)
+end, 10), "TERM-resistant descendant survived process-group escalation")
+for _, executable in ipairs { "opencode", "java", "keytool" } do
   acquire()
   local command = vim.fs.joinpath(bin, executable)
   local phase = "direct-" .. executable
@@ -107,7 +153,7 @@ for _, executable in ipairs({ "opencode", "java", "keytool" }) do
   lifecycle.release_lock()
 end
 
-for _, stream in ipairs({ "stdout", "stderr" }) do
+for _, stream in ipairs { "stdout", "stderr" } do
   acquire()
   local result, err = await(function(done)
     lifecycle.run_subprocess({ vim.fs.joinpath(bin, "keytool"), "direct-" .. stream }, {
@@ -135,9 +181,12 @@ lifecycle.run_subprocess({ vim.fs.joinpath(bin, "keytool"), "direct-success" }, 
   completion_count = completion_count + 1
   lifecycle.release_lock()
 end)
-assert(vim.wait(3000, function()
-  return completion_count == 1
-end, 10), "bounded subprocess did not complete")
+assert(
+  vim.wait(3000, function()
+    return completion_count == 1
+  end, 10),
+  "bounded subprocess did not complete"
+)
 vim.wait(100, function()
   return false
 end, 10)
@@ -145,11 +194,14 @@ assert(completion_count == 1, "bounded subprocess completed more than once")
 
 acquire()
 lifecycle.run_subprocess({ vim.fs.joinpath(bin, "keytool"), "direct-success" }, {}, function()
-  error("intentional callback failure")
+  error "intentional callback failure"
 end)
-assert(vim.wait(3000, function()
-  return not lifecycle.fence_is_held()
-end, 10), "callback exception retained the lifecycle fence")
+assert(
+  vim.wait(3000, function()
+    return not lifecycle.fence_is_held()
+  end, 10),
+  "callback exception retained the lifecycle fence"
+)
 acquire()
 lifecycle.release_lock()
 
@@ -201,20 +253,20 @@ end
 
 vim.env.MKCHAD_SUBPROCESS_PHASE = "generate-mkchad-ca"
 vim.env.MKCHAD_SUBPROCESS_RESIST_TERM = "1"
-local timeout_err = ensure_failure("integrated certificate timeout")
+local timeout_err = ensure_failure "integrated certificate timeout"
 assert(timeout_err:find("timed out", 1, true), timeout_err)
 assert(not vim.uv.fs_stat(lifecycle.paths().tls), "certificate timeout published TLS material")
 vim.env.MKCHAD_SUBPROCESS_PHASE = nil
 vim.env.MKCHAD_SUBPROCESS_RESIST_TERM = nil
 
 vim.env.MKCHAD_SUBPROCESS_EXIT_PHASE = "generate-mkchad-ca"
-local nonzero_err = ensure_failure("integrated certificate nonzero exit")
+local nonzero_err = ensure_failure "integrated certificate nonzero exit"
 assert(nonzero_err:find("exited with code 7", 1, true), nonzero_err)
 assert(not vim.uv.fs_stat(lifecycle.paths().tls), "certificate nonzero exit published TLS material")
 vim.env.MKCHAD_SUBPROCESS_EXIT_PHASE = nil
 
 vim.env.MKCHAD_SUBPROCESS_EMPTY_PHASE = "version"
-local parse_err = ensure_failure("integrated version parse failure")
+local parse_err = ensure_failure "integrated version parse failure"
 assert(parse_err:find("malformed", 1, true), parse_err)
 vim.env.MKCHAD_SUBPROCESS_EMPTY_PHASE = nil
 
@@ -222,7 +274,7 @@ local fake_opencode = vim.fs.joinpath(bin, "opencode")
 local original_opencode = vim.fn.readfile(fake_opencode)
 vim.fn.writefile({ "#!/does/not/exist", "exit 1" }, fake_opencode)
 assert(vim.uv.fs_chmod(fake_opencode, 493))
-local start_err = ensure_failure("integrated version start failure")
+local start_err = ensure_failure "integrated version start failure"
 assert(start_err:find("unable to start", 1, true), start_err)
 vim.fn.writefile(original_opencode, fake_opencode)
 assert(vim.uv.fs_chmod(fake_opencode, 493))
@@ -243,6 +295,9 @@ vim.wait(100, function()
   return false
 end, 10)
 assert(fd_count() <= before_fds, ("bounded subprocess fd growth: %d -> %d"):format(before_fds, fd_count()))
-assert(child_count() == before_children, ("bounded subprocess child growth: %d -> %d"):format(before_children, child_count()))
+assert(
+  child_count() == before_children,
+  ("bounded subprocess child growth: %d -> %d"):format(before_children, child_count())
+)
 vim.fn.writefile({ "passed" }, control)
-vim.cmd("qa!")
+vim.cmd "qa!"
