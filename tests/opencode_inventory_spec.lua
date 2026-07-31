@@ -201,6 +201,8 @@ replace_human_observation {
   layer = "shipped",
   state = "present",
   evidence = "fixture-v1",
+  identity_kind = "image-build-v1",
+  identity = "image-build",
   diagnostic_ids = {},
 }
 replace_human_observation {
@@ -234,6 +236,10 @@ for _, component in ipairs { "mkchad", "opencode-nvim", "sprint-loop-nvim" } do
 end
 human_by_id["opencode-nvim:installed"].version = "0.1.0"
 human_by_id["opencode-project-reload:installed"].state = "present"
+human_by_id["compound-engineering:cached"].state = "present"
+human_by_id["compound-engineering:cached"].version = "3.20.0"
+human_by_id["compound-engineering:cached"].identity_kind = "compound-engineering-plugin-v1"
+human_by_id["compound-engineering:cached"].identity = "compound-engineering-digest"
 local human_relationships = {
   {
     id = "nvim-image:shipped:ships-opencode",
@@ -288,6 +294,14 @@ assert(
 assert(
   not human_unknown:find("Inventory running: opencode", 1, true),
   "OpenCode was duplicated in generic running output"
+)
+assert(
+  human_unknown:find(
+    "Inventory component versions: nvim-image shipped identity image-build-v1:image-build, compound-engineering cached version 3.20.0 identity compound-engineering-plugin-v1:compound-engineering-digest",
+    1,
+    true
+  ),
+  "observed image and package versions were not rendered"
 )
 assert(human_unknown:find("Inventory active compatibility: unknown", 1, true), "ambiguous compatibility was inferred")
 assert((human_fixture "satisfied"):find("Inventory active compatibility: compatible", 1, true))

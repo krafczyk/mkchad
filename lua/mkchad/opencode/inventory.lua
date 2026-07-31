@@ -717,6 +717,17 @@ end
 
 function M.human(model)
   local grouped, expanded, not_attested, observation_by_id = {}, {}, {}, {}
+  local function observation_detail(observation)
+    local detail = observation.version and "version " .. observation.version or nil
+    if observation.identity_kind and observation.identity then
+      detail = (detail and detail .. " " or "")
+        .. "identity "
+        .. observation.identity_kind
+        .. ":"
+        .. observation.identity
+    end
+    return detail or "identity unknown"
+  end
   for _, component in ipairs(model.components) do
     local disposition = component.disposition or "present"
     if disposition == "absent" and component.optional then
@@ -809,14 +820,7 @@ function M.human(model)
   for _, layer in ipairs { "selected", "persisted", "running" } do
     local observation = observation_by_id["opencode:" .. layer]
     if observation and observation.state == "present" then
-      local identity = observation.identity_kind
-          and observation.identity
-          and observation.identity_kind .. ":" .. observation.identity
-        or "unknown"
-      table.insert(
-        opencode_layers,
-        layer .. " version " .. (observation.version or "unknown") .. " identity " .. identity
-      )
+      table.insert(opencode_layers, layer .. " " .. observation_detail(observation))
     end
   end
   if #opencode_layers > 0 then
@@ -824,14 +828,6 @@ function M.human(model)
   end
   local repository_backed, running = {}, {}
   for _, observation in ipairs(model.observations) do
-    local detail = observation.version and "version " .. observation.version or nil
-    if observation.identity_kind and observation.identity then
-      detail = (detail and detail .. " " or "")
-        .. "identity "
-        .. observation.identity_kind
-        .. ":"
-        .. observation.identity
-    end
     if
       observation.layer == "installed"
       and observation.state == "present"
@@ -842,14 +838,14 @@ function M.human(model)
         or ""
       table.insert(
         repository_backed,
-        observation.component_id .. " installed " .. (detail or "identity unknown") .. worktree
+        observation.component_id .. " installed " .. observation_detail(observation) .. worktree
       )
     elseif
       observation.component_id ~= "opencode"
       and observation.layer == "running"
       and observation.state == "present"
     then
-      table.insert(running, observation.component_id .. " " .. (detail or "identity unknown"))
+      table.insert(running, observation.component_id .. " " .. observation_detail(observation))
     end
   end
   if #repository_backed > 0 then
@@ -857,6 +853,30 @@ function M.human(model)
   end
   if #running > 0 then
     table.insert(lines, "Inventory running: " .. table.concat(running, ", "))
+  end
+  local component_versions = {}
+  for _, current in ipairs {
+    { "container-runtime", "installed" },
+    { "nvim-image", "shipped" },
+    { "opencode-project-reload", "installed", "cached" },
+    { "compound-engineering", "installed", "cached" },
+    { "sprint-loop-controller", "installed" },
+    { "prereq-neovim", "installed", "shipped" },
+    { "prereq-git", "installed" },
+    { "prereq-python", "installed" },
+    { "prereq-node", "installed", "shipped" },
+    { "prereq-curl", "installed" },
+  } do
+    for index = 2, #current do
+      local observation = observation_by_id[current[1] .. ":" .. current[index]]
+      if observation and observation.state == "present" and (observation.version or observation.identity) then
+        table.insert(component_versions, current[1] .. " " .. current[index] .. " " .. observation_detail(observation))
+        break
+      end
+    end
+  end
+  if #component_versions > 0 then
+    table.insert(lines, "Inventory component versions: " .. table.concat(component_versions, ", "))
   end
   local compatibility = active_incompatible and "incompatible"
     or active_contracts > 0 and not active_unknown and "compatible"
