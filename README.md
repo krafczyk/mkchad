@@ -54,7 +54,9 @@ creating lifecycle state. Its additive inventory accounts for the MkChad,
 container, OpenCode, plugin, controller, and prerequisite components across
 declared, shipped, installed, cached, selected, loaded, persisted, and running
 evidence. Missing optional components and unattested loaded plugins are explicit
-states, not failures or claims that installed content is loaded. `stop` follows validated active state rather than the current
+states, not failures or claims that installed content is loaded. Human status
+lists those facts by component before a separate compatibility section. `stop`
+follows validated active state rather than the current
 transport setting and is an idempotent success when no managed service is
 active. Usage errors exit `2`; refused or failed lifecycle operations exit `1`;
 completed operations, including observational unhealthy or blocked status, exit
@@ -92,8 +94,10 @@ message. Status adds `inventory.schema = 1` without changing the top-level
 schema or lifecycle exit behavior. The inventory preserves complete version
 strings, evaluates owner-declared `ships`, `requires`, `supports`,
 `tested-with`, and `loaded-from` relationships, and marks incomplete evidence
-as partial rather than inferring compatibility. Keep wrapper/runtime diagnostics
-on stderr.
+as partial rather than inferring compatibility. Its normalized `observations`
+and `relationships` remain authoritative; additive `facts` and `compatibility`
+indexes group their stable IDs for simpler consumers. Keep wrapper/runtime
+diagnostics on stderr.
 Without `--json`, `status` reports the shared `:OpenCodeInfo` fields available
 outside the editor: command status, public URL, transport, generation, live
 server version, active TLS CA, and any blocked or unhealthy lifecycle

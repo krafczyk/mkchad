@@ -167,7 +167,12 @@ assert(inventory.evaluate({
 
 local human_components = {}
 for _, id in ipairs(inventory.component_ids) do
-  table.insert(human_components, { id = id, optional = false, disposition = "present" })
+  local optional_absent = id == "sprint-loop-controller"
+  table.insert(human_components, {
+    id = id,
+    optional = optional_absent,
+    disposition = optional_absent and "absent" or "present",
+  })
 end
 local human_observations = {}
 for _, id in ipairs(inventory.required_observation_ids) do
@@ -235,7 +240,10 @@ for _, component in ipairs { "mkchad", "opencode-nvim", "sprint-loop-nvim" } do
   item.dirty = component == "opencode-nvim"
 end
 human_by_id["opencode-nvim:installed"].version = "0.1.0"
+human_by_id["opencode-nvim:loaded"].state = "unprovable"
 human_by_id["opencode-project-reload:installed"].state = "present"
+human_by_id["compound-engineering:installed"].state = "absent"
+human_by_id["sprint-loop-controller:installed"].state = "absent"
 human_by_id["compound-engineering:cached"].state = "present"
 human_by_id["compound-engineering:cached"].version = "3.20.0"
 human_by_id["compound-engineering:cached"].identity_kind = "compound-engineering-plugin-v1"
@@ -252,60 +260,134 @@ local human_relationships = {
     diagnostic_ids = {},
   },
   {
-    id = "opencode-project-reload:installed:supports-opencode",
-    type = "supports",
-    owner = "opencode-project-reload",
-    source_observation_id = "opencode-project-reload:installed",
+    id = "opencode-nvim:installed:tested-with-opencode",
+    type = "tested-with",
+    owner = "opencode-nvim",
+    source_observation_id = "opencode-nvim:installed",
     target_observation_id = "opencode:running",
-    contract = { kind = "exact-set", versions = { "1.18.3" }, suffix_policy = "literal" },
+    contract = { kind = "tested-baseline", version = "1.18.3", suffix_policy = "literal" },
+    result = "unknown",
+    diagnostic_ids = {},
+  },
+  {
+    id = "opencode-nvim:loaded-from",
+    type = "loaded-from",
+    owner = "opencode-nvim",
+    source_observation_id = "opencode-nvim:loaded",
+    target_observation_id = "opencode-nvim:installed",
+    contract = { kind = "identity", profile = "git-commit-v1" },
     result = "unknown",
     diagnostic_ids = {},
   },
 }
 local function human_fixture(result)
   human_relationships[2].result = result
-  return inventory.human(inventory.model(human_components, human_observations, human_relationships, {}))
+  local model = inventory.model(human_components, human_observations, human_relationships, {})
+  return inventory.human(model), model
 end
 local human_unknown = human_fixture "unknown"
+for _, id in ipairs(inventory.component_ids) do
+  assert(human_unknown:find("\n  " .. id .. ":", 1, true), "component facts omitted " .. id)
+end
 assert(
   human_unknown:find(
-    "Inventory image-shipped OpenCode baseline 1.18.3 is overridden by selected package 1.18.4",
+    "  nvim-image:shipped:ships-opencode: provenance image-shipped OpenCode baseline 1.18.3 is overridden by selected package 1.18.4",
     1,
     true
   ),
-  "selected package override was presented as a compatibility failure"
+  "selected package override was not retained as provenance"
 )
 assert(
   human_unknown:find(
-    "Inventory OpenCode layers: selected version 1.18.4 identity image-file-stat-v1:selected-id, persisted version 1.18.5 identity image-file-stat-v1:persisted-id, running version 1.18.6 identity image-file-stat-v1:running-id",
+    "  compound-engineering: installed absent; cached present version 3.20.0 identity compound-engineering-plugin-v1:compound-engineering-digest; loaded unavailable",
     1,
     true
   ),
-  "active OpenCode layers were not rendered"
+  "component facts did not retain observation states and identities"
 )
 assert(
   human_unknown:find(
-    "Inventory repository-backed: mkchad installed identity git-commit-v1:mkchad-commit worktree clean, opencode-nvim installed version 0.1.0 identity git-commit-v1:opencode-nvim-commit worktree dirty, sprint-loop-nvim installed identity git-commit-v1:sprint-loop-nvim-commit worktree clean",
+    "  opencode: shipped present version 1.18.3; selected present version 1.18.4 identity image-file-stat-v1:selected-id; persisted present version 1.18.5 identity image-file-stat-v1:persisted-id; running present version 1.18.6 identity image-file-stat-v1:running-id",
     1,
     true
   ),
-  "repository identities and worktree state were not rendered"
-)
-assert(
-  not human_unknown:find("Inventory running: opencode", 1, true),
-  "OpenCode was duplicated in generic running output"
+  "OpenCode lifecycle facts did not retain versions and identities"
 )
 assert(
   human_unknown:find(
-    "Inventory component versions: nvim-image shipped identity image-build-v1:image-build, compound-engineering cached version 3.20.0 identity compound-engineering-plugin-v1:compound-engineering-digest",
+    "  opencode-nvim: declared unavailable; installed present version 0.1.0 identity git-commit-v1:opencode-nvim-commit worktree dirty; loaded unprovable",
     1,
     true
   ),
-  "observed image and package versions were not rendered"
+  "repository facts did not retain worktree state"
 )
-assert(human_unknown:find("Inventory active compatibility: unknown", 1, true), "ambiguous compatibility was inferred")
-assert((human_fixture "satisfied"):find("Inventory active compatibility: compatible", 1, true))
-assert((human_fixture "unsupported"):find("Inventory active compatibility: incompatible", 1, true))
+assert(
+  human_unknown:find("  sprint-loop-controller: optional-absent; installed absent", 1, true),
+  "optional absence was not labeled"
+)
+assert(human_unknown:find("Compatibility: unknown", 1, true), "overall compatibility result was not separated")
+assert(
+  human_unknown:find(
+    "  opencode-nvim:installed:tested-with-opencode: unknown (tested-with; tested baseline 1.18.3; source installed present version 0.1.0 identity git-commit-v1:opencode-nvim-commit worktree dirty; target running present version 1.18.6 identity image-file-stat-v1:running-id)",
+    1,
+    true
+  ),
+  "tested baseline unknown omitted declared or observed version"
+)
+assert(
+  human_unknown:find(
+    "  opencode-nvim:loaded-from: unknown (loaded-from; declared identity git-commit-v1; source loaded unprovable; target installed present version 0.1.0 identity git-commit-v1:opencode-nvim-commit worktree dirty)",
+    1,
+    true
+  ),
+  "loaded-from unknown omitted source and target facts"
+)
+assert(not human_unknown:find("Inventory repository-backed:", 1, true), "redundant repository summary remained")
+assert(not human_unknown:find("Inventory component versions:", 1, true), "redundant version summary remained")
+assert((human_fixture "satisfied"):find("Compatibility: compatible", 1, true))
+assert((human_fixture "unsupported"):find("Compatibility: incompatible", 1, true))
+local _, indexed_human = human_fixture "unsupported"
+assert(indexed_human.facts and #indexed_human.facts == #inventory.component_ids, "facts index omitted components")
+assert(
+  vim.deep_equal(indexed_human.facts[7], {
+    component_id = "compound-engineering",
+    observation_ids = {
+      "compound-engineering:installed",
+      "compound-engineering:cached",
+      "compound-engineering:loaded",
+    },
+  }),
+  "facts index was not grouped deterministically"
+)
+assert(
+  vim.deep_equal(indexed_human.compatibility, {
+    active_result = "incompatible",
+    relationship_ids = {
+      "nvim-image:shipped:ships-opencode",
+      "opencode-nvim:installed:tested-with-opencode",
+      "opencode-nvim:loaded-from",
+    },
+  }),
+  "compatibility index did not retain active result and relationship IDs"
+)
+local reversed_observations = vim.deepcopy(human_observations)
+local reversed_relationships = vim.deepcopy(human_relationships)
+for index = 1, math.floor(#reversed_observations / 2) do
+  local opposite = #reversed_observations - index + 1
+  reversed_observations[index], reversed_observations[opposite] =
+    reversed_observations[opposite], reversed_observations[index]
+end
+for index = 1, math.floor(#reversed_relationships / 2) do
+  local opposite = #reversed_relationships - index + 1
+  reversed_relationships[index], reversed_relationships[opposite] =
+    reversed_relationships[opposite], reversed_relationships[index]
+end
+local reordered = inventory.model(human_components, reversed_observations, reversed_relationships, {})
+assert(vim.deep_equal(reordered.facts, indexed_human.facts), "facts index depended on collector ordering")
+assert(
+  vim.deep_equal(reordered.compatibility, indexed_human.compatibility),
+  "compatibility index depended on collector ordering"
+)
 
 local loaded_from =
   { type = "loaded-from", contract = { kind = "identity", profile = "compound-engineering-plugin-v1" } }

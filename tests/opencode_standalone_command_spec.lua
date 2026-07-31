@@ -164,6 +164,12 @@ assert(
 assert(
   inactive_result.inventory and inactive_result.inventory.schema == 1 and #inactive_result.inventory.components == 14
 )
+assert(
+  #inactive_result.inventory.facts == 14
+    and inactive_result.inventory.compatibility
+    and inactive_result.inventory.compatibility.active_result == "unknown",
+  "status JSON did not separate factual and compatibility indexes"
+)
 for _, diagnostic in ipairs(inactive_result.inventory.diagnostics) do
   assert(diagnostic.code ~= "collector_internal_error", "collector discarded completed probe evidence")
 end
@@ -206,10 +212,8 @@ assert(inactive_human.stdout:find(
   true
 ) == 1, "inactive human lifecycle status changed")
 assert(inactive_human.stdout:find("Inventory: partial", 1, true), "inactive inventory summary missing")
-assert(
-  inactive_human.stdout:find("Inventory active compatibility: unknown", 1, true),
-  "inactive active-contract summary missing"
-)
+assert(inactive_human.stdout:find("Compatibility: unknown", 1, true), "inactive active-contract summary missing")
+assert(inactive_human.stdout:find("Inventory diagnostics:", 1, true), "inactive diagnostics were not separated")
 
 local started = invoke("start", "--json")
 assert(started.code == 0 and started.stdout:match "^%b{}\n$", started.stderr)

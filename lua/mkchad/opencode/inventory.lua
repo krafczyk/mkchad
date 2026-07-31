@@ -599,11 +599,36 @@ function M.evaluate(relationship, source, target)
   return "unknown"
 end
 
+local function active_compatibility(relationships, observation_by_id)
+  local contracts, unknown, incompatible = 0, false, false
+  for _, relationship in ipairs(relationships) do
+    local target = relationship.target_observation_id and observation_by_id[relationship.target_observation_id]
+    if
+      (relationship.type == "requires" or relationship.type == "supports" or relationship.type == "tested-with")
+      and target
+      and target.state == "present"
+      and (target.layer == "selected" or target.layer == "persisted" or target.layer == "running")
+    then
+      contracts = contracts + 1
+      if
+        relationship.result == "unsupported"
+        or relationship.result == "stale"
+        or relationship.result == "mismatch"
+      then
+        incompatible = true
+      elseif relationship.result ~= "satisfied" and relationship.result ~= "not_applicable" then
+        unknown = true
+      end
+    end
+  end
+  return incompatible and "incompatible" or contracts > 0 and not unknown and "compatible" or "unknown"
+end
+
 function M.model(components, observations, relationships, diagnostics)
   if #components > 14 or #observations > 48 or #relationships > 32 or #diagnostics > 24 then
     error "inventory bounds exceeded"
   end
-  local component_seen, observation_seen, relationship_seen, diagnostic_seen = {}, {}, {}, {}
+  local component_seen, observation_seen, observation_by_id, relationship_seen, diagnostic_seen = {}, {}, {}, {}, {}
   for index, component in ipairs(components) do
     if
       type(component) ~= "table"
@@ -639,6 +664,7 @@ function M.model(components, observations, relationships, diagnostics)
       error "invalid inventory observation"
     end
     observation_seen[observation.id] = true
+    observation_by_id[observation.id] = observation
     if
       observation.state == "unavailable"
       or observation.state == "not_discoverable"
@@ -694,6 +720,23 @@ function M.model(components, observations, relationships, diagnostics)
     relationship_seen[relationship.id] = true
     outcomes[relationship.result] = outcomes[relationship.result] + 1
   end
+  local facts = {}
+  for _, component in ipairs(components) do
+    local observation_ids = {}
+    for _, layer in ipairs(M.layers) do
+      local layer_ids = {}
+      for _, observation in ipairs(observations) do
+        if observation.component_id == component.id and observation.layer == layer then
+          table.insert(layer_ids, observation.id)
+        end
+      end
+      table.sort(layer_ids)
+      vim.list_extend(observation_ids, layer_ids)
+    end
+    table.insert(facts, { component_id = component.id, observation_ids = observation_ids })
+  end
+  local relationship_ids = vim.tbl_keys(relationship_seen)
+  table.sort(relationship_ids)
   local model = {
     schema = 1,
     complete = not partial,
@@ -701,6 +744,11 @@ function M.model(components, observations, relationships, diagnostics)
     observations = observations,
     relationships = relationships,
     diagnostics = diagnostics,
+    facts = facts,
+    compatibility = {
+      active_result = active_compatibility(relationships, observation_by_id),
+      relationship_ids = relationship_ids,
+    },
     summary = {
       components = #components,
       observations = #observations,
@@ -716,46 +764,80 @@ function M.model(components, observations, relationships, diagnostics)
 end
 
 function M.human(model)
-  local grouped, expanded, not_attested, observation_by_id = {}, {}, {}, {}
-  local function observation_detail(observation)
-    local detail = observation.version and "version " .. observation.version or nil
-    if observation.identity_kind and observation.identity then
-      detail = (detail and detail .. " " or "")
-        .. "identity "
-        .. observation.identity_kind
-        .. ":"
-        .. observation.identity
-    end
-    return detail or "identity unknown"
-  end
+  local component_by_id, observation_by_id = {}, {}
   for _, component in ipairs(model.components) do
-    local disposition = component.disposition or "present"
-    if disposition == "absent" and component.optional then
-      disposition = "optional-absent"
-    end
-    grouped[disposition] = grouped[disposition] or {}
-    table.insert(grouped[disposition], component.id)
+    component_by_id[component.id] = component
   end
   for _, observation in ipairs(model.observations) do
     observation_by_id[observation.id] = observation
-    if observation.layer == "loaded" and observation.state == "unprovable" then
-      table.insert(not_attested, observation.component_id)
+  end
+  local function observation_fact(observation)
+    local detail = observation.layer .. " " .. observation.state
+    if observation.version then
+      detail = detail .. " version " .. observation.version
     end
-    if
-      observation.state == "unavailable"
-      or observation.state == "not_discoverable"
-      or observation.state == "unqueried"
-      or observation.state == "timed_out"
-    then
-      local diagnostic = observation.diagnostic_ids and observation.diagnostic_ids[1]
-      table.insert(
-        expanded,
-        "Inventory " .. observation.id .. ": " .. observation.state .. (diagnostic and " [" .. diagnostic .. "]" or "")
-      )
+    if observation.identity_kind and observation.identity then
+      detail = detail .. " identity " .. observation.identity_kind .. ":" .. observation.identity
+    end
+    if type(observation.dirty) == "boolean" then
+      detail = detail .. (observation.dirty and " worktree dirty" or " worktree clean")
+    end
+    if observation.diagnostic_ids and #observation.diagnostic_ids > 0 then
+      detail = detail .. " [" .. table.concat(observation.diagnostic_ids, ", ") .. "]"
+    end
+    return detail
+  end
+  local function declared_contract(contract)
+    if contract.kind == "exact" then
+      return "exact version " .. contract.version
+    elseif contract.kind == "tested-baseline" then
+      return "tested baseline " .. contract.version
+    elseif contract.kind == "exact-set" then
+      return "declared versions " .. table.concat(contract.versions, ", ")
+    elseif contract.kind == "range" then
+      local clauses = {}
+      for _, clause in ipairs(contract.clauses) do
+        table.insert(
+          clauses,
+          clause.min_inclusive .. (clause.max_exclusive and " to < " .. clause.max_exclusive or "+")
+        )
+      end
+      return "declared range " .. table.concat(clauses, ", ")
+    end
+    return "declared identity " .. contract.profile
+  end
+  local relationship_by_id = {}
+  for _, relationship in ipairs(model.relationships) do
+    relationship_by_id[relationship.id] = relationship
+  end
+  local lines = { "Inventory: " .. (model.complete and "complete" or "partial"), "Inventory facts:" }
+  for _, fact in ipairs(model.facts) do
+    local observations = {}
+    local component = component_by_id[fact.component_id]
+    if component.optional and component.disposition == "absent" then
+      table.insert(observations, "optional-absent")
+    end
+    for _, observation_id in ipairs(fact.observation_ids) do
+      table.insert(observations, observation_fact(observation_by_id[observation_id]))
+    end
+    table.insert(lines, "  " .. fact.component_id .. ": " .. table.concat(observations, "; "))
+  end
+  if #model.diagnostics == 0 then
+    table.insert(lines, "Inventory diagnostics: none")
+  else
+    table.insert(lines, "Inventory diagnostics:")
+    for _, diagnostic in ipairs(model.diagnostics) do
+      table.insert(lines, "  " .. diagnostic.id .. ": " .. diagnostic.code .. " - " .. diagnostic.message)
     end
   end
-  local active_contracts, active_unknown, active_incompatible = 0, false, false
-  for _, relation in ipairs(model.relationships) do
+  table.insert(lines, "Compatibility: " .. model.compatibility.active_result)
+  table.insert(
+    lines,
+    #model.compatibility.relationship_ids == 0 and "Compatibility relationships: none" or "Compatibility relationships:"
+  )
+  for _, relationship_id in ipairs(model.compatibility.relationship_ids) do
+    local relation = relationship_by_id[relationship_id]
+    local source = observation_by_id[relation.source_observation_id]
     local target = relation.target_observation_id and observation_by_id[relation.target_observation_id]
     local baseline = observation_by_id["opencode:shipped"]
     if
@@ -773,117 +855,34 @@ function M.human(model)
       and target.version
     then
       table.insert(
-        expanded,
-        "Inventory image-shipped OpenCode baseline "
+        lines,
+        "  "
+          .. relation.id
+          .. ": provenance image-shipped OpenCode baseline "
           .. baseline.version
           .. " is overridden by selected package "
           .. target.version
       )
-    elseif relation.result ~= "satisfied" and relation.result ~= "not_applicable" then
-      table.insert(expanded, "Inventory " .. relation.id .. ": " .. relation.result)
-    end
-    if
-      (relation.type == "requires" or relation.type == "supports" or relation.type == "tested-with")
-      and target
-      and target.state == "present"
-      and (target.layer == "selected" or target.layer == "persisted" or target.layer == "running")
-    then
-      active_contracts = active_contracts + 1
-      if relation.result == "unsupported" or relation.result == "stale" or relation.result == "mismatch" then
-        active_incompatible = true
-      elseif relation.result ~= "satisfied" and relation.result ~= "not_applicable" then
-        active_unknown = true
-      end
-    end
-  end
-  for _, diagnostic in ipairs(model.diagnostics) do
-    table.insert(expanded, "Inventory " .. diagnostic.id .. ": " .. diagnostic.code .. " - " .. diagnostic.message)
-  end
-  local lines = { "Inventory: " .. (model.complete and "complete" or "partial") }
-  for _, state in ipairs {
-    "present",
-    "optional-absent",
-    "absent",
-    "not_applicable",
-    "unprovable",
-    "unavailable",
-    "not_discoverable",
-  } do
-    if grouped[state] then
-      table.insert(lines, "Inventory " .. state:gsub("-", " ") .. ": " .. table.concat(grouped[state], ", "))
-    end
-  end
-  if #not_attested > 0 then
-    table.insert(lines, "Inventory not attested: " .. table.concat(not_attested, ", "))
-  end
-  local opencode_layers = {}
-  for _, layer in ipairs { "selected", "persisted", "running" } do
-    local observation = observation_by_id["opencode:" .. layer]
-    if observation and observation.state == "present" then
-      table.insert(opencode_layers, layer .. " " .. observation_detail(observation))
-    end
-  end
-  if #opencode_layers > 0 then
-    table.insert(lines, "Inventory OpenCode layers: " .. table.concat(opencode_layers, ", "))
-  end
-  local repository_backed, running = {}, {}
-  for _, observation in ipairs(model.observations) do
-    if
-      observation.layer == "installed"
-      and observation.state == "present"
-      and observation.identity_kind == "git-commit-v1"
-    then
-      local worktree = type(observation.dirty) == "boolean"
-          and (observation.dirty and " worktree dirty" or " worktree clean")
-        or ""
+    else
+      local evidence = "source "
+        .. (source and observation_fact(source) or "unavailable")
+        .. "; target "
+        .. (target and observation_fact(target) or "unavailable")
       table.insert(
-        repository_backed,
-        observation.component_id .. " installed " .. observation_detail(observation) .. worktree
+        lines,
+        "  "
+          .. relation.id
+          .. ": "
+          .. relation.result
+          .. " ("
+          .. relation.type
+          .. "; "
+          .. declared_contract(relation.contract)
+          .. "; "
+          .. evidence
+          .. ")"
       )
-    elseif
-      observation.component_id ~= "opencode"
-      and observation.layer == "running"
-      and observation.state == "present"
-    then
-      table.insert(running, observation.component_id .. " " .. observation_detail(observation))
     end
-  end
-  if #repository_backed > 0 then
-    table.insert(lines, "Inventory repository-backed: " .. table.concat(repository_backed, ", "))
-  end
-  if #running > 0 then
-    table.insert(lines, "Inventory running: " .. table.concat(running, ", "))
-  end
-  local component_versions = {}
-  for _, current in ipairs {
-    { "container-runtime", "installed" },
-    { "nvim-image", "shipped" },
-    { "opencode-project-reload", "installed", "cached" },
-    { "compound-engineering", "installed", "cached" },
-    { "sprint-loop-controller", "installed" },
-    { "prereq-neovim", "installed", "shipped" },
-    { "prereq-git", "installed" },
-    { "prereq-python", "installed" },
-    { "prereq-node", "installed", "shipped" },
-    { "prereq-curl", "installed" },
-  } do
-    for index = 2, #current do
-      local observation = observation_by_id[current[1] .. ":" .. current[index]]
-      if observation and observation.state == "present" and (observation.version or observation.identity) then
-        table.insert(component_versions, current[1] .. " " .. current[index] .. " " .. observation_detail(observation))
-        break
-      end
-    end
-  end
-  if #component_versions > 0 then
-    table.insert(lines, "Inventory component versions: " .. table.concat(component_versions, ", "))
-  end
-  local compatibility = active_incompatible and "incompatible"
-    or active_contracts > 0 and not active_unknown and "compatible"
-    or "unknown"
-  table.insert(lines, "Inventory active compatibility: " .. compatibility)
-  for _, line in ipairs(expanded) do
-    table.insert(lines, line)
   end
   return table.concat(lines, "\n")
 end
