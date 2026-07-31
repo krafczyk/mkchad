@@ -716,7 +716,7 @@ function M.model(components, observations, relationships, diagnostics)
 end
 
 function M.human(model)
-  local grouped, expanded, not_attested = {}, {}, {}
+  local grouped, expanded, not_attested, observation_by_id = {}, {}, {}, {}
   for _, component in ipairs(model.components) do
     local disposition = component.disposition or "present"
     if disposition == "absent" and component.optional then
@@ -725,12 +725,8 @@ function M.human(model)
     grouped[disposition] = grouped[disposition] or {}
     table.insert(grouped[disposition], component.id)
   end
-  for _, relation in ipairs(model.relationships) do
-    if relation.result ~= "satisfied" and relation.result ~= "not_applicable" then
-      table.insert(expanded, "Inventory " .. relation.id .. ": " .. relation.result)
-    end
-  end
   for _, observation in ipairs(model.observations) do
+    observation_by_id[observation.id] = observation
     if observation.layer == "loaded" and observation.state == "unprovable" then
       table.insert(not_attested, observation.component_id)
     end
@@ -745,6 +741,48 @@ function M.human(model)
         expanded,
         "Inventory " .. observation.id .. ": " .. observation.state .. (diagnostic and " [" .. diagnostic .. "]" or "")
       )
+    end
+  end
+  local active_contracts, active_unknown, active_incompatible = 0, false, false
+  for _, relation in ipairs(model.relationships) do
+    local target = relation.target_observation_id and observation_by_id[relation.target_observation_id]
+    local baseline = observation_by_id["opencode:shipped"]
+    if
+      relation.type == "ships"
+      and relation.owner == "nvim-image"
+      and relation.target_observation_id == "opencode:selected"
+      and relation.contract.kind == "exact"
+      and relation.result == "mismatch"
+      and baseline
+      and baseline.state == "present"
+      and baseline.version
+      and equivalent(relation.contract, baseline.version, relation.contract.version)
+      and target
+      and target.state == "present"
+      and target.version
+    then
+      table.insert(
+        expanded,
+        "Inventory image-shipped OpenCode baseline "
+          .. baseline.version
+          .. " is overridden by selected package "
+          .. target.version
+      )
+    elseif relation.result ~= "satisfied" and relation.result ~= "not_applicable" then
+      table.insert(expanded, "Inventory " .. relation.id .. ": " .. relation.result)
+    end
+    if
+      (relation.type == "requires" or relation.type == "supports" or relation.type == "tested-with")
+      and target
+      and target.state == "present"
+      and (target.layer == "selected" or target.layer == "persisted" or target.layer == "running")
+    then
+      active_contracts = active_contracts + 1
+      if relation.result == "unsupported" or relation.result == "stale" or relation.result == "mismatch" then
+        active_incompatible = true
+      elseif relation.result ~= "satisfied" and relation.result ~= "not_applicable" then
+        active_unknown = true
+      end
     end
   end
   for _, diagnostic in ipairs(model.diagnostics) do
@@ -767,6 +805,63 @@ function M.human(model)
   if #not_attested > 0 then
     table.insert(lines, "Inventory not attested: " .. table.concat(not_attested, ", "))
   end
+  local opencode_layers = {}
+  for _, layer in ipairs { "selected", "persisted", "running" } do
+    local observation = observation_by_id["opencode:" .. layer]
+    if observation and observation.state == "present" then
+      local identity = observation.identity_kind
+          and observation.identity
+          and observation.identity_kind .. ":" .. observation.identity
+        or "unknown"
+      table.insert(
+        opencode_layers,
+        layer .. " version " .. (observation.version or "unknown") .. " identity " .. identity
+      )
+    end
+  end
+  if #opencode_layers > 0 then
+    table.insert(lines, "Inventory OpenCode layers: " .. table.concat(opencode_layers, ", "))
+  end
+  local repository_backed, running = {}, {}
+  for _, observation in ipairs(model.observations) do
+    local detail = observation.version and "version " .. observation.version or nil
+    if observation.identity_kind and observation.identity then
+      detail = (detail and detail .. " " or "")
+        .. "identity "
+        .. observation.identity_kind
+        .. ":"
+        .. observation.identity
+    end
+    if
+      observation.layer == "installed"
+      and observation.state == "present"
+      and observation.identity_kind == "git-commit-v1"
+    then
+      local worktree = type(observation.dirty) == "boolean"
+          and (observation.dirty and " worktree dirty" or " worktree clean")
+        or ""
+      table.insert(
+        repository_backed,
+        observation.component_id .. " installed " .. (detail or "identity unknown") .. worktree
+      )
+    elseif
+      observation.component_id ~= "opencode"
+      and observation.layer == "running"
+      and observation.state == "present"
+    then
+      table.insert(running, observation.component_id .. " " .. (detail or "identity unknown"))
+    end
+  end
+  if #repository_backed > 0 then
+    table.insert(lines, "Inventory repository-backed: " .. table.concat(repository_backed, ", "))
+  end
+  if #running > 0 then
+    table.insert(lines, "Inventory running: " .. table.concat(running, ", "))
+  end
+  local compatibility = active_incompatible and "incompatible"
+    or active_contracts > 0 and not active_unknown and "compatible"
+    or "unknown"
+  table.insert(lines, "Inventory active compatibility: " .. compatibility)
   for _, line in ipairs(expanded) do
     table.insert(lines, line)
   end

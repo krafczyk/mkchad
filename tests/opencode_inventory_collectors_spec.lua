@@ -3,6 +3,15 @@ local root = vim.fs.dirname(vim.fs.dirname(source))
 package.path = vim.fs.joinpath(root, "lua", "?.lua") .. ";" .. package.path
 vim.opt.runtimepath:prepend(root)
 
+for _, module in ipairs {
+  "mkchad.opencode.inventory",
+  "mkchad.opencode.inventory_collectors",
+  "mkchad.opencode.inventory_evidence",
+  "mkchad.opencode.inventory_host",
+  "mkchad.opencode.contracts",
+} do
+  package.loaded[module] = nil
+end
 local collectors = require "mkchad.opencode.inventory_collectors"
 local inventory = require "mkchad.opencode.inventory"
 local evidence = require "mkchad.opencode.inventory_evidence"
@@ -90,6 +99,58 @@ assert(by_id["prereq-curl:installed"].state == "timed_out")
 assert(synthetic.summary.evaluations.unknown >= 1)
 
 local fixture = vim.fs.joinpath(vim.fn.stdpath "state", "inventory-package-fixture-" .. vim.fn.getpid())
+local drift_image_root = vim.fs.joinpath(fixture, "drift-image")
+local drift_manifest = vim.fs.joinpath(drift_image_root, "component-manifest.json")
+assert(vim.fn.mkdir(drift_image_root, "p", 448) ~= 0)
+vim.fn.writefile({
+  vim.json.encode {
+    schema = 1,
+    component_id = "nvim-image",
+    relationships = {
+      {
+        id = "ships-opencode",
+        type = "ships",
+        target_component = "opencode",
+        contract = { kind = "exact", version = "1.18.3", suffix_policy = "literal" },
+      },
+    },
+  },
+}, drift_manifest)
+local drift_model = collectors.collect {
+  image_root = drift_image_root,
+  image_manifest = drift_manifest,
+  image_uid = vim.uv.getuid(),
+  probe_results = { opencode = { code = 0, stdout = "1.18.4\n" } },
+  lifecycle = {
+    persisted_state = "present",
+    persisted_version = "1.18.4",
+    running_state = "present",
+    running_version = "1.18.4",
+  },
+}
+for _, item in ipairs(drift_model.diagnostics) do
+  assert(item.code ~= "opencode_layer_drift", "image-shipped baseline was included in OpenCode layer drift")
+end
+local layer_drift_model = collectors.collect {
+  image_root = drift_image_root,
+  image_manifest = drift_manifest,
+  image_uid = vim.uv.getuid(),
+  probe_results = { opencode = { code = 0, stdout = "1.18.4\n" } },
+  lifecycle = {
+    persisted_state = "present",
+    persisted_version = "1.18.5",
+    running_state = "present",
+    running_version = "1.18.4",
+  },
+}
+local layer_drift_diagnostics = 0
+for _, item in ipairs(layer_drift_model.diagnostics) do
+  if item.code == "opencode_layer_drift" then
+    layer_drift_diagnostics = layer_drift_diagnostics + 1
+  end
+end
+assert(layer_drift_diagnostics == 1, "selected, persisted, and running OpenCode drift was not reported once")
+
 local npm_root = vim.fs.joinpath(fixture, "npm")
 local package_root = vim.fs.joinpath(npm_root, "lib", "node_modules", "opencode-project-reload")
 local runtime = vim.fs.joinpath(package_root, "dist", "tui.js")
@@ -161,6 +222,76 @@ local cached_model = collectors.collect { cache_root = cache_home }
 for _, item in ipairs(cached_model.observations) do
   if item.id == "opencode-project-reload:cached" then
     assert(item.state == "present" and item.identity == vim.fn.sha256(runtime_bytes), "versioned cache was not found")
+  end
+end
+local unsafe_cache_root = vim.fs.joinpath(
+  cache_home,
+  "opencode",
+  "packages",
+  "opencode-project-reload@unsafe",
+  "node_modules",
+  "opencode-project-reload"
+)
+assert(vim.fn.mkdir(vim.fs.joinpath(unsafe_cache_root, "dist"), "p", 448) ~= 0)
+vim.fn.writefile({ runtime_bytes }, vim.fs.joinpath(unsafe_cache_root, "dist", "tui.js"), "b")
+vim.fn.writefile({ vim.json.encode(package_owner) }, vim.fs.joinpath(unsafe_cache_root, "opencode-component.json"))
+assert(vim.uv.fs_chmod(vim.fs.joinpath(unsafe_cache_root, "dist"), 511))
+local unsafe_cached_model = collectors.collect { cache_root = cache_home }
+for _, item in ipairs(unsafe_cached_model.observations) do
+  if item.id == "opencode-project-reload:cached" then
+    assert(item.state == "unavailable", "indeterminate unsafe cache root did not fail closed")
+  end
+end
+local ce_cache_root = vim.fs.joinpath(
+  cache_home,
+  "opencode",
+  "packages",
+  "compound-engineering@git+https:",
+  "github.com",
+  "example",
+  "compound-engineering#fixture",
+  "node_modules",
+  "compound-engineering"
+)
+assert(vim.fn.mkdir(vim.fs.joinpath(ce_cache_root, "skills"), "p", 448) ~= 0)
+vim.fn.writefile({ "current" }, vim.fs.joinpath(ce_cache_root, "skills", "routing.md"))
+local ce_owner = {
+  schema = 1,
+  component_id = "compound-engineering",
+  component_version = "3.20.0",
+  relationships = {},
+  identity_profile = {
+    id = "compound-engineering-plugin-v1",
+    algorithm = "sha256",
+    included_roots = { "skills" },
+    exclusions = {},
+    max_regular_files = 4096,
+    max_total_bytes = 16777216,
+    max_per_file_bytes = 2097152,
+    max_elapsed_ms = 5000,
+    framing = "path-u32be-content-u64be-v1",
+  },
+}
+vim.fn.writefile({ vim.json.encode(ce_owner) }, vim.fs.joinpath(ce_cache_root, "component.json"))
+local invalid_ce_cache_root = vim.fs.joinpath(
+  cache_home,
+  "opencode",
+  "packages",
+  "compound-engineering@legacy",
+  "node_modules",
+  "compound-engineering"
+)
+assert(vim.fn.mkdir(invalid_ce_cache_root, "p", 448) ~= 0)
+local invalid_ce_owner = vim.deepcopy(ce_owner)
+invalid_ce_owner.identity_profile.included_roots = { "missing-runtime-content" }
+vim.fn.writefile({ vim.json.encode(invalid_ce_owner) }, vim.fs.joinpath(invalid_ce_cache_root, "component.json"))
+local ce_cached_model = collectors.collect { cache_root = cache_home }
+for _, item in ipairs(ce_cached_model.observations) do
+  if item.id == "compound-engineering:cached" then
+    assert(
+      item.state == "present" and item.version == "3.20.0",
+      "content-invalid historical Compound Engineering cache root competed with the current root"
+    )
   end
 end
 local unsafe_root = vim.fs.joinpath(fixture, "unsafe-tree")

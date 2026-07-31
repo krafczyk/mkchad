@@ -1,7 +1,9 @@
 local source = debug.getinfo(1, "S").source:gsub("^@", "")
 local root = vim.fs.dirname(vim.fs.dirname(source))
 package.path = vim.fs.joinpath(root, "lua", "?.lua") .. ";" .. package.path
+vim.opt.runtimepath:prepend(root)
 
+package.loaded["mkchad.opencode.inventory"] = nil
 local inventory = require "mkchad.opencode.inventory"
 
 local owner = assert(inventory.validate_owner({
@@ -162,6 +164,134 @@ assert(inventory.evaluate({
     suffix_policy = "literal",
   },
 }, source_observation, { state = "present", version = "01.2.3" }) == "unknown")
+
+local human_components = {}
+for _, id in ipairs(inventory.component_ids) do
+  table.insert(human_components, { id = id, optional = false, disposition = "present" })
+end
+local human_observations = {}
+for _, id in ipairs(inventory.required_observation_ids) do
+  local component, layer = id:match "^(.+):([^:]+)$"
+  table.insert(human_observations, {
+    id = id,
+    component_id = component,
+    layer = layer,
+    state = "unavailable",
+    evidence = "fixture-v1",
+    diagnostic_ids = {},
+  })
+end
+local human_by_id = {}
+for _, item in ipairs(human_observations) do
+  human_by_id[item.id] = item
+end
+local function replace_human_observation(item)
+  for index, current in ipairs(human_observations) do
+    if current.id == item.id then
+      human_observations[index] = item
+      human_by_id[item.id] = item
+      return item
+    end
+  end
+  error("missing human fixture observation " .. item.id)
+end
+replace_human_observation {
+  id = "nvim-image:shipped",
+  component_id = "nvim-image",
+  layer = "shipped",
+  state = "present",
+  evidence = "fixture-v1",
+  diagnostic_ids = {},
+}
+replace_human_observation {
+  id = "opencode:shipped",
+  component_id = "opencode",
+  layer = "shipped",
+  state = "present",
+  evidence = "fixture-v1",
+  version = "1.18.3",
+  diagnostic_ids = {},
+}
+for _, layer in ipairs { "selected", "persisted", "running" } do
+  replace_human_observation {
+    id = "opencode:" .. layer,
+    component_id = "opencode",
+    layer = layer,
+    state = "present",
+    evidence = "fixture-v1",
+    version = layer == "selected" and "1.18.4" or layer == "persisted" and "1.18.5" or "1.18.6",
+    identity_kind = "image-file-stat-v1",
+    identity = layer .. "-id",
+    diagnostic_ids = {},
+  }
+end
+for _, component in ipairs { "mkchad", "opencode-nvim", "sprint-loop-nvim" } do
+  local item = human_by_id[component .. ":installed"]
+  item.state = "present"
+  item.identity_kind = "git-commit-v1"
+  item.identity = component .. "-commit"
+  item.dirty = component == "opencode-nvim"
+end
+human_by_id["opencode-nvim:installed"].version = "0.1.0"
+human_by_id["opencode-project-reload:installed"].state = "present"
+local human_relationships = {
+  {
+    id = "nvim-image:shipped:ships-opencode",
+    type = "ships",
+    owner = "nvim-image",
+    source_observation_id = "nvim-image:shipped",
+    target_observation_id = "opencode:selected",
+    contract = { kind = "exact", version = "1.18.3", suffix_policy = "literal" },
+    result = "mismatch",
+    diagnostic_ids = {},
+  },
+  {
+    id = "opencode-project-reload:installed:supports-opencode",
+    type = "supports",
+    owner = "opencode-project-reload",
+    source_observation_id = "opencode-project-reload:installed",
+    target_observation_id = "opencode:running",
+    contract = { kind = "exact-set", versions = { "1.18.3" }, suffix_policy = "literal" },
+    result = "unknown",
+    diagnostic_ids = {},
+  },
+}
+local function human_fixture(result)
+  human_relationships[2].result = result
+  return inventory.human(inventory.model(human_components, human_observations, human_relationships, {}))
+end
+local human_unknown = human_fixture "unknown"
+assert(
+  human_unknown:find(
+    "Inventory image-shipped OpenCode baseline 1.18.3 is overridden by selected package 1.18.4",
+    1,
+    true
+  ),
+  "selected package override was presented as a compatibility failure"
+)
+assert(
+  human_unknown:find(
+    "Inventory OpenCode layers: selected version 1.18.4 identity image-file-stat-v1:selected-id, persisted version 1.18.5 identity image-file-stat-v1:persisted-id, running version 1.18.6 identity image-file-stat-v1:running-id",
+    1,
+    true
+  ),
+  "active OpenCode layers were not rendered"
+)
+assert(
+  human_unknown:find(
+    "Inventory repository-backed: mkchad installed identity git-commit-v1:mkchad-commit worktree clean, opencode-nvim installed version 0.1.0 identity git-commit-v1:opencode-nvim-commit worktree dirty, sprint-loop-nvim installed identity git-commit-v1:sprint-loop-nvim-commit worktree clean",
+    1,
+    true
+  ),
+  "repository identities and worktree state were not rendered"
+)
+assert(
+  not human_unknown:find("Inventory running: opencode", 1, true),
+  "OpenCode was duplicated in generic running output"
+)
+assert(human_unknown:find("Inventory active compatibility: unknown", 1, true), "ambiguous compatibility was inferred")
+assert((human_fixture "satisfied"):find("Inventory active compatibility: compatible", 1, true))
+assert((human_fixture "unsupported"):find("Inventory active compatibility: incompatible", 1, true))
 
 local loaded_from =
   { type = "loaded-from", contract = { kind = "identity", profile = "compound-engineering-plugin-v1" } }

@@ -170,6 +170,20 @@ end
 
 local installed_package
 
+local function content_identity(root, metadata, expected_uid, deadline_ns)
+  if not metadata.identity_profile then
+    return true
+  end
+  local digest, digest_err = evidence.digest_profile(root, metadata.identity_profile, expected_uid, deadline_ns)
+  if not digest then
+    return nil, digest_err
+  end
+  if metadata.identity_profile.sha256 and metadata.identity_profile.sha256 ~= digest then
+    return nil, "mismatch"
+  end
+  return true, nil, digest
+end
+
 local function cached_package(
   observations,
   declarations,
@@ -316,13 +330,23 @@ local function cached_package(
   local discovered = candidates
   candidates = {}
   local validation_timed_out = false
+  local validation_indeterminate
   for _, root in ipairs(discovered) do
     local metadata, err =
       read_owner(vim.fs.joinpath(root, metadata_name), root, component, expected_uid, {}, deadline_ns)
     if metadata then
-      table.insert(candidates, root)
+      local content_valid, content_err = content_identity(root, metadata, expected_uid, deadline_ns)
+      if content_valid then
+        table.insert(candidates, root)
+      elseif content_err == "timed_out" then
+        validation_timed_out = true
+      elseif content_err == "unsafe" or content_err == "unavailable" or content_err == "raced" then
+        validation_indeterminate = validation_indeterminate or content_err
+      end
     elseif err == "timed_out" then
       validation_timed_out = true
+    elseif err == "unsafe" or err == "unavailable" or err == "raced" then
+      validation_indeterminate = validation_indeterminate or err
     end
   end
   if validation_timed_out then
@@ -333,8 +357,17 @@ local function cached_package(
     )
     return
   end
-  if #candidates == 0 and #discovered == 1 then
-    candidates = discovered
+  if validation_indeterminate then
+    local diagnostic_id = diagnostic(
+      diagnostics,
+      "package_cache_" .. validation_indeterminate,
+      "An allowlisted OpenCode cache root could not be safely validated"
+    )
+    table.insert(
+      observations,
+      observation(component, "cached", "unavailable", "owner-metadata-v1", nil, { diagnostic_id })
+    )
+    return
   end
   if #candidates > 1 then
     local diagnostic_id = diagnostic(
@@ -349,8 +382,11 @@ local function cached_package(
     return
   end
   if #candidates == 0 then
-    local diagnostic_id =
-      diagnostic(diagnostics, "package_cache_invalid", "No allowlisted OpenCode cache root has valid owner metadata")
+    local diagnostic_id = diagnostic(
+      diagnostics,
+      "package_cache_invalid",
+      "No allowlisted OpenCode cache root has valid owner metadata and content identity"
+    )
     table.insert(
       observations,
       observation(component, "cached", "unavailable", "owner-metadata-v1", nil, { diagnostic_id })
@@ -402,26 +438,17 @@ installed_package = function(
   end
   local extra = { version = metadata and metadata.component_version }
   if metadata and metadata.identity_profile then
-    local digest, digest_err = evidence.digest_profile(root, metadata.identity_profile, expected_uid, deadline_ns)
-    if digest then
+    local content_valid, digest_err, digest = content_identity(root, metadata, expected_uid, deadline_ns)
+    if content_valid then
       extra.identity_kind = metadata.identity_profile.id
       extra.identity = digest
-      if metadata.identity_profile.sha256 and metadata.identity_profile.sha256 ~= digest then
-        state = "unavailable"
-        extra.identity_kind = nil
-        extra.identity = nil
-        diagnostic_id = diagnostic(
-          diagnostics,
-          "content_identity_mismatch",
-          "Package content differs from its owner-declared immutable identity"
-        )
-      end
     else
       state = digest_err == "timed_out" and "timed_out" or "unavailable"
       diagnostic_id = diagnostic(
         diagnostics,
         "content_identity_" .. tostring(digest_err),
-        "Package content identity could not be safely calculated"
+        digest_err == "mismatch" and "Package content differs from its owner-declared immutable identity"
+          or "Package content identity could not be safely calculated"
       )
     end
   end
@@ -530,6 +557,21 @@ local function component_list(observations)
     )
   end
   return components
+end
+
+local function opencode_layer_drift(observations)
+  local versions = {}
+  for _, item in ipairs(observations) do
+    if
+      item.component_id == "opencode"
+      and (item.layer == "selected" or item.layer == "persisted" or item.layer == "running")
+      and item.state == "present"
+      and item.version
+    then
+      versions[item.version] = true
+    end
+  end
+  return vim.tbl_count(versions) > 1
 end
 
 local function build(options, probes)
@@ -751,17 +793,7 @@ local function build(options, probes)
       identity = lifecycle.running_identity,
     })
   )
-  local versions = {}
-  for _, item in ipairs(observations) do
-    if item.component_id == "opencode" and item.state == "present" and item.version then
-      versions[item.version] = true
-    end
-  end
-  local distinct_versions = 0
-  for _ in pairs(versions) do
-    distinct_versions = distinct_versions + 1
-  end
-  if distinct_versions > 1 then
+  if opencode_layer_drift(observations) then
     diagnostic(
       diagnostics,
       "opencode_layer_drift",
@@ -1146,17 +1178,7 @@ function M.collect_async(options, callback)
     running.version = lifecycle.running_version
     running.identity_kind = lifecycle.running_identity_kind
     running.identity = lifecycle.running_identity
-    local versions = {}
-    for _, item in ipairs(observations) do
-      if item.component_id == "opencode" and item.state == "present" and item.version then
-        versions[item.version] = true
-      end
-    end
-    local distinct = 0
-    for _ in pairs(versions) do
-      distinct = distinct + 1
-    end
-    if distinct > 1 then
+    if opencode_layer_drift(observations) then
       diagnostic(
         diagnostics,
         "opencode_layer_drift",

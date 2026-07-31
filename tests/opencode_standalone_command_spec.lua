@@ -65,7 +65,18 @@ environment.PATH = fake_bin .. ":" .. environment.PATH
 
 local function invoke(...)
   local done, result = false, nil
-  vim.system({ nvim, "--headless", "-u", "NONE", "-l", entrypoint, "--", ... }, { env = environment }, function(value)
+  vim.system({
+    nvim,
+    "--headless",
+    "-u",
+    "NONE",
+    "--cmd",
+    "set rtp^=" .. root,
+    "-l",
+    entrypoint,
+    "--",
+    ...,
+  }, { env = environment }, function(value)
     result, done = value, true
   end)
   assert(
@@ -195,6 +206,10 @@ assert(inactive_human.stdout:find(
   true
 ) == 1, "inactive human lifecycle status changed")
 assert(inactive_human.stdout:find("Inventory: partial", 1, true), "inactive inventory summary missing")
+assert(
+  inactive_human.stdout:find("Inventory active compatibility: unknown", 1, true),
+  "inactive active-contract summary missing"
+)
 
 local started = invoke("start", "--json")
 assert(started.code == 0 and started.stdout:match "^%b{}\n$", started.stderr)
