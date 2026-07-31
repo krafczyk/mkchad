@@ -313,12 +313,44 @@ local function cached_package(
     )
     return
   end
+  local discovered = candidates
+  candidates = {}
+  local validation_timed_out = false
+  for _, root in ipairs(discovered) do
+    local metadata, err =
+      read_owner(vim.fs.joinpath(root, metadata_name), root, component, expected_uid, {}, deadline_ns)
+    if metadata then
+      table.insert(candidates, root)
+    elseif err == "timed_out" then
+      validation_timed_out = true
+    end
+  end
+  if validation_timed_out then
+    local diagnostic_id = diagnostic(diagnostics, "package_cache_timed_out", "The package cache deadline expired")
+    table.insert(
+      observations,
+      observation(component, "cached", "timed_out", "owner-metadata-v1", nil, { diagnostic_id })
+    )
+    return
+  end
+  if #candidates == 0 and #discovered == 1 then
+    candidates = discovered
+  end
   if #candidates > 1 then
     local diagnostic_id = diagnostic(
       diagnostics,
       "package_cache_ambiguous",
       "Multiple allowlisted OpenCode cache roots prevent a unique cached identity"
     )
+    table.insert(
+      observations,
+      observation(component, "cached", "unavailable", "owner-metadata-v1", nil, { diagnostic_id })
+    )
+    return
+  end
+  if #candidates == 0 then
+    local diagnostic_id =
+      diagnostic(diagnostics, "package_cache_invalid", "No allowlisted OpenCode cache root has valid owner metadata")
     table.insert(
       observations,
       observation(component, "cached", "unavailable", "owner-metadata-v1", nil, { diagnostic_id })
@@ -402,17 +434,40 @@ installed_package = function(
   end
 end
 
-local function git_observation(observations, diagnostics, component, layer, result, evidence, owner_metadata)
+local function git_observation(
+  observations,
+  diagnostics,
+  component,
+  layer,
+  result,
+  dirty_result,
+  evidence,
+  owner_metadata
+)
   local state = probe_state(result)
   local identity
   local dirty
   if state == "present" then
-    local line = result.stdout
-      and (result.stdout:match "^([0-9a-f]+)%-dirty[\r\n]*$" or result.stdout:match "^([0-9a-f]+)[\r\n]*$")
+    local line = result.stdout and result.stdout:match "^([0-9a-f]+)[\r\n]*$"
     identity = line and #line == 40 and line or nil
-    dirty = result.stdout and result.stdout:find "%-dirty[\r\n]*$" ~= nil or false
     if not identity then
       state = "unavailable"
+    elseif dirty_result and dirty_result.timed_out then
+      state = "timed_out"
+      identity = nil
+    elseif
+      dirty_result
+      and dirty_result.code == 0
+      and not dirty_result.error
+      and not dirty_result.killed
+      and (dirty_result.signal or 0) == 0
+    then
+      dirty = false
+    elseif dirty_result and dirty_result.code == 1 and not dirty_result.killed and (dirty_result.signal or 0) == 0 then
+      dirty = true
+    else
+      state = dirty_result and dirty_result.timed_out and "timed_out" or "unavailable"
+      identity = nil
     end
   end
   if state == "absent" and component == "mkchad" then
@@ -431,7 +486,7 @@ local function git_observation(observations, diagnostics, component, layer, resu
       version = owner_metadata and owner_metadata.component_version,
       identity_kind = identity and "git-commit-v1" or nil,
       identity = identity,
-      dirty = identity and dirty or nil,
+      dirty = identity and dirty,
     }, diagnostic_ids)
   )
 end
@@ -531,7 +586,15 @@ local function build(options, probes)
       identity = contracts.opencode_nvim_revision,
     })
   )
-  git_observation(observations, diagnostics, "mkchad", "installed", probes.mkchad_git, "git-checkout-v1")
+  git_observation(
+    observations,
+    diagnostics,
+    "mkchad",
+    "installed",
+    probes.mkchad_git,
+    probes.mkchad_dirty,
+    "git-checkout-v1"
+  )
 
   local image, image_err, image_diagnostic =
     read_owner(paths.image_manifest, paths.image_root, "nvim-image", image_uid, diagnostics, options.deadline_ns)
@@ -588,6 +651,7 @@ local function build(options, probes)
     "opencode-nvim",
     "installed",
     probes.opencode_nvim_git,
+    probes.opencode_nvim_dirty,
     "lazy-git-checkout-v1",
     plugin_metadata
   )
@@ -748,6 +812,7 @@ local function build(options, probes)
     "sprint-loop-nvim",
     "installed",
     probes.sprint_nvim_git,
+    probes.sprint_nvim_dirty,
     "lazy-git-checkout-v1"
   )
   table.insert(observations, observation("sprint-loop-nvim", "loaded", "unprovable", "owner-attestation-v1"))
@@ -900,6 +965,44 @@ local function executable(path, roots)
   return resolved
 end
 
+local function managed_opencode_result(path)
+  if not path then
+    return nil
+  end
+  local package_root = path:match "^(.*)/bin/opencode$"
+  if
+    not package_root
+    or vim.fs.basename(package_root) ~= "opencode-ai"
+    or vim.fs.basename(vim.fs.dirname(package_root)) ~= "node_modules"
+  then
+    return nil
+  end
+  local expected_executable = uv.fs_realpath(vim.fs.joinpath(package_root, "bin", "opencode"))
+  local executable_stat = uv.fs_stat(path)
+  if
+    not expected_executable
+    or path ~= expected_executable
+    or not evidence.path_within(expected_executable, package_root)
+    or not executable_stat
+  then
+    return { error = true, path = path }
+  end
+  local raw =
+    evidence.read_regular(vim.fs.joinpath(package_root, "package.json"), package_root, owner_limit, executable_stat.uid)
+  local decoded = raw and inventory.decode_json(raw, owner_limit)
+  if
+    not decoded
+    or decoded.name ~= "opencode-ai"
+    or not bounded(decoded.version, 128)
+    or not decoded.version:match "^[0-9][0-9A-Za-z.+_-]*$"
+    or type(decoded.bin) ~= "table"
+    or decoded.bin.opencode ~= "./bin/opencode"
+  then
+    return { error = true, path = path }
+  end
+  return { code = 0, stdout = decoded.version .. "\n", path = path }
+end
+
 local function probe_specs(options)
   local paths = default_paths(options)
   local executables = options.executables or {}
@@ -915,6 +1018,31 @@ local function probe_specs(options)
   for _, root in ipairs(options.trusted_executable_roots or {}) do
     table.insert(roots, { path = root, uid = user_uid })
   end
+  local image_base = options.image_base or "/nvim"
+  local image_invoking_uid = options.image_invoking_uid or user_uid
+  local node_candidate = executables.node or vim.fn.exepath "node"
+  local resolved_node = node_candidate and uv.fs_realpath(node_candidate)
+  local image_relative = resolved_node
+    and evidence.path_within(resolved_node, image_base)
+    and resolved_node:sub(#image_base + 2)
+  local image_runtime_name = image_relative and image_relative:match "^([^/]+)/"
+  local image_runtime_root = image_runtime_name and vim.fs.joinpath(image_base, image_runtime_name)
+  if image_runtime_root then
+    local image_root = uv.fs_lstat(image_base)
+    local runtime_root = uv.fs_lstat(image_runtime_root)
+    if
+      image_root
+      and image_root.type == "directory"
+      and image_root.uid ~= image_invoking_uid
+      and bit.band(image_root.mode, 18) == 0
+      and runtime_root
+      and runtime_root.type == "directory"
+      and runtime_root.uid ~= image_invoking_uid
+      and bit.band(runtime_root.mode, 18) == 0
+    then
+      table.insert(roots, { path = image_runtime_root, uid = runtime_root.uid })
+    end
+  end
   local function selected(name, fallback)
     if executables[name] == false then
       return nil
@@ -922,7 +1050,7 @@ local function probe_specs(options)
     return executable(executables[name] or vim.fn.exepath(fallback or name), roots)
   end
   local git = selected "git"
-  local function git_spec(root, allowed_root)
+  local function git_spec(root, allowed_root, dirty_id)
     if not root then
       return { missing = true }
     end
@@ -938,25 +1066,31 @@ local function probe_specs(options)
     if not git then
       return { missing = true }
     end
+    local prefix = {
+      git,
+      "-c",
+      "core.hooksPath=/dev/null",
+      "-c",
+      "core.fsmonitor=false",
+      "--no-optional-locks",
+      "-C",
+      root,
+    }
+    local function command(arguments)
+      return vim.list_extend(vim.deepcopy(prefix), arguments)
+    end
+    local function validate()
+      return evidence.snapshot_unchanged(root, root_snapshot) and evidence.snapshot_unchanged(git_path, git_snapshot)
+    end
     return {
-      argv = {
-        git,
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-c",
-        "core.fsmonitor=false",
-        "--no-optional-locks",
-        "-C",
-        root,
-        "describe",
-        "--always",
-        "--dirty",
-        "--abbrev=40",
-        "--match=__mkchad_no_tag_can_match__",
-      },
-      validate = function()
-        return evidence.snapshot_unchanged(root, root_snapshot) and evidence.snapshot_unchanged(git_path, git_snapshot)
+      argv = command { "rev-parse", "--verify", "HEAD" },
+      intermediate_argv = function(result)
+        return command { "diff", "--quiet", "--no-ext-diff", vim.trim(result.stdout), "--" }
       end,
+      intermediate_id = dirty_id,
+      repeat_intermediate = true,
+      validate = validate,
+      verify = true,
     }
   end
   local opencode = selected "opencode"
@@ -964,11 +1098,14 @@ local function probe_specs(options)
   local python = selected("python", "python3")
   local node = selected "node"
   local curl = selected "curl"
+  local opencode_result = managed_opencode_result(opencode)
   return {
-    mkchad_git = git_spec(options.config_root, options.config_root),
-    opencode_nvim_git = git_spec(paths.opencode_nvim, paths.lazy_root),
-    sprint_nvim_git = git_spec(paths.sprint_nvim, paths.lazy_root),
-    opencode = opencode and { argv = { opencode, "--version" }, path = opencode } or { missing = true },
+    mkchad_git = git_spec(options.config_root, options.config_root, "mkchad_dirty"),
+    opencode_nvim_git = git_spec(paths.opencode_nvim, paths.lazy_root, "opencode_nvim_dirty"),
+    sprint_nvim_git = git_spec(paths.sprint_nvim, paths.lazy_root, "sprint_nvim_dirty"),
+    opencode = opencode
+        and (opencode_result and { result = opencode_result } or { argv = { opencode, "--version" }, path = opencode })
+      or { missing = true },
     sprint_loop = sprint_loop and { argv = { sprint_loop, "component-info", "--json" } } or { missing = true },
     git = git and { argv = { git, "--version" } } or { missing = true },
     python = python and { argv = { python, "--version" } } or { missing = true },
@@ -1069,9 +1206,11 @@ function M.collect_async(options, callback)
       results[id] = { missing = true }
     elseif spec.invalid then
       results[id] = { error = true }
+    elseif spec.result then
+      results[id] = spec.result
     else
       pending = pending + 1
-      probe(spec.argv, {
+      local probe_options = {
         timeout_ms = 2000,
         deadline_ns = deadline_ns,
         cwd = "/",
@@ -1088,17 +1227,82 @@ function M.collect_async(options, callback)
           LC_ALL = "C",
           PATH = "/usr/bin:/bin",
         },
-      }, function(result, err)
+      }
+      local function complete(result, err)
         results[id] = spec.validate and not spec.validate() and { error = true, raced = true }
           or result
           or { error = true }
-        results[id].error = err ~= nil
+        results[id].error = err ~= nil or results[id].error
         results[id].path = spec.path
         pending = pending - 1
         if pending == 0 and not launching then
           probes_done = true
           maybe_collect()
         end
+      end
+      probe(spec.argv, probe_options, function(result, err)
+        if spec.verify and result and result.code == 0 and not err then
+          local intermediate
+          local function finish_verified()
+            if not spec.repeat_intermediate then
+              complete(result)
+              return
+            end
+            local argv = type(spec.intermediate_argv) == "function" and spec.intermediate_argv(result)
+              or spec.intermediate_argv
+            probe(argv, probe_options, function(repeated, repeated_err)
+              repeated = repeated or { error = true }
+              repeated.error = repeated_err ~= nil or repeated.error
+              if repeated.timed_out then
+                complete({ error = true, timed_out = true }, repeated_err)
+                return
+              end
+              if
+                not intermediate
+                or repeated.code ~= intermediate.code
+                or repeated.timed_out ~= intermediate.timed_out
+                or repeated.killed ~= intermediate.killed
+                or repeated.signal ~= intermediate.signal
+              then
+                complete({ error = true, raced = true }, "Git dirty state changed during collection")
+                return
+              end
+              results[spec.intermediate_id] = repeated
+              complete(result)
+            end)
+          end
+          local function verify()
+            probe(spec.argv, probe_options, function(verified, verify_err)
+              if verify_err or not verified or verified.code ~= 0 or verified.stdout ~= result.stdout then
+                local timed_out = verified and verified.timed_out or false
+                complete(
+                  { error = true, raced = not timed_out, timed_out = timed_out },
+                  verify_err or "Git identity changed during collection"
+                )
+                return
+              end
+              finish_verified()
+            end)
+          end
+          if spec.intermediate_argv then
+            local argv = type(spec.intermediate_argv) == "function" and spec.intermediate_argv(result)
+              or spec.intermediate_argv
+            probe(argv, probe_options, function(value, intermediate_err)
+              intermediate = value or { error = true }
+              intermediate.error = intermediate_err ~= nil or intermediate.error
+              if intermediate.timed_out then
+                results[spec.intermediate_id] = intermediate
+                complete({ error = true, timed_out = true }, intermediate_err)
+                return
+              end
+              verify()
+            end)
+          else
+            verify()
+          end
+          return
+        end
+        complete(result, err)
       end)
     end
   end
