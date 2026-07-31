@@ -2,10 +2,17 @@
 -- command contract can be exercised without Java or a container runtime.
 local source = debug.getinfo(1, "S").source:gsub("^@", "")
 local root = vim.fs.dirname(vim.fs.dirname(source))
+package.path = vim.fs.joinpath(root, "?.lua") .. ";" .. package.path
+local test_paths = require "tests.opencode_test_paths"
 local entrypoint = vim.fs.joinpath(root, "lua", "mkchad", "opencode", "command.lua")
-local state_home = assert(vim.env.XDG_STATE_HOME, "set XDG_STATE_HOME to an isolated test path")
-local config_home = assert(vim.env.XDG_CONFIG_HOME, "set XDG_CONFIG_HOME to an isolated test path")
-local runtime_home = assert(vim.env.XDG_RUNTIME_DIR, "set XDG_RUNTIME_DIR to an isolated test path")
+local _, xdg_roots = test_paths.create_xdg_roots(vim.env.MKCHAD_TEST_ROOT, {
+  XDG_CONFIG_HOME = vim.env.XDG_CONFIG_HOME,
+  XDG_STATE_HOME = vim.env.XDG_STATE_HOME,
+  XDG_RUNTIME_DIR = vim.env.XDG_RUNTIME_DIR,
+})
+local state_home = xdg_roots.XDG_STATE_HOME
+local config_home = xdg_roots.XDG_CONFIG_HOME
+local runtime_home = xdg_roots.XDG_RUNTIME_DIR
 local nvim = assert(vim.fn.exepath "nvim" ~= "" and vim.fn.exepath "nvim")
 local fake_bin = vim.fs.joinpath(state_home, "fake-bin")
 local config_dir = vim.fs.joinpath(config_home, "mkchad")
