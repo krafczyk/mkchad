@@ -1,5 +1,5 @@
 local M = {}
-local scratch_root = "/tmp/opencode-mkchad"
+local scratch_root = "/tmp/mkchad-v1"
 
 local function required_path(name, value)
   assert(type(value) == "string" and value ~= "", name .. " is required")

@@ -3,11 +3,11 @@ local root = vim.fs.dirname(vim.fs.dirname(source))
 package.path = vim.fs.joinpath(root, "?.lua") .. ";" .. package.path
 
 local test_paths = require "tests.opencode_test_paths"
-local scratch_root = "/tmp/opencode-mkchad"
+local scratch_root = "/tmp/mkchad-v1"
 local suffix = tostring(vim.fn.getpid())
 
 for _, path in ipairs {
-  "/tmp/opencode-mkchad-outside/task",
+  "/tmp/mkchad-v1-outside/task",
   scratch_root,
   scratch_root .. "/nested/task",
 } do

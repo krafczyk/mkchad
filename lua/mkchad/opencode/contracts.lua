@@ -3,7 +3,7 @@
 local M = {
   schema = 1,
   component_id = "mkchad",
-  opencode_nvim_revision = "64aab776e06e37d234daba8de652366e2a288344",
+  opencode_nvim_revision = "37033dc157ac4c05c1e1525fe2fc9e87ae83e2ac",
   relationships = {
     {
       id = "ships-opencode-nvim",

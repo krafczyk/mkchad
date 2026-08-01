@@ -22,7 +22,7 @@ local config_home = vim.env.XDG_CONFIG_HOME or vim.fs.joinpath(vim.env.HOME or "
 local state_home = vim.env.XDG_STATE_HOME or vim.fs.joinpath(vim.env.HOME or "", ".local", "state")
 local server_config_path = vim.g.mkchad_opencode_test_api
     and (vim.g.mkchad_opencode_test_server_config or vim.fs.joinpath(
-      "/tmp/opencode-mkchad",
+      "/tmp/mkchad-v1",
       "mkchad-server-config-test-" .. vim.fn.getpid() .. ".json"
     ))
   or vim.fs.joinpath(config_home, "mkchad", "opencode-server.json")
@@ -100,6 +100,7 @@ local function paths()
     log = vim.fs.joinpath(root, "server.log"),
     proxy_log = vim.fs.joinpath(root, "proxy.log"),
     fence = vim.fs.joinpath(root, "lifecycle.fence"),
+    deployment_lock = vim.fs.joinpath(state_home, "mkchad", "deployment.lock"),
     lock = vim.fs.joinpath(root, "startup.lock"),
     lock_owner = vim.fs.joinpath(root, "startup.lock", "owner.json"),
     tls = vim.fs.joinpath(root, "tls"),
@@ -203,6 +204,109 @@ local function release_fence()
     end)
   end
   uv.fs_close(fd)
+end
+
+function test_hooks.acquire_deployment_lock(callback, deadline_ns)
+  if test_hooks.deployment_lock_fd then
+    callback(false, "nested OpenCode deployment lock acquisition was refused")
+    return
+  end
+  if not ffi_ok then
+    callback(false, "Linux flock support is unavailable in this Neovim")
+    return
+  end
+  local state_paths, state_err = ensure_state_dir()
+  if not state_paths then
+    callback(false, state_err)
+    return
+  end
+  local deployment_parent = vim.fs.dirname(state_paths.deployment_lock)
+  local parent_stat = uv.fs_lstat(deployment_parent)
+  if
+    not parent_stat
+    or parent_stat.type ~= "directory"
+    or not uv.getuid
+    or parent_stat.uid ~= uv.getuid()
+    or parent_stat.mode % 512 ~= 448
+  then
+    callback(false, "OpenCode deployment lock parent is missing or unsafe: " .. deployment_parent)
+    return
+  end
+  local existing = uv.fs_lstat(state_paths.deployment_lock)
+  if existing and (existing.type ~= "file" or not uv.getuid or existing.uid ~= uv.getuid()) then
+    callback(false, "OpenCode deployment lock path is a symlink, non-file, or foreign-owned")
+    return
+  end
+  local fd, open_err = uv.fs_open(state_paths.deployment_lock, "a", 384)
+  if not fd then
+    callback(false, "Unable to open the OpenCode deployment lock: " .. (open_err or "unknown error"))
+    return
+  end
+  local closed = false
+  local function close_fd()
+    if not closed then
+      closed = true
+      uv.fs_close(fd)
+    end
+  end
+  local fd_stat = uv.fs_fstat(fd)
+  local path_stat = uv.fs_lstat(state_paths.deployment_lock)
+  if
+    not fd_stat
+    or fd_stat.type ~= "file"
+    or not path_stat
+    or path_stat.type ~= "file"
+    or not uv.getuid
+    or fd_stat.uid ~= uv.getuid()
+    or fd_stat.dev ~= path_stat.dev
+    or fd_stat.ino ~= path_stat.ino
+  then
+    close_fd()
+    callback(false, "OpenCode deployment lock path or permissions are unsafe: " .. state_paths.deployment_lock)
+    return
+  end
+  local chmod_ok, chmod_err = uv.fs_fchmod(fd, 384)
+  fd_stat = uv.fs_fstat(fd)
+  path_stat = uv.fs_lstat(state_paths.deployment_lock)
+  if
+    not chmod_ok
+    or not fd_stat
+    or fd_stat.mode % 512 ~= 384
+    or not path_stat
+    or path_stat.type ~= "file"
+    or path_stat.dev ~= fd_stat.dev
+    or path_stat.ino ~= fd_stat.ino
+  then
+    close_fd()
+    callback(
+      false,
+      "OpenCode deployment lock path or permissions are unsafe: " .. (chmod_err or state_paths.deployment_lock)
+    )
+    return
+  end
+  local function attempt()
+    local ok, result = pcall(function()
+      return ffi.C.flock(fd, 1 + flock_nonblocking)
+    end)
+    if ok and result == 0 then
+      closed = true
+      test_hooks.deployment_lock_fd = fd
+      callback(true)
+      return
+    end
+    local errno = ok and ffi.errno() or 0
+    if ok and (errno == 4 or errno == 11) and uv.hrtime() < deadline_ns then
+      vim.defer_fn(attempt, fence_poll_interval_ms)
+      return
+    end
+    close_fd()
+    if ok and errno == 11 then
+      callback(false, "Timed out waiting for the OpenCode deployment lock")
+    else
+      callback(false, "Unable to acquire the Linux OpenCode deployment lock")
+    end
+  end
+  attempt()
 end
 
 local function safe_subprocess_callback(callback, ...)
@@ -2068,6 +2172,9 @@ local function require_lock_ownership(action)
   if not fenced then
     return nil, fence_err
   end
+  if not test_hooks.deployment_lock_fd then
+    return nil, "OpenCode deployment lock is not held for " .. action
+  end
   local renewed, err = renew_lock()
   if not renewed then
     return nil,
@@ -2145,6 +2252,16 @@ release_lock = function()
     end
   end
   lock_claim = nil
+  local deployment_fd = test_hooks.deployment_lock_fd
+  test_hooks.deployment_lock_fd = nil
+  if deployment_fd then
+    if ffi_ok then
+      pcall(function()
+        ffi.C.flock(deployment_fd, flock_unlock)
+      end)
+    end
+    uv.fs_close(deployment_fd)
+  end
   release_fence()
 end
 
@@ -2289,7 +2406,7 @@ local function publish_lock_owner(claim)
   return true
 end
 
-local function acquire_logical_lock_under_fence(callback, retried)
+local function acquire_logical_lock_under_fence(callback, retried, deadline_ns)
   local state_paths, err = ensure_state_dir()
   if not state_paths then
     release_fence()
@@ -2315,22 +2432,29 @@ local function acquire_logical_lock_under_fence(callback, retried)
       callback(false, "Unable to write OpenCode startup lock: " .. (write_err or "unknown error"))
       return
     end
-    if not require_lock_ownership "startup critical section" then
-      release_lock()
-      callback(false, "OpenCode startup lock ownership was lost before startup")
-      return
-    end
-    local renewing, renewal_err = start_lock_renewal()
-    if not renewing then
-      release_lock()
-      callback(false, "Unable to renew OpenCode startup lock: " .. renewal_err)
-      return
-    end
-    callback(true)
+    test_hooks.acquire_deployment_lock(function(deployment_locked, deployment_err)
+      if not deployment_locked then
+        release_lock()
+        callback(false, deployment_err)
+        return
+      end
+      if not require_lock_ownership "startup critical section" then
+        release_lock()
+        callback(false, "OpenCode startup lock ownership was lost before startup")
+        return
+      end
+      local renewing, renewal_err = start_lock_renewal()
+      if not renewing then
+        release_lock()
+        callback(false, "Unable to renew OpenCode startup lock: " .. renewal_err)
+        return
+      end
+      callback(true)
+    end, deadline_ns)
     return
   end
   if not retried and reclaim_stale_lock() then
-    acquire_logical_lock_under_fence(callback, true)
+    acquire_logical_lock_under_fence(callback, true, deadline_ns)
     return
   end
   release_fence()
@@ -2346,7 +2470,7 @@ local function acquire_lock(callback, retried, deadline_ns)
       return
     end
     local ok, acquire_err = xpcall(function()
-      acquire_logical_lock_under_fence(callback, retried)
+      acquire_logical_lock_under_fence(callback, retried, operation_deadline)
     end, debug.traceback)
     if not ok then
       release_lock()
@@ -6342,6 +6466,9 @@ if vim.g.mkchad_opencode_test_api then
     write_state = write_state_while_locked,
     remove_matching_state_while_locked = remove_matching_state_while_locked,
     fence_is_held = fence_is_held,
+    deployment_lock_is_held = function()
+      return test_hooks.deployment_lock_fd ~= nil
+    end,
     set_test_hook = function(action, marker, resume)
       assert(
         vim.tbl_contains(

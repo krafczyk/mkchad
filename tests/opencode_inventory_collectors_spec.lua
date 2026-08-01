@@ -97,8 +97,18 @@ assert(by_id["mkchad:installed"].dirty == true)
 assert(by_id["opencode:selected"].version == "1.18.3-mkchad.7")
 assert(by_id["prereq-curl:installed"].state == "timed_out")
 assert(synthetic.summary.evaluations.unknown >= 1)
+assert(
+  by_id["opencode-nvim:declared"].identity == "37033dc157ac4c05c1e1525fe2fc9e87ae83e2ac",
+  "inventory did not report the parent-authoritative opencode.nvim revision"
+)
 
-local fixture = vim.fs.joinpath(vim.fn.stdpath "state", "inventory-package-fixture-" .. vim.fn.getpid())
+local scratch_root = "/tmp/mkchad-v1"
+assert(vim.fn.mkdir(scratch_root, "p", 448) ~= 0 or vim.uv.fs_stat(scratch_root))
+local scratch_stat = assert(vim.uv.fs_lstat(scratch_root))
+assert(
+  scratch_stat.type == "directory" and scratch_stat.uid == vim.uv.getuid() and bit.band(scratch_stat.mode, 18) == 0
+)
+local fixture = vim.fs.joinpath(scratch_root, "inventory-package-fixture-" .. vim.fn.getpid())
 local drift_image_root = vim.fs.joinpath(fixture, "drift-image")
 local drift_manifest = vim.fs.joinpath(drift_image_root, "component-manifest.json")
 assert(vim.fn.mkdir(drift_image_root, "p", 448) ~= 0)
