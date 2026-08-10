@@ -99,10 +99,18 @@ do
   append_path(vim.fn.stdpath("data") .. "/mason/bin")
 
   if node_global_key then
-    local npm_global_root = env_or_default("MSK_NPM_GLOBAL_ROOT", home .. "/.local/share/msk_containers/npm-global")
-    local npm_global_prefix = npm_global_root .. "/" .. node_global_key
+    local npm_global_base = env_or_default(
+      "MSK_NPM_GLOBAL_BASE",
+      env_or_default("MSK_NPM_GLOBAL_ROOT", home .. "/.local/share/msk_containers/npm-global")
+    )
+    local selected_suffix = "/" .. node_global_key
+    local npm_global_prefix = npm_global_base
+    if npm_global_base:sub(-#selected_suffix) ~= selected_suffix then
+      npm_global_prefix = npm_global_base .. selected_suffix
+    end
 
     vim.fn.mkdir(npm_global_prefix, "p")
+    vim.env.MSK_NPM_GLOBAL_ROOT = npm_global_prefix
     vim.env.NPM_CONFIG_PREFIX = npm_global_prefix
     prepend_path(npm_global_prefix .. "/bin")
   end
