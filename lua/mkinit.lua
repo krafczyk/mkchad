@@ -105,7 +105,7 @@ do
     )
     local selected_suffix = "/" .. node_global_key
     local npm_global_prefix = npm_global_base
-    if npm_global_base:sub(-#selected_suffix) ~= selected_suffix then
+    if not vim.endswith(npm_global_base, selected_suffix) then
       npm_global_prefix = npm_global_base .. selected_suffix
     end
 
