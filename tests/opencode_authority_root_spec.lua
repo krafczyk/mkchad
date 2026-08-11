@@ -45,7 +45,7 @@ local function assert_refused(name, create, inspect)
     before.type == after.type and before.dev == after.dev and before.ino == after.ino,
     name .. " unsafe entry changed"
   )
-  inspect(after)
+  inspect(after, err)
 end
 
 assert_refused("pre-existing symlink", function()
@@ -67,8 +67,14 @@ end)
 assert_refused("unsafe mode", function()
   assert(vim.fn.mkdir(paths.root, "p", 493) ~= 0 or vim.uv.fs_stat(paths.root))
   assert(vim.uv.fs_chmod(paths.root, 493))
-end, function(entry)
+end, function(entry, err)
   assert(entry.type == "directory" and entry.mode % 512 == 493)
+  assert(
+    tostring(err):find("mode 0755", 1, true)
+      and tostring(err):find("mode 0700", 1, true)
+      and tostring(err):find(paths.root, 1, true),
+    "authority root error omitted the observed mode, required mode, or path: " .. tostring(err)
+  )
 end)
 
 -- A non-owner cannot create a wrong-EUID entry credential-free. Production

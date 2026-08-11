@@ -153,8 +153,28 @@ local function ensure_state_dir()
     end
   end
   local root = uv.fs_lstat(state_paths.root)
-  if not root or root.type ~= "directory" or root.uid ~= uv.getuid() or root.mode % 512 ~= 448 then
-    return nil, "OpenCode authority root ownership or mode is unsafe: " .. state_paths.root
+  if not root then
+    return nil, "OpenCode authority root is missing: " .. state_paths.root
+  end
+  if root.type ~= "directory" then
+    return nil, "OpenCode authority root must be a directory, not " .. root.type .. ": " .. state_paths.root
+  end
+  if root.uid ~= uv.getuid() then
+    return nil,
+      string.format(
+        "OpenCode authority root is owned by uid %d; expected uid %d: %s",
+        root.uid,
+        uv.getuid(),
+        state_paths.root
+      )
+  end
+  if root.mode % 512 ~= 448 then
+    return nil,
+      string.format(
+        "OpenCode authority root has mode %04o; expected mode 0700: %s. Repair it with chmod 700.",
+        root.mode % 512,
+        state_paths.root
+      )
   end
   state_paths.root_identity = { dev = root.dev, ino = root.ino }
   return state_paths
@@ -222,14 +242,24 @@ function test_hooks.acquire_deployment_lock(callback, deadline_ns)
   end
   local deployment_parent = vim.fs.dirname(state_paths.deployment_lock)
   local parent_stat = uv.fs_lstat(deployment_parent)
-  if
-    not parent_stat
-    or parent_stat.type ~= "directory"
-    or not uv.getuid
-    or parent_stat.uid ~= uv.getuid()
-    or parent_stat.mode % 512 ~= 448
-  then
-    callback(false, "OpenCode deployment lock parent is missing or unsafe: " .. deployment_parent)
+  if not parent_stat then
+    callback(false, "OpenCode deployment lock parent is missing; expected a current-user-owned directory with mode 0700: " .. deployment_parent)
+    return
+  end
+  if parent_stat.type ~= "directory" then
+    callback(false, "OpenCode deployment lock parent must be a directory, not " .. parent_stat.type .. ": " .. deployment_parent)
+    return
+  end
+  if not uv.getuid then
+    callback(false, "OpenCode deployment lock parent ownership cannot be verified: " .. deployment_parent)
+    return
+  end
+  if parent_stat.uid ~= uv.getuid() then
+    callback(false, string.format("OpenCode deployment lock parent is owned by uid %d; expected uid %d: %s", parent_stat.uid, uv.getuid(), deployment_parent))
+    return
+  end
+  if parent_stat.mode % 512 ~= 448 then
+    callback(false, string.format("OpenCode deployment lock parent has mode %04o; expected mode 0700: %s. Repair it with chmod 700.", parent_stat.mode % 512, deployment_parent))
     return
   end
   local existing = uv.fs_lstat(state_paths.deployment_lock)

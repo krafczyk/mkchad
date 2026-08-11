@@ -58,6 +58,19 @@ local function unlock(fd)
   assert(vim.uv.fs_close(fd))
 end
 
+local deployment_parent = vim.fs.dirname(paths.deployment_lock)
+assert(vim.fn.mkdir(deployment_parent, "p", 448) ~= 0 or vim.uv.fs_stat(deployment_parent))
+assert(vim.uv.fs_chmod(deployment_parent, 493))
+local acquired, acquire_err = await(lifecycle.acquire_lock, 3000)
+assert(not acquired, "permissive deployment lock parent was accepted")
+assert(
+  tostring(acquire_err):find("mode 0755", 1, true)
+    and tostring(acquire_err):find("mode 0700", 1, true)
+    and tostring(acquire_err):find(deployment_parent, 1, true),
+  "deployment lock error omitted the observed mode, required mode, or path: " .. tostring(acquire_err)
+)
+assert(vim.uv.fs_chmod(deployment_parent, 448))
+
 -- A deployment lock path must never redirect locking or chmod through a link.
 assert(
   vim.fn.mkdir(vim.fs.dirname(paths.deployment_lock), "p", 448) ~= 0
@@ -67,7 +80,7 @@ local symlink_target = paths.deployment_lock .. ".target"
 assert(vim.fn.writefile({ "unrelated" }, symlink_target) == 0)
 assert(vim.uv.fs_chmod(symlink_target, 420))
 assert(vim.uv.fs_symlink(symlink_target, paths.deployment_lock))
-local acquired, acquire_err = await(lifecycle.acquire_lock, 3000)
+acquired, acquire_err = await(lifecycle.acquire_lock, 3000)
 assert(not acquired and acquire_err:find("deployment lock path", 1, true), acquire_err)
 assert(vim.uv.fs_lstat(paths.deployment_lock).type == "link")
 assert(vim.uv.fs_stat(symlink_target).mode % 512 == 420, "deployment lock validation chmodded a link target")
