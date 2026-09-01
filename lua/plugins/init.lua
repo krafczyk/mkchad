@@ -11,6 +11,11 @@ return {
     "tpope/vim-commentary",
     lazy=false,
   },
+  {
+    "choplin/code-review.nvim",
+    event = "VeryLazy",
+    opts = {},
+  },
   -- {
   --   "jedrzejboczar/possession.nvim",
   --   lazy=false,
