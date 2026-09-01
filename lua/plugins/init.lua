@@ -14,7 +14,21 @@ return {
   {
     "choplin/code-review.nvim",
     event = "VeryLazy",
-    opts = {},
+    config = function()
+      local code_review = require "code-review"
+      code_review.setup()
+
+      vim.api.nvim_create_autocmd("User", {
+        pattern = "CodeReviewInputEnter",
+        callback = function(event)
+          local submit = code_review.get_input_buffer_functions(event.data.buf).submit
+          vim.keymap.set({ "i", "n" }, "<C-j>", submit, {
+            buffer = event.data.buf,
+            desc = "Submit review comment",
+          })
+        end,
+      })
+    end,
   },
   -- {
   --   "jedrzejboczar/possession.nvim",
