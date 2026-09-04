@@ -82,6 +82,12 @@ public final class MkChadTlsProxyTupleTest {
       throw new AssertionError("valid 12-column TIME_WAIT row was rejected");
     }
 
+    String finWait2 = shortRow(0, "1F02A8C0:CC87", "99BBCD6D:1090", "05", "0");
+    Files.writeString(tcp, TCP_HEADER + finWait2 + row(1, local, remote, "01", "4242"), StandardCharsets.US_ASCII);
+    if (!MkChadTlsProxy.findUniqueEstablishedInode(List.of(tcp, tcp6), local, remote).equals("4242")) {
+      throw new AssertionError("valid 12-column FIN_WAIT2 row was rejected");
+    }
+
     Files.writeString(tcp, TCP_HEADER + match, StandardCharsets.US_ASCII);
     Files.writeString(tcp6, "", StandardCharsets.US_ASCII);
     expectFailure(() -> MkChadTlsProxy.findUniqueEstablishedInode(List.of(tcp, tcp6), local, remote));

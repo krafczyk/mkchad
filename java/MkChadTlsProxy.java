@@ -1627,7 +1627,7 @@ public final class MkChadTlsProxy {
       throw new IOException("proc TCP table entry is malformed");
     }
     int state = Integer.parseInt(fields[3], 16);
-    int expectedFields = state == 3 || state == 6 ? 12 : 17;
+    int expectedFields = state == 3 || state == 5 || state == 6 ? 12 : 17;
     if (state < 1
         || state > 13
         || fields.length != expectedFields
