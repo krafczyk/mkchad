@@ -34,6 +34,7 @@ local function usage()
     "Usage: mkchad-opencode-server start [--json]",
     "       mkchad-opencode-server status [--json] [--host-evidence-v1 BASE64URL]",
     "       mkchad-opencode-server stop [--json]",
+    "       mkchad-opencode-server restart-broker [--json]",
     "       mkchad-opencode-server clear [--json]",
     "       mkchad-opencode-server kill [--json]",
     "       mkchad-opencode-server --help",
@@ -54,10 +55,11 @@ elseif
   command ~= "start"
   and command ~= "status"
   and command ~= "stop"
+  and command ~= "restart-broker"
   and command ~= "clear"
   and command ~= "kill"
 then
-  usage_error = "expected start, status, stop, clear, kill, or --help"
+  usage_error = "expected start, status, stop, restart-broker, clear, kill, or --help"
 else
   local index = 2
   while index <= #arguments do
@@ -203,6 +205,11 @@ local function finish(exit_code, ok, status, state, message, diagnostic_code, in
   vim.cmd(exit_code == 0 and "qa!" or "cquit " .. exit_code)
 end
 
+if command == "restart-broker" and vim.env.MKCHAD_PERSISTENT_INSTANCE ~= "1" then
+  finish(1, false, "blocked", nil, "Broker restart requires the managed persistent container instance")
+  return
+end
+
 local loaded, lifecycle = xpcall(function()
   return require "mkchad.opencode.lifecycle"
 end, function()
@@ -300,6 +307,15 @@ elseif command == "status" then
   end)
 elseif command == "stop" then
   lifecycle.stop(finish_inactive)
+elseif command == "restart-broker" then
+  lifecycle.restart_broker(function(ok, message, state)
+    local stable_state = result_state(state)
+    if ok and stable_state then
+      finish(0, true, "healthy", stable_state)
+    else
+      finish(1, false, "blocked", nil, message or "lifecycle returned an invalid state")
+    end
+  end)
 elseif command == "clear" then
   lifecycle.clear(finish_inactive)
 else

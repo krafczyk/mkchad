@@ -167,6 +167,10 @@ local source_replacement = paths.proxy_source .. ".new"
 vim.fn.writefile({ "final class MkChadTlsProxy { int replacement; }" }, source_replacement)
 assert(vim.uv.fs_rename(source_replacement, paths.proxy_source))
 assert(not lifecycle.process_identity_is_owned(proxy_record, lifecycle.current_boot_id()), "replaced Java source remained trusted")
+assert(
+  lifecycle.process_identity_is_owned(proxy_record, lifecycle.current_boot_id(), true),
+  "explicit broker replacement could not retain process identity after a source upgrade"
+)
 
 locked, lock_err = await(lifecycle.acquire_lock, 3000)
 assert(locked, lock_err)
@@ -176,6 +180,21 @@ end, 3000)
 lifecycle.release_lock()
 assert(not stopped and stop_err:find("Java proxy source identity", 1, true), stop_err)
 assert(vim.fn.jobwait({ second_job }, 0)[1] == -1, "proxy with unverifiable source was signaled")
+
+locked, lock_err = await(lifecycle.acquire_lock, 3000)
+assert(locked, lock_err)
+stopped, stop_err = await(function(done)
+  lifecycle.terminate_process(
+    proxy_record,
+    lifecycle.current_boot_id(),
+    vim.uv.hrtime() + 3000000000,
+    done,
+    true
+  )
+end, 5000)
+lifecycle.release_lock()
+assert(stopped, stop_err)
+assert(vim.fn.jobwait({ second_job }, 1000)[1] ~= -1, "explicit broker replacement retained the old process")
 
 for _, job in ipairs({ second_job, interpreted_job, replacement_job }) do
   if vim.fn.jobwait({ job }, 0)[1] == -1 then

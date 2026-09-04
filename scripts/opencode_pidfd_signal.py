@@ -93,8 +93,11 @@ def validate_after_pidfd_open(request: dict) -> tuple[int, int]:
         if not isinstance(executable, str) or not executable.startswith("/") or identity(executable) != launch:
             fail("managed launch executable identity changed")
 
+    allow_replaced_source = request.get("allow_replaced_source", False)
+    if not isinstance(allow_replaced_source, bool):
+        fail("invalid source replacement policy")
     source = process.get("source")
-    if source is not None:
+    if source is not None and not allow_replaced_source:
         source_identity = (process.get("source_dev"), process.get("source_ino"))
         if not isinstance(source, str) or not source.startswith("/") or identity(source) != source_identity:
             fail("managed source identity changed")

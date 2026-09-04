@@ -15,6 +15,7 @@ an ordinary shell to manage the shared detached service without opening MkChad:
 mkchad-opencode-server start [--json]
 mkchad-opencode-server status [--json]
 mkchad-opencode-server stop [--json]
+mkchad-opencode-server restart-broker [--json]
 mkchad-opencode-server clear [--json]
 mkchad-opencode-server kill [--json]
 ```
@@ -61,6 +62,19 @@ transport setting and is an idempotent success when no managed service is
 active. Usage errors exit `2`; refused or failed lifecycle operations exit `1`;
 completed operations, including observational unhealthy or blocked status, exit
 `0`.
+
+`restart-broker` replaces only an exactly verified schema-4 TLS broker while
+preserving the existing OpenCode backend PID, port, and process identity. It
+accepts either complete state or a control-ready/running pending generation,
+including a broker whose frozen Java source was replaced by a trusted
+deployment. Existing TLS streams disconnect during replacement, but direct
+backend clients and backend work continue. The public port is retained when it
+can be rebound and otherwise moves to a reported fallback, including when
+pre-upgrade connections still reserve the old port. The command publishes a new
+broker generation and returns success only after CA-pinned HTTPS health passes.
+It refuses direct HTTP, malformed or future authority, and any unverifiable
+backend without signaling that backend. Like detached `start`, it is refused
+outside the managed persistent container instance.
 
 Server `stop` leaves the idle runtime instance available for future MkChad and
 lifecycle commands. It never maps a successful server stop to `instance stop`,
@@ -181,10 +195,12 @@ unauthenticated `GET /global/health`, and proves the exact reverse established
 tuple's socket inode belongs to the recorded backend PID before reading or
 forwarding client HTTP bytes. It never reconnects a client stream. For schema-4
 TLS, a live broker with a dead backend is unhealthy and may be cleaned only by a
-committed broker stop; a dead broker with a live backend is blocked for manual
-operating-system accounting; both dead roles may be reconciled only after the
-recorded control inode is safely accounted for. Loss of the public broker drops
-existing streams. Status and reload remain observational and never restart it.
+committed broker stop; a dead broker with a live backend remains blocked for
+ordinary start and status, but an explicit `restart-broker` may adopt it after
+exact process and control accounting. Both dead roles may be reconciled only
+after the recorded control inode is safely accounted for. Loss or explicit
+restart of the public broker drops existing TLS streams. Status and reload remain
+observational and never restart it.
 
 MkChad reads optional server settings from
 `${XDG_CONFIG_HOME:-$HOME/.config}/mkchad/opencode-server.json` when the

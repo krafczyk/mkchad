@@ -52,6 +52,23 @@ local function row(index, family, row_port, inode, replacements)
   return table.concat(fields, " ") .. "\n"
 end
 
+local function short_row(index, state)
+  return table.concat({
+    tostring(index) .. ":",
+    "1F02A8C0:CC87",
+    "99BBCD6D:1090",
+    state,
+    "00000000:00000000",
+    "03:00000000",
+    "00000000",
+    "0",
+    "0",
+    "0",
+    "3",
+    "0000000000000000",
+  }, " ") .. "\n"
+end
+
 local function scan(tcp, tcp6)
   write(tcp_path, tcp)
   write(tcp6_path, tcp6)
@@ -67,6 +84,15 @@ assert(scan(table.concat(large), tcp6_header) == "4242", "a listener beyond the 
 
 local match = row(0, "tcp", port, 4242)
 assert(scan(tcp_header .. match, tcp6_header) == "4242")
+assert(
+  scan(tcp_header .. short_row(0, "05") .. row(1, "tcp", port, 4242), tcp6_header) == "4242",
+  "a valid short FIN_WAIT2 row blocked listener proof"
+)
+assert(
+  scan(tcp_header .. row(0, "tcp", port + 1, 0, { [4] = "05" }) .. row(1, "tcp", port, 4242), tcp6_header)
+    == "4242",
+  "a valid full FIN_WAIT2 row blocked listener proof"
+)
 assert(not scan(tcp_header .. match .. row(1, "tcp", port + 1, 5252, { [7] = "malformed" }), tcp6_header))
 assert(not scan(tcp_header .. row(0, "tcp", port, 4242, {
   [2] = "00000000000000000000000001000000:" .. string.format("%04X", port),

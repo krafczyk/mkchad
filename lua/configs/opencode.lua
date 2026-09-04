@@ -786,6 +786,11 @@ local function read_file(path)
   return data
 end
 
+function test_hooks.path_is_absent(path)
+  local stat, _, error_name = uv.fs_lstat(path)
+  return stat == nil and error_name == "ENOENT"
+end
+
 local function monotonic_ms()
   return math.floor(uv.hrtime() / 1000000)
 end
@@ -1034,43 +1039,50 @@ local function valid_role_relationships(state)
   end
   if state.schema == 4 then
     local broker = state.broker
-    return broker
-      and proxy.port ~= backend.port
-      and vim.deep_equal(proxy.argv, {
-        proxy.executable,
-        "--source",
-        "21",
-        proxy.source,
-        "--broker",
-        "--state-root",
-        paths().root,
-        "--control",
-        broker.control_path,
-        "--generation",
-        state.generation,
-        "--boot-id",
-        state.boot_id,
-        "--backend-executable",
-        backend.executable,
-        "--backend-version",
-        backend.local_version,
-        "--backend-port",
-        tostring(backend.port),
-        "--listen-port",
-        tostring(proxy.port),
-        "--keystore",
-        paths().server_store,
-        "--password-file",
-        paths().password,
-        "--max-connections",
-        tostring(proxy_max_connections),
-        "--backend-log",
-        paths().log,
-        "--pidfd-python",
-        paths().pidfd_python,
-        "--pidfd-helper",
-        paths().pidfd_helper,
+    local expected = {
+      proxy.executable,
+      "--source",
+      "21",
+      proxy.source,
+      "--broker",
+      "--state-root",
+      paths().root,
+      "--control",
+      broker.control_path,
+      "--generation",
+      state.generation,
+      "--boot-id",
+      state.boot_id,
+      "--backend-executable",
+      backend.executable,
+      "--backend-version",
+      backend.local_version,
+      "--backend-port",
+      tostring(backend.port),
+      "--listen-port",
+      tostring(proxy.port),
+      "--keystore",
+      paths().server_store,
+      "--password-file",
+      paths().password,
+      "--max-connections",
+      tostring(proxy_max_connections),
+      "--backend-log",
+      paths().log,
+      "--pidfd-python",
+      paths().pidfd_python,
+      "--pidfd-helper",
+      paths().pidfd_helper,
+    }
+    if argv_option(proxy.argv, "--adopt-backend-pid") then
+      vim.list_extend(expected, {
+        "--adopt-backend-pid",
+        tostring(backend.pid),
+        "--adopt-backend-start",
+        backend.start_time,
       })
+    end
+    return broker and proxy.port ~= backend.port and vim.deep_equal(proxy.argv, expected)
   end
   return proxy.port ~= backend.port
     and #proxy.argv == 20
@@ -1130,6 +1142,11 @@ local function valid_pending(pending)
     end
     if pending.phase == "control-ready" then
       return pending.backend == nil
+        or (
+          argv_option(pending.proxy.argv, "--adopt-backend-pid") ~= nil
+          and valid_process_record(pending.backend, "backend")
+          and valid_role_relationships(pending)
+        )
     end
     return pending.phase == "running"
       and valid_process_record(pending.backend, "backend")
@@ -1651,7 +1668,8 @@ local function valid_proc_tcp_row(fields, family)
     return false
   end
   local state = tonumber(fields[4], 16)
-  local expected_fields = (state == 3 or state == 6) and 12 or 17
+  local short_entry = state == 3 or state == 6 or (state == 5 and #fields == 12)
+  local expected_fields = short_entry and 12 or 17
   if
     not state
     or state < 1
@@ -1789,7 +1807,7 @@ local function process_listens_on_port(pid, port)
   return false
 end
 
-local function process_identity_is_owned(process, boot_id)
+local function process_identity_is_owned(process, boot_id, allow_replaced_source)
   if not process or type(process.pid) ~= "number" or process.pid <= 0 then
     return false, "invalid managed PID"
   end
@@ -1822,7 +1840,7 @@ local function process_identity_is_owned(process, boot_id)
       return false, "interpreted launch executable identity does not match"
     end
   end
-  if process.source then
+  if process.source and not allow_replaced_source then
     local source = file_identity(process.source)
     if not source or source.dev ~= process.source_dev or source.ino ~= process.source_ino then
       return false, "Java proxy source identity does not match"
@@ -1897,7 +1915,7 @@ end
 
 local renew_lock
 
-local function signal_process(process, boot_id, requested_signal, deadline_ns, callback)
+local function signal_process(process, boot_id, requested_signal, deadline_ns, callback, allow_replaced_source)
   local fenced, fence_err = require_fence "managed process signal"
   if not fenced then
     callback(false, fence_err)
@@ -1911,7 +1929,7 @@ local function signal_process(process, boot_id, requested_signal, deadline_ns, c
     )
     return
   end
-  local owned, reason = process_identity_is_owned(process, boot_id)
+  local owned, reason = process_identity_is_owned(process, boot_id, allow_replaced_source)
   if not owned then
     callback(false, reason)
     return
@@ -1928,6 +1946,7 @@ local function signal_process(process, boot_id, requested_signal, deadline_ns, c
     boot_id = boot_id,
     signal = signal_name,
     process = process,
+    allow_replaced_source = allow_replaced_source or nil,
   }
   local hook = vim.g.mkchad_opencode_test_api and test_hooks.signal or nil
   if hook then
@@ -1953,8 +1972,8 @@ local function signal_process(process, boot_id, requested_signal, deadline_ns, c
   end)
 end
 
-local function terminate_process(process, boot_id, deadline_ns, callback)
-  local owned, reason = process_identity_is_owned(process, boot_id)
+local function terminate_process(process, boot_id, deadline_ns, callback, allow_replaced_source)
+  local owned, reason = process_identity_is_owned(process, boot_id, allow_replaced_source)
   if not owned then
     callback(not process or not pid_is_live(process.pid), reason)
     return
@@ -1984,7 +2003,7 @@ local function terminate_process(process, boot_id, deadline_ns, callback)
             end
             escalated = true
             vim.defer_fn(wait_for_exit, health_interval_ms)
-          end)
+          end, allow_replaced_source)
           return
         end
       elseif now >= deadline_ns and escalated then
@@ -1997,7 +2016,7 @@ local function terminate_process(process, boot_id, deadline_ns, callback)
       vim.defer_fn(wait_for_exit, health_interval_ms)
     end
     wait_for_exit()
-  end)
+  end, allow_replaced_source)
 end
 
 local lock_claim
@@ -3099,6 +3118,50 @@ function test_hooks.reclaim_dead_schema4_control_while_locked(state)
   return true
 end
 
+function test_hooks.remove_unclaimed_control_while_locked(records)
+  local owned, ownership_err = require_lock_ownership "unclaimed schema-4 control reconciliation"
+  if not owned then
+    return nil, ownership_err
+  end
+  local root_identity, root_err = test_hooks.read_authority_root()
+  if not root_identity then
+    return nil, root_err
+  end
+  local control = private_socket_identity(paths().control, root_identity)
+  if not control then
+    if not uv.fs_lstat(paths().control) then
+      return true
+    end
+    return nil, "control path is unsafe or not a socket"
+  end
+  for _, record in ipairs(records) do
+    if
+      record
+      and record.broker
+      and record.broker.control_dev == control.dev
+      and record.broker.control_ino == control.ino
+    then
+      return true
+    end
+  end
+  local quarantine = paths().control_quarantine
+  if uv.fs_lstat(quarantine) then
+    return nil, "schema-4 stale control quarantine requires manual inspection"
+  end
+  if not uv.fs_rename(paths().control, quarantine) then
+    return nil, "unable to quarantine the unclaimed schema-4 control socket"
+  end
+  local moved = private_socket_identity(quarantine, root_identity)
+  if not moved or moved.dev ~= control.dev or moved.ino ~= control.ino then
+    return nil, "unclaimed schema-4 control changed while being quarantined"
+  end
+  local removed, remove_err = uv.fs_unlink(quarantine)
+  if not removed then
+    return nil, "unable to remove the quarantined schema-4 control socket: " .. (remove_err or "unknown error")
+  end
+  return true
+end
+
 local function strict_json_objects(value)
   local index, length = 1, #value
   local function whitespace()
@@ -3440,6 +3503,7 @@ local function write_pending(pending)
   end
   if vim.g.mkchad_opencode_test_api and is_integer(vim.g.mkchad_opencode_test_fail_pending_write_after, 1, 100) then
     if vim.g.mkchad_opencode_test_fail_pending_write_after == 1 then
+      vim.g.mkchad_opencode_test_fail_pending_write_after = nil
       return nil, "injected pending write failure"
     end
     vim.g.mkchad_opencode_test_fail_pending_write_after = vim.g.mkchad_opencode_test_fail_pending_write_after - 1
@@ -3513,6 +3577,8 @@ local function valid_broker_launch_intent(intent)
       version = true,
       port = true,
       log = true,
+      pid = "optional",
+      start_time = "optional",
     })
     or intent.backend.role ~= "backend"
     or not absolute_path(intent.backend.executable)
@@ -3522,6 +3588,9 @@ local function valid_broker_launch_intent(intent)
     or not is_integer(intent.backend.port, 1, 65535)
     or intent.backend.port == intent.public.port
     or intent.backend.log ~= paths().log
+    or ((intent.backend.pid == nil) ~= (intent.backend.start_time == nil))
+    or (intent.backend.pid ~= nil and not is_integer(intent.backend.pid, 1, 4194304))
+    or (intent.backend.start_time ~= nil and not decimal_identity(intent.backend.start_time, false))
     or not has_only_fields(intent.proxy, {
       role = true,
       port = true,
@@ -3549,7 +3618,7 @@ local function valid_broker_launch_intent(intent)
   then
     return false
   end
-  return vim.deep_equal(intent.proxy.argv, {
+  local expected = {
     intent.proxy.executable,
     "--source",
     "21",
@@ -3583,7 +3652,16 @@ local function valid_broker_launch_intent(intent)
     paths().pidfd_python,
     "--pidfd-helper",
     paths().pidfd_helper,
-  })
+  }
+  if intent.backend.pid then
+    vim.list_extend(expected, {
+      "--adopt-backend-pid",
+      tostring(intent.backend.pid),
+      "--adopt-backend-start",
+      intent.backend.start_time,
+    })
+  end
+  return vim.deep_equal(intent.proxy.argv, expected)
 end
 
 local function valid_launch_intent(intent)
@@ -3625,6 +3703,13 @@ local function write_launch_intent(intent)
   local owned, ownership_err = require_lock_ownership("launch intent " .. intent.generation .. " write")
   if not owned then
     return nil, ownership_err
+  end
+  if vim.g.mkchad_opencode_test_api and is_integer(vim.g.mkchad_opencode_test_fail_launch_write_after, 1, 100) then
+    if vim.g.mkchad_opencode_test_fail_launch_write_after == 1 then
+      vim.g.mkchad_opencode_test_fail_launch_write_after = nil
+      return nil, "injected launch intent write failure"
+    end
+    vim.g.mkchad_opencode_test_fail_launch_write_after = vim.g.mkchad_opencode_test_fail_launch_write_after - 1
   end
   local temporary = paths().launch .. "." .. random_token() .. ".tmp"
   local wrote, write_err = write_private(temporary, vim.json.encode(intent), true)
@@ -4161,6 +4246,10 @@ local function remove_matching_pending_while_locked(generation, action)
   if not pending then
     return nil, pending_err
   end
+  if vim.g.mkchad_opencode_test_api and vim.g.mkchad_opencode_test_fail_pending_remove then
+    vim.g.mkchad_opencode_test_fail_pending_remove = nil
+    return nil, "injected pending metadata removal failure"
+  end
   run_test_hook "pending_remove"
   local removed, remove_err = uv.fs_unlink(paths().pending)
   if not removed then
@@ -4185,6 +4274,15 @@ local function cleanup_pending(deadline_ns, callback)
     return
   end
   if pending.schema == 4 then
+    if
+      pending.phase == "control-ready"
+      and pending.backend
+      and pid_is_live(pending.backend.pid)
+      and argv_option(pending.proxy.argv, "--adopt-backend-pid")
+    then
+      callback(false, "Adopted pending authority requires mkchad-opencode-server restart-broker")
+      return
+    end
     test_hooks.stop_schema4(pending, deadline_ns, function(stopped, stop_err)
       if not stopped then
         callback(false, stop_err)
@@ -4457,7 +4555,7 @@ local function spawn_direct(previous, deadline_ns, callback, excluded_public)
   end)
 end
 
-local function spawn_broker_pair(previous, deadline_ns, callback, excluded_public, excluded_internal)
+local function spawn_broker_pair(previous, deadline_ns, callback, excluded_public, excluded_internal, adopted)
   local state_paths, root_err = ensure_state_dir()
   if not state_paths then
     return callback(nil, root_err)
@@ -4482,17 +4580,39 @@ local function spawn_broker_pair(previous, deadline_ns, callback, excluded_publi
       if not backend_executable or not proxy_executable or not proxy_source then
         return callback(nil, "Unable to record broker launch identities")
       end
-      local public_port, source, public_err = select_port(previous, excluded_public)
-      local internal_port, internal_err =
-        public_port and select_internal_port(public_port, excluded_internal) or nil, nil
-      if public_port then
-        internal_port, internal_err = select_internal_port(public_port, excluded_internal)
+      if
+        adopted
+        and (
+          executable ~= adopted.backend.executable
+          or version ~= adopted.backend.local_version
+          or backend_executable.dev ~= adopted.backend.executable_dev
+          or backend_executable.ino ~= adopted.backend.executable_ino
+        )
+      then
+        return callback(nil, "Adopted backend differs from the selected OpenCode executable")
       end
-      if not public_port or not internal_port then
+      local public_port, source, public_err
+      local internal_port, internal_err
+      if adopted then
+        local previous_public_port = adopted.port or adopted.proxy.port
+        public_port = previous_public_port
+        internal_port = adopted.backend.port
+        source = adopted.port_source or "persisted"
+        if not port_is_available(public_port) then
+          public_port, public_err = select_internal_port(internal_port, { [previous_public_port] = true })
+          source = "fallback"
+        end
+      else
+        public_port, source, public_err = select_port(previous, excluded_public)
+        if public_port then
+          internal_port, internal_err = select_internal_port(public_port, excluded_internal)
+        end
+      end
+      if public_err or internal_err or not public_port or not internal_port then
         return callback(nil, public_err or internal_err)
       end
       local boot_id, generation = current_boot_id(), random_token()
-      if not boot_id then
+      if not boot_id or (adopted and boot_id ~= adopted.boot_id) then
         return callback(nil, "Unable to read the host boot identity")
       end
       local arguments = {
@@ -4529,6 +4649,14 @@ local function spawn_broker_pair(previous, deadline_ns, callback, excluded_publi
         "--pidfd-helper",
         state_paths.pidfd_helper,
       }
+      if adopted then
+        vim.list_extend(arguments, {
+          "--adopt-backend-pid",
+          tostring(adopted.backend.pid),
+          "--adopt-backend-start",
+          adopted.backend.start_time,
+        })
+      end
       local intent = {
         schema = 2,
         transport = "tls-proxy",
@@ -4557,6 +4685,8 @@ local function spawn_broker_pair(previous, deadline_ns, callback, excluded_publi
           version = version,
           port = internal_port,
           log = state_paths.log,
+          pid = adopted and adopted.backend.pid or nil,
+          start_time = adopted and adopted.backend.start_time or nil,
         },
       }
       local intent_ok, intent_err = write_launch_intent(intent)
@@ -4575,7 +4705,17 @@ local function spawn_broker_pair(previous, deadline_ns, callback, excluded_publi
       end
       intent.proxy.pid = proxy_pid
       if not write_launch_intent(intent) then
-        return callback(nil, "Broker launch intent could not record its PID")
+        local launched = capture_process(proxy_pid, {
+          port = public_port,
+          executable = java21,
+          executable_dev = proxy_executable.dev,
+          executable_ino = proxy_executable.ino,
+          source = state_paths.proxy_source,
+          source_dev = proxy_source.dev,
+          source_ino = proxy_source.ino,
+          log = state_paths.proxy_log,
+        })
+        return callback(nil, "Broker launch intent could not record its PID", nil, nil, launched)
       end
       vim.defer_fn(function()
         local control = private_socket_identity(state_paths.control, root_identity)
@@ -4620,10 +4760,11 @@ local function spawn_broker_pair(previous, deadline_ns, callback, excluded_publi
               boot_id = boot_id,
               proxy = proxy,
               broker = broker,
+              backend = adopted and vim.deepcopy(adopted.backend) or nil,
             }
             local pending_ok, pending_err = write_pending(pending)
             if not pending_ok then
-              return callback(nil, "Unable to publish control-ready broker state: " .. pending_err)
+                  return callback(nil, "Unable to publish control-ready broker state: " .. pending_err, nil, nil, proxy)
             end
             broker_exchange(
               state_paths.control,
@@ -4632,12 +4773,21 @@ local function spawn_broker_pair(previous, deadline_ns, callback, excluded_publi
               root_identity,
               control,
               function(activated, activation_err)
-                if not activated or activated.phase ~= "running" or type(activated.backend) ~= "table" then
+                if
+                  not activated
+                  or activated.phase ~= "running"
+                  or type(activated.backend) ~= "table"
+                  or (adopted and not test_hooks.broker_receipt_matches_backend(activated, adopted.backend))
+                then
+                  local message = "Broker activation failed: "
+                    .. (activation_err or "backend evidence unavailable")
+                  if adopted then
+                    return callback(nil, message)
+                  end
                   return cleanup_failed_pair(pending, deadline_ns, function(cleaned, cleanup_err)
                     callback(
                       nil,
-                      "Broker activation failed: "
-                        .. (activation_err or "backend evidence unavailable")
+                      message
                         .. (cleanup_err and "; broker cleanup failed: " .. cleanup_err or ""),
                       cleaned and public_port or nil,
                       cleaned and internal_port or nil
@@ -4663,8 +4813,8 @@ local function spawn_broker_pair(previous, deadline_ns, callback, excluded_publi
                   port = public_port,
                   url = ("https://%s:%d"):format(host, public_port),
                   port_source = source,
-                  started_at = iso_now(),
-                  cwd = vim.env.HOME or vim.fn.expand "~",
+                  started_at = adopted and adopted.started_at or iso_now(),
+                  cwd = adopted and adopted.cwd or vim.env.HOME or vim.fn.expand "~",
                   boot_id = boot_id,
                   ca_path = state_paths.ca,
                   certificate_identity = certificate,
@@ -4921,6 +5071,16 @@ local function ensure_backend(callback, attach_tui)
         else
           launch(locked_state)
         end
+      end
+      local interrupted_pending = read_pending()
+      if
+        interrupted_pending
+        and interrupted_pending.schema == 4
+        and argv_option(interrupted_pending.proxy.argv, "--adopt-backend-pid")
+      then
+        release_lock()
+        finish_ensure(false, "An adopted broker restart is incomplete; run mkchad-opencode-server restart-broker")
+        return
       end
       cleanup_pending(deadline_ns, function(cleaned, cleanup_err)
         if not cleaned then
@@ -5242,6 +5402,343 @@ local function show_local_tui(toggle)
         local_tui.term:show()
       end
     end)
+  end)
+end
+
+function test_hooks.restart_broker(callback)
+  local deadline_ns = uv.hrtime() + startup_timeout_ms * 1000000
+  acquire_lock(function(locked, lock_err)
+    if not locked then
+      callback(false, lock_err)
+      return
+    end
+    local function finish(ok, err, state)
+      release_lock()
+      callback(ok, err, state)
+    end
+    local state, state_status = read_state()
+    local pending, pending_status = read_pending()
+    local intent, intent_status = read_launch_intent()
+    if
+      intent
+      and intent.schema == 2
+      and (state_status == "valid" or state_status == "missing")
+      and (pending_status == "valid" or pending_status == nil)
+      and (state ~= nil or test_hooks.path_is_absent(paths().state))
+      and (pending ~= nil or test_hooks.path_is_absent(paths().pending))
+      and not launch_intent_is_covered(intent, pending)
+      and (not intent.proxy.pid or not pid_is_live(intent.proxy.pid))
+    then
+      local reconciled, reconcile_err = test_hooks.remove_unclaimed_control_while_locked({ state, pending })
+      if not reconciled then
+        finish(false, "Unable to reconcile a dead replacement control authority: " .. reconcile_err)
+        return
+      end
+      local removed, remove_err = remove_matching_launch_intent(intent.generation)
+      if not removed then
+        finish(false, "Unable to reconcile a dead replacement launch intent: " .. (remove_err or "unknown error"))
+        return
+      end
+      intent, intent_status = nil, "missing"
+    end
+    local source
+    local restore_state, restore_pending, restore_intent
+    if
+      state
+      and state.schema == 4
+      and state_transport(state) == "tls-proxy"
+      and pending
+      and pending.schema == 4
+      and (pending.phase == "control-ready" or pending.phase == "running")
+      and (launch_intent_is_covered(intent, pending) or intent_status == "missing")
+      and argv_option(pending.proxy.argv, "--adopt-backend-pid")
+      and (
+        (
+          pending.backend
+          and test_hooks.broker_receipt_matches_backend({ phase = "running", backend = pending.backend }, state.backend)
+        )
+        or (
+          launch_intent_is_covered(intent, pending)
+          and intent.backend.pid == state.backend.pid
+          and intent.backend.start_time == state.backend.start_time
+        )
+      )
+    then
+      source = vim.deepcopy(pending)
+      source.backend = vim.deepcopy(state.backend)
+      source.started_at = state.started_at
+      source.cwd = state.cwd
+      source.port_source = state.port_source
+      source.certificate_identity = state.certificate_identity
+      restore_state = vim.deepcopy(state)
+      restore_pending, restore_intent = vim.deepcopy(pending), vim.deepcopy(intent)
+    elseif state then
+      if state.schema ~= 4 or state_transport(state) ~= "tls-proxy" then
+        finish(false, "Broker restart requires an active schema-4 TLS broker")
+        return
+      end
+      if pending or pending_status or intent or intent_status ~= "missing" then
+        finish(false, "Broker restart requires one complete generation without provisional authority")
+        return
+      end
+      source = state
+      restore_state = vim.deepcopy(state)
+    elseif
+      state_status == "missing"
+      and pending
+      and pending.schema == 4
+      and (pending.phase == "control-ready" or pending.phase == "running")
+      and pending.backend
+      and (launch_intent_is_covered(intent, pending) or intent_status == "missing")
+    then
+      source = pending
+      restore_pending = vim.deepcopy(pending)
+      restore_intent = intent and vim.deepcopy(intent) or nil
+    else
+      local detail = state_status ~= "missing" and state_status
+        or pending_status
+        or intent_status ~= "missing" and intent_status
+        or "inactive"
+      finish(false, "Broker restart requires a complete or running-pending schema-4 generation (" .. detail .. ")")
+      return
+    end
+
+    local certificate = certificate_identity(paths())
+    local backend_owned, backend_err = process_identity_is_owned(source.backend, source.boot_id)
+    local backend_listening = backend_owned and process_listens_on_port(source.backend.pid, source.backend.port)
+    local backend_problem = not certificate and "certificate unavailable"
+      or source.certificate_identity and certificate ~= source.certificate_identity and "certificate identity changed"
+      or not backend_owned and backend_err
+      or not backend_listening and "backend listener unavailable"
+    if
+      backend_problem
+    then
+      if restore_pending and not pid_is_live(source.backend.pid) then
+        cleanup_pending(uv.hrtime() + subprocess_timeout_ms * 1000000, function(cleaned, cleanup_err)
+          if not cleaned then
+            finish(false, "Broker restart backend is unavailable and provisional cleanup failed: " .. cleanup_err)
+            return
+          end
+          if restore_state then
+            local removed, remove_err = remove_matching_state_while_locked(
+              restore_state.generation,
+              "dead backend complete-state reconciliation"
+            )
+            if not removed then
+              finish(false, "Broker restart backend is unavailable and complete-state cleanup failed: " .. remove_err)
+              return
+            end
+          end
+          finish(false, "Broker restart cannot preserve the backend because it is no longer running")
+        end)
+        return
+      end
+      finish(false, "Broker restart cannot prove the existing backend and certificate: " .. backend_problem)
+      return
+    end
+    local root_identity, root_err = test_hooks.read_authority_root()
+    if not root_identity then
+      finish(false, root_err)
+      return
+    end
+    local control = private_socket_identity(source.broker.control_path, root_identity)
+    if
+      control
+      and (control.dev ~= source.broker.control_dev or control.ino ~= source.broker.control_ino)
+    then
+      finish(false, "Broker restart refuses a changed control authority")
+      return
+    end
+
+    local adopted = vim.deepcopy(source)
+    adopted.host = host
+    adopted.port = source.port or source.proxy.port
+    adopted.url = ("https://%s:%d"):format(host, adopted.port)
+    adopted.port_source = source.port_source or "persisted"
+    adopted.started_at = source.started_at or iso_now()
+    adopted.cwd = source.cwd or vim.env.HOME or vim.fn.expand "~"
+    adopted.ca_path = paths().ca
+    adopted.certificate_identity = certificate
+
+    local function restore_after_failure(message, launched_process)
+      local cleanup_deadline_ns = uv.hrtime() + subprocess_timeout_ms * 1000000
+      local function restore_original_metadata()
+        if restore_state then
+          local restored, restore_err = write_state_while_locked(restore_state, "failed broker restart rollback")
+          if not restored then
+            finish(false, message .. "; original state restoration failed: " .. restore_err)
+            return
+          end
+        end
+        if restore_pending then
+          local pending_ok, pending_err = write_pending(restore_pending)
+          local intent_ok, intent_err = true, nil
+          if pending_ok and restore_intent then
+            intent_ok, intent_err = write_launch_intent(restore_intent)
+          end
+          if not pending_ok or not intent_ok then
+            finish(false, message .. "; original pending authority restoration failed: " .. (pending_err or intent_err))
+            return
+          end
+        end
+        finish(false, message)
+      end
+      local replacement = read_pending()
+      if replacement and replacement.generation ~= source.generation then
+        local function remove_replacement_metadata()
+          local replacement_control = private_socket_identity(replacement.broker.control_path, root_identity)
+          if replacement_control then
+            if
+              replacement_control.dev ~= replacement.broker.control_dev
+              or replacement_control.ino ~= replacement.broker.control_ino
+            then
+              finish(false, message .. "; replacement control authority changed")
+              return
+            end
+            local control_removed, control_remove_err = uv.fs_unlink(replacement.broker.control_path)
+            if not control_removed then
+              finish(
+                false,
+                message .. "; replacement control cleanup failed: " .. (control_remove_err or "unknown error")
+              )
+              return
+            end
+          end
+          local removed, remove_err = remove_matching_pending_while_locked(
+            replacement.generation,
+            "failed replacement pending removal"
+          )
+          if not removed then
+            finish(false, message .. "; replacement cleanup failed: " .. remove_err)
+            return
+          end
+          local replacement_intent = read_launch_intent()
+          if replacement_intent and replacement_intent.generation == replacement.generation then
+            local intent_removed, intent_remove_err = remove_matching_launch_intent(replacement.generation)
+            if not intent_removed then
+              finish(false, message .. "; replacement intent cleanup failed: " .. intent_remove_err)
+              return
+            end
+          end
+          restore_original_metadata()
+        end
+        if pid_is_live(replacement.proxy.pid) then
+          terminate_process(replacement.proxy, replacement.boot_id, cleanup_deadline_ns, function(stopped, stop_err)
+            if not stopped then
+              finish(false, message .. "; replacement broker cleanup failed: " .. (stop_err or "unknown error"))
+              return
+            end
+            remove_replacement_metadata()
+          end)
+        else
+          remove_replacement_metadata()
+        end
+        return
+      end
+
+      local replacement_intent = read_launch_intent()
+      local has_replacement_intent = replacement_intent and replacement_intent.generation ~= source.generation
+      local launched = launched_process
+      if not launched and has_replacement_intent and replacement_intent.proxy.pid then
+        launched = capture_process(replacement_intent.proxy.pid, {
+          port = replacement_intent.proxy.port,
+          executable = replacement_intent.proxy.executable,
+          executable_dev = replacement_intent.proxy.executable_dev,
+          executable_ino = replacement_intent.proxy.executable_ino,
+          source = replacement_intent.proxy.source,
+          source_dev = replacement_intent.proxy.source_dev,
+          source_ino = replacement_intent.proxy.source_ino,
+          log = replacement_intent.proxy.log,
+        })
+      end
+      local function remove_replacement_intent()
+        local stale_control = private_socket_identity(paths().control, root_identity)
+        if stale_control then
+          local control_removed, control_remove_err = uv.fs_unlink(paths().control)
+          if not control_removed then
+            finish(
+              false,
+              message .. "; replacement control cleanup failed: " .. (control_remove_err or "unknown error")
+            )
+            return
+          end
+        end
+        if has_replacement_intent then
+          local removed, remove_err = remove_matching_launch_intent(replacement_intent.generation)
+          if not removed then
+            finish(false, message .. "; replacement intent cleanup failed: " .. remove_err)
+            return
+          end
+        end
+        restore_original_metadata()
+      end
+      if launched and pid_is_live(launched.pid) then
+        terminate_process(launched, source.boot_id, cleanup_deadline_ns, function(stopped, stop_err)
+          if not stopped then
+            finish(false, message .. "; uncommitted replacement broker remains live: " .. (stop_err or "unknown error"))
+            return
+          end
+          remove_replacement_intent()
+        end)
+      elseif
+        has_replacement_intent
+        and replacement_intent.proxy.pid
+        and pid_is_live(replacement_intent.proxy.pid)
+      then
+        finish(false, message .. "; replacement broker identity is unavailable and its intent remains authoritative")
+      else
+        remove_replacement_intent()
+      end
+    end
+
+    local function launch_replacement()
+      local still_owned, still_err = process_identity_is_owned(source.backend, source.boot_id)
+      if not still_owned or not process_listens_on_port(source.backend.pid, source.backend.port) then
+        finish(false, "Broker stopped but backend adoption proof failed: " .. (still_err or "listener unavailable"))
+        return
+      end
+      if control then
+        local current_control = private_socket_identity(source.broker.control_path, root_identity)
+        if
+          not current_control
+          or current_control.dev ~= control.dev
+          or current_control.ino ~= control.ino
+          or not authority_root_is_stable(root_identity)
+        then
+          finish(false, "Broker stopped but its control authority changed")
+          return
+        end
+        local removed, remove_err = uv.fs_unlink(source.broker.control_path)
+        if not removed then
+          finish(false, "Unable to remove the stopped broker control socket: " .. (remove_err or "unknown error"))
+          return
+        end
+      end
+      spawn_broker_pair(nil, deadline_ns, function(restarted, restart_err, _, _, launched_process)
+        if restarted then
+          finish(true, nil, restarted)
+        else
+          restore_after_failure("Broker replacement failed: " .. (restart_err or "unknown error"), launched_process)
+        end
+      end, nil, nil, adopted)
+    end
+
+    if not pid_is_live(source.proxy.pid) then
+      launch_replacement()
+      return
+    end
+    local broker_owned, broker_err = process_identity_is_owned(source.proxy, source.boot_id, true)
+    if not broker_owned then
+      finish(false, "Broker restart refuses to signal an unverifiable broker: " .. broker_err)
+      return
+    end
+    terminate_process(source.proxy, source.boot_id, deadline_ns, function(stopped, stop_err)
+      if not stopped then
+        finish(false, "Unable to stop only the recorded broker: " .. (stop_err or "unknown error"))
+        return
+      end
+      launch_replacement()
+    end, true)
   end)
 end
 
@@ -6514,6 +7011,7 @@ if vim.g.mkchad_opencode_test_api then
     reload_current_directory = reload_current_directory,
     show_info = show_info,
     stop_shared_server = stop_shared_server,
+    restart_broker = test_hooks.restart_broker,
     ensure_server = ensure_server,
     observe_server = observe_server,
     projection = test_hooks.inventory_projection,
@@ -6537,6 +7035,7 @@ return {
   ensure = ensure_server,
   status = observe_server,
   stop = stop_server,
+  restart_broker = test_hooks.restart_broker,
   clear = test_hooks.clear_server,
   kill = test_hooks.kill_server,
   paths = paths,

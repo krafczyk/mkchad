@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Broker stop ordering and pidfd-helper failure integration coverage."""
 
+import atexit
 import json
 import os
 from pathlib import Path
@@ -21,28 +22,31 @@ BASE = Path(os.environ["MKCHAD_TEST_ROOT"])
 
 
 BACKEND = r'''#!/usr/bin/env python3
-import os, signal, socket, sys, time
+import os, signal, socket, sys, threading, time
 port = int(sys.argv[sys.argv.index("--port") + 1])
 marker = os.environ.get("MKCHAD_BROKER_BACKEND_PID_MARKER")
 if marker: open(marker, "w").write(str(os.getpid()))
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
 sock = socket.socket(); sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 sock.bind(("127.0.0.1", port)); sock.listen(32)
+def handle(client):
+    with client:
+        while True:
+            raw = b""
+            while b"\r\n\r\n" not in raw:
+                part = client.recv(4096)
+                if not part: break
+                raw += part
+            if not raw: break
+            target = raw.split(b" ", 2)[1]
+            if target == b"/event":
+                client.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: keep-alive\r\n\r\nserver.connected")
+                time.sleep(30)
+                break
+            client.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok")
 while True:
     client, _ = sock.accept()
-    with client:
-        raw = b""
-        while b"\r\n\r\n" not in raw:
-            part = client.recv(4096)
-            if not part: break
-            raw += part
-        if not raw: continue
-        target = raw.split(b" ", 2)[1]
-        if target == b"/event":
-            client.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: keep-alive\r\n\r\nserver.connected")
-            time.sleep(30)
-        else:
-            client.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok")
+    threading.Thread(target=handle, args=(client,), daemon=True).start()
 '''
 
 HELPER = r'''
@@ -201,6 +205,120 @@ def cleanup_broker(process: subprocess.Popen, root: Path, backend_pid: int) -> N
         pass
 
 
+def adoption_case(root: Path) -> None:
+    process, control, generation, ca, _ = start_broker(root, "kill")
+    running = exchange(control, "status", generation)
+    assert running and running["phase"] == "running"
+    backend_pid = running["backend"]["pid"]
+    brokers = [process]
+    sockets: list[socket.socket] = []
+
+    def cleanup() -> None:
+        for resource in sockets:
+            resource.close()
+        for broker in brokers:
+            if broker.poll() is None:
+                broker.kill()
+                broker.wait(5)
+        try:
+            os.kill(backend_pid, 9)
+        except ProcessLookupError:
+            pass
+
+    atexit.register(cleanup)
+    original_command = list(process.args)
+    context = ssl.create_default_context(cafile=str(ca))
+    stale_raw = socket.create_connection(("127.0.0.1", running["proxy"]["port"]), timeout=5)
+    stale_tls = context.wrap_socket(stale_raw, server_hostname="127.0.0.1")
+    sockets.append(stale_tls)
+    stale_tls.sendall(b"GET /event HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n")
+    assert b"server.connected" in stale_tls.recv(1024)
+    process.terminate()
+    process.wait(5)
+    stale_tls.close()
+    control.unlink()
+
+    environment = os.environ | {
+        "MKCHAD_BROKER_HELPER_MODE": "kill",
+        "MKCHAD_BROKER_HELPER_MARKER": str(root / "helper.marker"),
+    }
+    bad_adoption = subprocess.Popen(
+        original_command
+        + ["--adopt-backend-pid", str(backend_pid), "--adopt-backend-start", "1"],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    brokers.append(bad_adoption)
+    wait_for(control.exists, "invalid adopting broker control socket")
+    refused = exchange(control, "activate", generation)
+    assert refused and refused["phase"] == "activation-failed", refused
+    assert Path(f"/proc/{backend_pid}").exists(), "failed adoption stopped the existing backend"
+    stopped_refusal = exchange(control, "stop", generation)
+    assert stopped_refusal and stopped_refusal["phase"] == "stopped"
+    bad_adoption.wait(5)
+
+    public_port = free_port()
+    occupied = socket.socket()
+    sockets.append(occupied)
+    occupied.bind(("127.0.0.1", public_port))
+    occupied.listen(1)
+    blocked_command = list(original_command)
+    blocked_command[blocked_command.index("--listen-port") + 1] = str(public_port)
+    blocked_adoption = subprocess.Popen(
+        blocked_command
+        + [
+            "--adopt-backend-pid", str(backend_pid),
+            "--adopt-backend-start", running["backend"]["start_time"],
+        ],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    brokers.append(blocked_adoption)
+    wait_for(control.exists, "blocked adopting broker control socket")
+    blocked = exchange(control, "activate", generation)
+    assert blocked and blocked["phase"] == "activation-failed", blocked
+    assert Path(f"/proc/{backend_pid}").exists(), "failed listener activation stopped the adopted backend"
+    stopped_blocked = exchange(control, "stop", generation)
+    assert stopped_blocked and stopped_blocked["phase"] == "stopped"
+    blocked_adoption.wait(5)
+    occupied.close()
+
+    adopted = subprocess.Popen(
+        original_command
+        + [
+            "--adopt-backend-pid", str(backend_pid),
+            "--adopt-backend-start", running["backend"]["start_time"],
+        ],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    brokers.append(adopted)
+    try:
+        wait_for(control.exists, "adopting broker control socket")
+        activation = exchange(control, "activate", generation)
+        assert activation and activation["phase"] == "running", activation
+        assert activation["backend"]["pid"] == backend_pid, "adoption replaced the backend"
+        assert activation["proxy"]["port"] == running["proxy"]["port"], "adoption changed the reusable public port"
+        with socket.create_connection(("127.0.0.1", activation["proxy"]["port"]), timeout=5) as raw:
+            with context.wrap_socket(raw, server_hostname="127.0.0.1") as client:
+                client.sendall(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                assert b"200 OK" in client.recv(1024), "adopted broker did not relay HTTPS"
+        stopped = exchange(control, "stop", generation)
+        assert stopped and stopped["phase"] == "stopped"
+        adopted.wait(5)
+        wait_for(lambda: not Path(f"/proc/{backend_pid}").exists(), "adopted backend stop")
+    finally:
+        cleanup_broker(adopted, root, backend_pid)
+        atexit.unregister(cleanup)
+        cleanup()
+
+
 def frozen_asset_case(root: Path, asset: str) -> None:
     process, control, generation, _, _ = start_broker(root, "kill")
     running = exchange(control, "status", generation)
@@ -356,6 +474,7 @@ def main() -> None:
     if BASE.exists():
         raise AssertionError(f"test root must be fresh: {BASE}")
     BASE.mkdir(parents=True, mode=0o700)
+    adoption_case(BASE / "adoption")
     for hook, target in (("accept-return", "/health"), ("relay-registered", "/health"), ("backend-connect", "/health"), ("relay-removal", "/event")):
         race_case(BASE / hook, hook, target)
     activation_failure_case(BASE / "activation-failure")

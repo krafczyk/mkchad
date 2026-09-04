@@ -397,6 +397,17 @@ assert(not refused_result.ok and refused_result.command == "clear" and refused_r
 assert(vim.uv.fs_stat(vim.fs.joinpath(lifecycle_root, "state.json")), "clear removed live authority")
 local live_record = vim.json.decode(table.concat(vim.fn.readfile(vim.fs.joinpath(lifecycle_root, "state.json")), "\n"))
 
+local direct_restart = invoke("restart-broker", "--json")
+assert(direct_restart.code == 1 and direct_restart.stdout:match "^%b{}\n$", direct_restart.stderr)
+local direct_restart_result = vim.json.decode(direct_restart.stdout)
+assert(
+  not direct_restart_result.ok
+    and direct_restart_result.command == "restart-broker"
+    and direct_restart_result.status == "blocked",
+  "direct HTTP broker restart was not refused"
+)
+assert(not process_dead(live_record.backend.pid), "refused broker restart stopped the direct backend")
+
 local killed = invoke("kill", "--json")
 assert(killed.code == 0 and killed.stdout:match "^%b{}\n$", killed.stderr)
 local killed_result = vim.json.decode(killed.stdout)
@@ -419,6 +430,7 @@ assert(help.code == 0 and help.stdout == table.concat({
   "Usage: mkchad-opencode-server start [--json]",
   "       mkchad-opencode-server status [--json] [--host-evidence-v1 BASE64URL]",
   "       mkchad-opencode-server stop [--json]",
+  "       mkchad-opencode-server restart-broker [--json]",
   "       mkchad-opencode-server clear [--json]",
   "       mkchad-opencode-server kill [--json]",
   "       mkchad-opencode-server --help",

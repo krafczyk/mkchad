@@ -61,6 +61,8 @@ local function broker_intent(state)
       version = state.backend.local_version,
       port = state.backend.port,
       log = state.backend.log,
+      pid = state.backend.pid,
+      start_time = state.backend.start_time,
     },
   }
 end
@@ -144,6 +146,162 @@ assert(
 )
 assert(lifecycle.set_test_procfs_authority(true))
 
+local previous_generation = state.generation
+local previous_proxy_pid, preserved_backend_pid = state.proxy.pid, state.backend.pid
+vim.g.mkchad_opencode_test_fail_launch_write_after = 2
+local failed_restart, failed_restart_err = await(lifecycle.restart_broker)
+assert(not failed_restart and failed_restart_err:find("launch intent", 1, true), failed_restart_err)
+local rollback_state = assert(lifecycle.read_state())
+assert(
+  rollback_state.generation == previous_generation and rollback_state.backend.pid == preserved_backend_pid,
+  "failed broker restart did not restore complete authority"
+)
+assert(dead(previous_proxy_pid) and not dead(preserved_backend_pid), "failed broker restart changed the backend")
+assert(not vim.uv.fs_stat(paths.pending) and not vim.uv.fs_stat(paths.launch) and not vim.uv.fs_stat(paths.control))
+
+vim.g.mkchad_opencode_test_fail_pending_remove = true
+local failed_publication, failed_publication_err = await(lifecycle.restart_broker)
+assert(not failed_publication and failed_publication_err:find("pending", 1, true), failed_publication_err)
+rollback_state = assert(lifecycle.read_state())
+assert(
+  rollback_state.generation == previous_generation and rollback_state.backend.pid == preserved_backend_pid,
+  "post-publication failure did not restore complete authority"
+)
+assert(not dead(preserved_backend_pid), "post-publication failure stopped the backend")
+assert(not vim.uv.fs_stat(paths.pending) and not vim.uv.fs_stat(paths.launch) and not vim.uv.fs_stat(paths.control))
+
+vim.g.mkchad_opencode_test_fail_pending_write_after = 1
+local failed_control_ready, failed_control_ready_err = await(lifecycle.restart_broker)
+assert(not failed_control_ready and failed_control_ready_err:find("control-ready", 1, true), failed_control_ready_err)
+rollback_state = assert(lifecycle.read_state())
+assert(
+  rollback_state.generation == previous_generation and rollback_state.backend.pid == preserved_backend_pid,
+  "control-ready publication failure did not restore complete authority"
+)
+assert(not dead(preserved_backend_pid), "control-ready publication failure stopped the backend")
+assert(not vim.uv.fs_stat(paths.pending) and not vim.uv.fs_stat(paths.launch) and not vim.uv.fs_stat(paths.control))
+
+local dead_launch_intent = broker_intent(rollback_state)
+dead_launch_intent.backend.pid = nil
+dead_launch_intent.backend.start_time = nil
+local stale_socket = vim.system({
+  assert(vim.fn.exepath "python3"),
+  "-c",
+  "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()",
+  paths.control,
+}):wait()
+assert(stale_socket.code == 0, stale_socket.stderr)
+assert(vim.uv.fs_chmod(paths.control, 384))
+assert(await(lifecycle.acquire_lock))
+assert(lifecycle.write_launch_intent(dead_launch_intent))
+lifecycle.release_lock()
+local reconciled_launch, reconciled_launch_err, reconciled_state = await(lifecycle.restart_broker)
+assert(reconciled_launch, reconciled_launch_err)
+assert(
+  reconciled_state.generation ~= previous_generation and reconciled_state.backend.pid == preserved_backend_pid,
+  "dead launch-intent reconciliation did not preserve the backend"
+)
+previous_generation = reconciled_state.generation
+
+local entrypoint = vim.fs.joinpath(vim.fn.getcwd(), "lua", "mkchad", "opencode", "command.lua")
+local restart_command = await(function(done)
+  vim.system(
+    { vim.fn.exepath "nvim", "--headless", "-u", "NONE", "-l", entrypoint, "--", "restart-broker", "--json" },
+    { env = { MKCHAD_PERSISTENT_INSTANCE = "1" } },
+    done
+  )
+end)
+assert(restart_command.code == 0, restart_command.stderr .. restart_command.stdout)
+local restart_result = vim.json.decode(restart_command.stdout)
+assert(restart_result.ok and restart_result.status == "healthy", restart_command.stdout)
+local restarted_state = assert(lifecycle.read_state())
+assert(
+  restarted_state.generation ~= previous_generation
+    and restarted_state.proxy.pid ~= previous_proxy_pid
+    and restarted_state.backend.pid == preserved_backend_pid,
+  "broker restart did not preserve only the backend"
+)
+assert(dead(previous_proxy_pid) and not dead(preserved_backend_pid), "broker restart changed the wrong process")
+state = restarted_state
+
+local coexisting_generation = state.generation
+local coexisting_backend_pid = state.backend.pid
+local coexisting_pending = vim.deepcopy(state)
+coexisting_pending.phase = "running"
+assert(await(lifecycle.acquire_lock))
+assert(lifecycle.write_pending(coexisting_pending))
+assert(lifecycle.write_launch_intent(broker_intent(state)))
+lifecycle.release_lock()
+local resumed, resume_err, resumed_state = await(lifecycle.restart_broker)
+assert(resumed, resume_err)
+assert(
+  resumed_state.generation ~= coexisting_generation and resumed_state.backend.pid == coexisting_backend_pid,
+  "restart could not recover coexisting complete and provisional authority"
+)
+state = resumed_state
+
+local control_ready_generation = state.generation
+local control_ready_backend_pid = state.backend.pid
+local control_ready_pending = vim.deepcopy(state)
+control_ready_pending.phase = "control-ready"
+control_ready_pending.backend = nil
+assert(await(lifecycle.acquire_lock))
+assert(lifecycle.write_pending(control_ready_pending))
+assert(lifecycle.write_launch_intent(broker_intent(state)))
+lifecycle.release_lock()
+resumed, resume_err, resumed_state = await(lifecycle.restart_broker)
+assert(resumed, resume_err)
+assert(
+  resumed_state.generation ~= control_ready_generation and resumed_state.backend.pid == control_ready_backend_pid,
+  "restart could not recover control-ready provisional authority"
+)
+state = resumed_state
+
+local occupied_public_port = state.port
+local fallback_backend_pid = state.backend.pid
+assert(vim.uv.kill(state.proxy.pid, "sigkill"))
+assert(
+  vim.wait(5000, function()
+    return dead(state.proxy.pid)
+  end, 20),
+  "broker fixture did not stop before fallback restart"
+)
+assert(
+  vim.wait(5000, function()
+    return lifecycle.port_is_available(occupied_public_port)
+  end, 20),
+  "broker public port did not become reusable"
+)
+local occupied_public = assert(vim.uv.new_tcp())
+assert(occupied_public:bind("127.0.0.1", occupied_public_port) == 0)
+assert(occupied_public:listen(1, function() end) == 0)
+local fallback, fallback_err, fallback_state = await(lifecycle.restart_broker)
+occupied_public:close()
+assert(fallback, fallback_err)
+assert(
+  fallback_state.port ~= occupied_public_port and fallback_state.backend.pid == fallback_backend_pid,
+  "broker restart did not select a fallback around an unavailable old public port"
+)
+state = fallback_state
+
+local state_less_control_generation = state.generation
+local state_less_control_backend = state.backend.pid
+local state_less_control = vim.deepcopy(state)
+state_less_control.phase = "control-ready"
+assert(await(lifecycle.acquire_lock))
+assert(lifecycle.write_pending(state_less_control))
+assert(lifecycle.write_launch_intent(broker_intent(state)))
+assert(vim.uv.fs_unlink(paths.state))
+lifecycle.release_lock()
+local recovered_control, recovered_control_err, recovered_control_state = await(lifecycle.restart_broker)
+assert(recovered_control, recovered_control_err)
+assert(
+  recovered_control_state.generation ~= state_less_control_generation
+    and recovered_control_state.backend.pid == state_less_control_backend,
+  "state-less control-ready restart did not preserve the backend"
+)
+state = recovered_control_state
+
 -- A manager cut after running pending publication is reconciled through the
 -- exact broker/control generation. It must not become permanent manual state.
 local cut_generation = state.generation
@@ -159,7 +317,7 @@ assert(vim.uv.fs_unlink(paths.state))
 lifecycle.release_lock()
 local mismatched_pending = table.concat(vim.fn.readfile(paths.pending), "\n")
 local mismatched_intent = table.concat(vim.fn.readfile(paths.launch), "\n")
-local mismatched, mismatch_err = await(lifecycle.ensure_server)
+local mismatched, mismatch_err = await(lifecycle.restart_broker)
 assert(not mismatched and mismatch_err:find("control authority", 1, true), mismatch_err)
 assert(table.concat(vim.fn.readfile(paths.pending), "\n") == mismatched_pending)
 assert(table.concat(vim.fn.readfile(paths.launch), "\n") == mismatched_intent)
@@ -168,10 +326,23 @@ cut_pending.broker.control_ino = exact_control_ino
 assert(await(lifecycle.acquire_lock))
 assert(lifecycle.write_pending(cut_pending))
 lifecycle.release_lock()
-local reconciled, reconcile_err, reconciled_state = await(lifecycle.ensure_server)
+vim.g.mkchad_opencode_test_fail_pending_write_after = 2
+local failed_pending_restart, failed_pending_restart_err = await(lifecycle.restart_broker)
+assert(
+  not failed_pending_restart and failed_pending_restart_err:find("running broker state", 1, true),
+  failed_pending_restart_err
+)
+assert(not dead(cut_backend_pid), "failed running-pending restart stopped the backend")
+assert(
+  vim.deep_equal(lifecycle.read_pending(), cut_pending),
+  "failed restart did not restore pending authority: " .. failed_pending_restart_err
+)
+assert(lifecycle.read_launch_intent().generation == cut_generation)
+local reconciled, reconcile_err, reconciled_state = await(lifecycle.restart_broker)
 assert(reconciled, reconcile_err)
 assert(reconciled_state.generation ~= cut_generation, "running crash cut reused an unfinalized generation")
-assert(dead(cut_proxy_pid) and dead(cut_backend_pid), "running crash cut left an old broker role alive")
+assert(dead(cut_proxy_pid) and not dead(cut_backend_pid), "running crash cut did not preserve only the backend")
+assert(reconciled_state.backend.pid == cut_backend_pid, "running crash cut replaced the backend")
 state = reconciled_state
 
 -- An incomplete schema-4 generation still has broker authority. Status must
@@ -196,7 +367,6 @@ assert(
     and incomplete_projection.persisted_version == pending.backend.local_version,
   "unhealthy lifecycle projection erased persisted backend evidence"
 )
-local entrypoint = vim.fs.joinpath(vim.fn.getcwd(), "lua", "mkchad", "opencode", "command.lua")
 local command_result = await(function(done)
   vim.system({ vim.fn.exepath "nvim", "--headless", "-u", "NONE", "-l", entrypoint, "--", "status", "--json" }, done)
 end)
@@ -312,6 +482,30 @@ assert(killed, kill_err)
 assert(lifecycle.read_state() == nil, "crashed schema-4 kill retained lifecycle state")
 assert(not vim.uv.fs_lstat(paths.control), "crashed schema-4 kill retained the exact stale control socket")
 assert(not vim.uv.fs_lstat(paths.tls), "crashed schema-4 kill retained TLS material")
+
+local coexist_started, coexist_start_err, coexist_old_state = await(lifecycle.ensure_server)
+assert(coexist_started, coexist_start_err)
+local coexist_restarted, coexist_restart_err, coexist_pending = await(lifecycle.restart_broker)
+assert(coexist_restarted, coexist_restart_err)
+coexist_pending.phase = "running"
+assert(await(lifecycle.acquire_lock))
+assert(lifecycle.write_state(coexist_old_state))
+assert(lifecycle.write_pending(coexist_pending))
+assert(lifecycle.write_launch_intent(broker_intent(coexist_pending)))
+lifecycle.release_lock()
+assert(vim.uv.kill(coexist_pending.backend.pid, "sigkill"))
+assert(vim.wait(5000, function()
+  return dead(coexist_pending.backend.pid)
+end, 20), "coexisting adopted backend did not terminate")
+local dead_backend_restart, dead_backend_err = await(lifecycle.restart_broker)
+assert(not dead_backend_restart and dead_backend_err:find("no longer running", 1, true), dead_backend_err)
+assert(vim.wait(5000, function()
+  return dead(coexist_pending.proxy.pid)
+end, 20), "dead-backend reconciliation retained the adopted broker")
+assert(
+  not lifecycle.read_state() and not vim.uv.fs_lstat(paths.pending) and not vim.uv.fs_lstat(paths.launch),
+  "dead-backend reconciliation retained lifecycle authority"
+)
 
 local slow_fake = vim.fn.readfile(fake_target)
 table.insert(slow_fake, 4, "signal.signal(signal.SIGTERM, lambda *_: None)")

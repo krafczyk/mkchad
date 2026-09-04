@@ -50,7 +50,10 @@ import javax.net.ssl.SSLServerSocket;
 import javax.net.ssl.SSLServerSocketFactory;
 import javax.net.ssl.SSLSocket;
 
-/** A loopback TLS relay that proves ownership of each established backend socket. */
+/**
+ * A loopback TLS broker that launches or explicitly adopts one verified backend
+ * and proves ownership of every relayed backend socket.
+ */
 public final class MkChadTlsProxy {
   private static final byte[] PREFLIGHT = (
       "GET /global/health HTTP/1.1\r\n"
@@ -112,7 +115,9 @@ public final class MkChadTlsProxy {
       int maxConnections,
       Path backendLog,
       Path pidfdPython,
-      Path pidfdHelper) {}
+      Path pidfdHelper,
+      Long adoptedBackendPid,
+      String adoptedBackendStart) {}
 
   private record BrokerAuthority(
       long pid,
@@ -194,7 +199,7 @@ public final class MkChadTlsProxy {
     SSLContext context = tlsContext(config);
     SSLServerSocketFactory factory = context.getServerSocketFactory();
     SSLServerSocket server = (SSLServerSocket) factory.createServerSocket();
-    server.setReuseAddress(false);
+    server.setReuseAddress(true);
     server.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), config.listenPort()));
     Set<String> supported = Set.of(server.getSupportedProtocols());
     String[] protocols = Arrays.stream(new String[] {"TLSv1.3", "TLSv1.2"})
@@ -344,7 +349,9 @@ public final class MkChadTlsProxy {
 
   private static BrokerConfig parseBroker(String[] args) {
     Map<String, String> values = parseOptions(args);
-    if (values.size() != 14) {
+    String adoptedPid = values.get("--adopt-backend-pid");
+    String adoptedStart = values.get("--adopt-backend-start");
+    if ((adoptedPid == null) != (adoptedStart == null) || values.size() != (adoptedPid == null ? 14 : 16)) {
       throw new IllegalArgumentException("invalid broker argument count");
     }
     Path stateRoot = Path.of(required(values, "--state-root"));
@@ -362,6 +369,11 @@ public final class MkChadTlsProxy {
     if (maxConnections < 1 || maxConnections > 1024) {
       throw new IllegalArgumentException("invalid proxy bounds");
     }
+    Long adoptedBackendPid = adoptedPid == null ? null : Long.parseLong(adoptedPid);
+    if (adoptedBackendPid != null
+        && (adoptedBackendPid <= 0 || !adoptedStart.matches("[0-9]+"))) {
+      throw new IllegalArgumentException("invalid adopted backend identity");
+    }
     return new BrokerConfig(
         stateRoot,
         control,
@@ -376,7 +388,9 @@ public final class MkChadTlsProxy {
         maxConnections,
         Path.of(required(values, "--backend-log")),
         Path.of(required(values, "--pidfd-python")),
-        Path.of(required(values, "--pidfd-helper")));
+        Path.of(required(values, "--pidfd-helper")),
+        adoptedBackendPid,
+        adoptedStart);
   }
 
   private static Config parse(String[] args) {
@@ -422,7 +436,7 @@ public final class MkChadTlsProxy {
     requireRegularFile(config.pidfdHelper());
     BrokerAuthority authority = captureBrokerAuthority(config);
     AtomicReference<BrokerPhase> phase = new AtomicReference<>(BrokerPhase.CONTROL_READY);
-    AtomicReference<Process> backend = new AtomicReference<>();
+    AtomicReference<ProcessHandle> backend = new AtomicReference<>();
     AtomicReference<BrokerTlsService> service = new AtomicReference<>();
     AtomicBoolean activationInFlight = new AtomicBoolean();
     CountDownLatch activationDone = new CountDownLatch(1);
@@ -486,7 +500,7 @@ public final class MkChadTlsProxy {
       FileIdentity root,
       FileIdentity control,
       AtomicReference<BrokerPhase> phase,
-      AtomicReference<Process> backend,
+      AtomicReference<ProcessHandle> backend,
       AtomicReference<BrokerTlsService> service,
       AtomicBoolean activationInFlight,
       CountDownLatch activationDone,
@@ -520,6 +534,7 @@ public final class MkChadTlsProxy {
         }
         current = BrokerPhase.ACTIVATING;
       } else if (request.operation().equals("stop") && beginStop(phase)) {
+        boolean terminateManagedBackend = config.adoptedBackendPid() == null || current == BrokerPhase.RUNNING;
         completeStop(
             config,
             authority,
@@ -533,6 +548,7 @@ public final class MkChadTlsProxy {
             controlListener,
             request,
             channel,
+            terminateManagedBackend,
             terminalReceiptWritten);
         return;
       }
@@ -595,7 +611,7 @@ public final class MkChadTlsProxy {
   }
 
   private static List<String> expectedBrokerTail(BrokerConfig config) {
-    return List.of(
+    List<String> arguments = new ArrayList<>(List.of(
         "--broker",
         "--state-root", config.stateRoot().toString(),
         "--control", config.control().toString(),
@@ -610,7 +626,14 @@ public final class MkChadTlsProxy {
         "--max-connections", Integer.toString(config.maxConnections()),
         "--backend-log", config.backendLog().toString(),
         "--pidfd-python", config.pidfdPython().toString(),
-        "--pidfd-helper", config.pidfdHelper().toString());
+        "--pidfd-helper", config.pidfdHelper().toString()));
+    if (config.adoptedBackendPid() != null) {
+      arguments.add("--adopt-backend-pid");
+      arguments.add(Long.toString(config.adoptedBackendPid()));
+      arguments.add("--adopt-backend-start");
+      arguments.add(config.adoptedBackendStart());
+    }
+    return List.copyOf(arguments);
   }
 
   private static void requireBrokerSelf(BrokerConfig config, BrokerAuthority authority, boolean requireListener)
@@ -653,7 +676,7 @@ public final class MkChadTlsProxy {
       BrokerConfig config,
       BrokerAuthority authority,
       AtomicReference<BrokerPhase> phase,
-      AtomicReference<Process> backend,
+      AtomicReference<ProcessHandle> backend,
       AtomicReference<BrokerTlsService> service,
       AtomicBoolean activationInFlight,
       CountDownLatch activationDone) {
@@ -661,16 +684,30 @@ public final class MkChadTlsProxy {
       if (phase.get() != BrokerPhase.ACTIVATING) {
         return;
       }
-      Process started = new ProcessBuilder(
-          config.backendExecutable().toString(), "serve", "--hostname", "127.0.0.1", "--port",
-          Integer.toString(config.backendPort()))
-          .redirectInput(ProcessBuilder.Redirect.from(Path.of("/dev/null").toFile()))
-          .redirectOutput(ProcessBuilder.Redirect.appendTo(config.backendLog().toFile()))
-          .redirectError(ProcessBuilder.Redirect.appendTo(config.backendLog().toFile()))
-          .start();
+      ProcessHandle started;
+      String backendStart;
+      boolean adopting = config.adoptedBackendPid() != null;
+      if (adopting) {
+        started = ProcessHandle.of(config.adoptedBackendPid())
+            .filter(ProcessHandle::isAlive)
+            .orElseThrow(() -> new IOException("adopted backend is not live"));
+        backendStart = processStart(Path.of("/proc", Long.toString(started.pid()), "stat"));
+        if (!backendStart.equals(config.adoptedBackendStart())) {
+          throw new IOException("adopted backend start identity changed");
+        }
+      } else {
+        Process child = new ProcessBuilder(
+            config.backendExecutable().toString(), "serve", "--hostname", "127.0.0.1", "--port",
+            Integer.toString(config.backendPort()))
+            .redirectInput(ProcessBuilder.Redirect.from(Path.of("/dev/null").toFile()))
+            .redirectOutput(ProcessBuilder.Redirect.appendTo(config.backendLog().toFile()))
+            .redirectError(ProcessBuilder.Redirect.appendTo(config.backendLog().toFile()))
+            .start();
+        started = child.toHandle();
+        backendStart = processStart(Path.of("/proc", Long.toString(started.pid()), "stat"));
+      }
       backend.set(started);
-      Config tls = new Config(config.listenPort(), config.backendPort(), started.pid(),
-          processStart(Path.of("/proc", Long.toString(started.pid()), "stat")), config.bootId(),
+      Config tls = new Config(config.listenPort(), config.backendPort(), started.pid(), backendStart, config.bootId(),
           config.keyStore(), config.passwordFile(), config.maxConnections());
       requireLinuxEvidence(tls);
       waitForListener(tls, System.nanoTime() + CONTROL_DEADLINE_NANOS);
@@ -684,7 +721,11 @@ public final class MkChadTlsProxy {
       phase.compareAndSet(BrokerPhase.ACTIVATING, BrokerPhase.RUNNING);
     } catch (Exception failure) {
       if (phase.get() == BrokerPhase.ACTIVATING) {
-        boolean cleaned = cleanupFailedActivation(config, authority, backend.get(), service.get());
+        boolean adopting = config.adoptedBackendPid() != null;
+        boolean cleaned = cleanupFailedActivation(config, authority, backend.get(), service.get(), !adopting);
+        if (cleaned && adopting) {
+          backend.set(null);
+        }
         phase.compareAndSet(
             BrokerPhase.ACTIVATING, cleaned ? BrokerPhase.ACTIVATION_FAILED : BrokerPhase.BLOCKED);
       }
@@ -695,15 +736,19 @@ public final class MkChadTlsProxy {
   }
 
   private static boolean cleanupFailedActivation(
-      BrokerConfig config, BrokerAuthority authority, Process backend, BrokerTlsService service) {
+      BrokerConfig config,
+      BrokerAuthority authority,
+      ProcessHandle backend,
+      BrokerTlsService service,
+      boolean terminateBackend) {
     try {
       if (service != null) {
         service.quiesce();
       }
-      if (backend != null && backend.isAlive()) {
+      if (terminateBackend && backend != null && backend.isAlive()) {
         terminateBackend(backend, config, authority, false, System.nanoTime() + CONTROL_DEADLINE_NANOS);
       }
-      return backend == null || !backend.isAlive();
+      return !terminateBackend || backend == null || !backend.isAlive();
     } catch (Exception failure) {
       return false;
     }
@@ -715,13 +760,14 @@ public final class MkChadTlsProxy {
       FileIdentity root,
       FileIdentity control,
       AtomicReference<BrokerPhase> phase,
-      AtomicReference<Process> backend,
+      AtomicReference<ProcessHandle> backend,
       AtomicReference<BrokerTlsService> service,
       AtomicBoolean activationInFlight,
       CountDownLatch activationDone,
       AtomicReference<ServerSocketChannel> controlListener,
       ControlRequest request,
       SocketChannel channel,
+      boolean terminateManagedBackend,
       CountDownLatch terminalReceiptWritten) {
     try {
       BrokerTlsService publicService = service.get();
@@ -736,12 +782,12 @@ public final class MkChadTlsProxy {
       if (publicService != null) {
         publicService.quiesce();
       }
-      Process child = backend.get();
-      if (child != null && child.isAlive()) {
+      ProcessHandle child = backend.get();
+      if (terminateManagedBackend && child != null && child.isAlive()) {
         terminateBackend(
             child, config, authority, publicService != null, System.nanoTime() + CONTROL_DEADLINE_NANOS);
       }
-      if (child != null && child.isAlive()) {
+      if (terminateManagedBackend && child != null && child.isAlive()) {
         return;
       }
       if (!root.equals(requirePrivateDirectory(config.stateRoot()))
@@ -763,7 +809,7 @@ public final class MkChadTlsProxy {
   }
 
   private static void terminateBackend(
-      Process backend, BrokerConfig config, BrokerAuthority authority, boolean requireListener, long deadline)
+      ProcessHandle backend, BrokerConfig config, BrokerAuthority authority, boolean requireListener, long deadline)
       throws IOException {
     invokePidfdHelper(
         backendReceipt(backend.pid(), config, authority, requireListener), config, authority, "SIGTERM", deadline);
@@ -1190,7 +1236,7 @@ public final class MkChadTlsProxy {
       BrokerConfig config,
       BrokerAuthority authority,
       FileIdentity control,
-      Process backend) {
+      ProcessHandle backend) {
     BrokerPhase responsePhase = phase;
     String backendReceipt = null;
     String error = null;
@@ -1627,7 +1673,8 @@ public final class MkChadTlsProxy {
       throw new IOException("proc TCP table entry is malformed");
     }
     int state = Integer.parseInt(fields[3], 16);
-    int expectedFields = state == 3 || state == 5 || state == 6 ? 12 : 17;
+    boolean shortEntry = state == 3 || state == 6 || (state == 5 && fields.length == 12);
+    int expectedFields = shortEntry ? 12 : 17;
     if (state < 1
         || state > 13
         || fields.length != expectedFields
